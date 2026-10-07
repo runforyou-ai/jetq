@@ -314,6 +314,25 @@ func (w *Worker) process(runCtx, jobCtx context.Context, q Queue, msg jetstream.
 		return context.WithTimeout(context.WithoutCancel(runCtx), settleTimeout)
 	}
 
+	cancelled, err := w.client.cancelled(runCtx, header, info.ID)
+	if err != nil {
+		// Whether the job was cancelled is unknown: put it back without running
+		// it, like a snooze, so the check does not use up attempts.
+		w.client.cfg.logger.WarnContext(runCtx, "jetq cancellation check failed", "queue", q.Name, "job", info.Name, "id", info.ID, "error", err)
+		settleCtx, cancelSettle := newSettleCtx()
+		defer cancelSettle()
+		w.snooze(settleCtx, q, msg, info, cancelCheckRetry)
+		return
+	}
+	if cancelled {
+		// Cancelled while the schedule was firing: drop the copy unrun.
+		w.releaseLock(runCtx, msg, info)
+		if ackErr := msg.Ack(); ackErr != nil {
+			w.client.cfg.logger.WarnContext(runCtx, "jetq ack failed", "queue", q.Name, "job", info.Name, "id", info.ID, "error", ackErr)
+		}
+		return
+	}
+
 	if info.Attempt > info.MaxAttempts {
 		settleCtx, cancelSettle := newSettleCtx()
 		defer cancelSettle()
@@ -332,6 +351,9 @@ func (w *Worker) process(runCtx, jobCtx context.Context, q Queue, msg jetstream.
 	var retry *retryAfterError
 	switch {
 	case err == nil:
+		// Release the unique lock before acking: a lost ack then risks a
+		// duplicate run, never a key that stays locked.
+		w.releaseLock(settleCtx, msg, info)
 		if ackErr := msg.Ack(); ackErr != nil {
 			logger.WarnContext(settleCtx, "jetq ack failed", "queue", q.Name, "job", info.Name, "id", info.ID, "error", ackErr)
 		}
@@ -354,6 +376,10 @@ func (w *Worker) process(runCtx, jobCtx context.Context, q Queue, msg jetstream.
 		}
 	}
 }
+
+// cancelCheckRetry is the delay before redelivering a job whose cancellation
+// could not be checked.
+const cancelCheckRetry = 5 * time.Second
 
 // settleTimeout bounds publishing to the dead-letter stream, snoozing and failure callbacks.
 var settleTimeout = 30 * time.Second
@@ -474,6 +500,9 @@ func (w *Worker) deadLetter(ctx context.Context, q Queue, msg jetstream.Msg, inf
 	logger.ErrorContext(ctx, "jetq job failed permanently", "queue", q.Name, "job", info.Name, "id", info.ID,
 		"attempt", info.Attempt, "error", cause)
 
+	// The job is settled as dead: free its unique key before the callbacks, so
+	// they can enqueue a replacement with the same key.
+	w.releaseLock(ctx, msg, info)
 	failCtx := context.WithValue(ctx, infoKey{}, info)
 	if h, ok := w.handlers[info.Name]; ok && h.failed != nil {
 		w.callback(failCtx, info, func() { h.failed(failCtx, msg.Data(), cause) })
@@ -495,6 +524,13 @@ func (w *Worker) callback(ctx context.Context, info Info, fn func()) {
 		}
 	}()
 	fn()
+}
+
+// releaseLock frees the UniqueUntilDone lock of a settled job.
+func (w *Worker) releaseLock(ctx context.Context, msg jetstream.Msg, info Info) {
+	if lock := msg.Headers().Get(HeaderUniqueLock); lock != "" {
+		w.client.unlock(ctx, lock, info.ID)
+	}
 }
 
 func truncate(s string, n int) string {

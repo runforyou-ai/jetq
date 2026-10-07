@@ -34,7 +34,7 @@ q, err := jetq.New(ctx, js) // js 为 jetstream.JetStream，按需创建 stream
 id, err := q.Enqueue(ctx, WelcomeEmail{UserID: 42},
 	jetq.OnQueue("mail"),
 	jetq.Delay(10*time.Minute),   // 或 jetq.At(t)
-	jetq.Unique("welcome-42"),    // 去重窗口内重复投递返回 ErrDuplicate
+	jetq.UniqueUntilDone("welcome-42"), // 同键任务结束前重复投递返回 ErrDuplicate；jetq.Unique(key) 按时间窗口去重
 	// jetq.JobID(id) 自行指定任务编号，例如投递前先保存它
 )
 _ = q.Cancel(ctx, id)            // 取消尚未到点的延迟任务
@@ -95,7 +95,7 @@ err = w.Run(ctx) // 阻塞；取消后等待正在执行的任务
 | `$this->release($delay)` | `return jetq.Snooze(d)` |
 | `$this->fail()` | `return jetq.Permanent(err)` |
 | `failed()`、`failed_jobs` | `jetq.OnFailure`、`w.OnFailed`、死信 stream |
-| `ShouldBeUnique` | `jetq.Unique(key)`（去重窗口内） |
+| `ShouldBeUnique` | `jetq.UniqueUntilDone(key)`（任务结束前）或 `jetq.Unique(key)`（去重窗口内） |
 | `$schedule->job(...)->cron(...)->timezone(...)` | `jetq.Cron(key, spec, job).In(tz)` + `q.SyncSchedules` |
 | `queue:work` | `w.Run(ctx)` |
 | `after_commit` | 事务提交后调用 `Enqueue` |

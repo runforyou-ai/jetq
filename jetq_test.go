@@ -750,3 +750,347 @@ func TestSlowLogContextIsKeptAlive(t *testing.T) {
 		t.Fatalf("calls = %d", calls.Load())
 	}
 }
+
+func TestUniqueUntilDone(t *testing.T) {
+	c := newClient(t)
+	ctx := context.Background()
+	w := c.NewWorker(jetq.Queue{Name: "default", MaxAttempts: 2, Backoff: jetq.Constant(300 * time.Millisecond)})
+	release := make(chan struct{})
+	runs := make(chan string, 10)
+	jetq.Handle(w, func(ctx context.Context, job sendEmail) error {
+		runs <- job.To
+		switch job.To {
+		case "block":
+			<-release
+		case "fail":
+			return errors.New("boom")
+		}
+		return nil
+	})
+	start(t, w)
+
+	// Locked while running, free again after success.
+	if _, err := c.Enqueue(ctx, sendEmail{To: "block"}, jetq.UniqueUntilDone("k1")); err != nil {
+		t.Fatal(err)
+	}
+	wait(t, runs, 5*time.Second)
+	if _, err := c.Enqueue(ctx, sendEmail{To: "block"}, jetq.UniqueUntilDone("k1")); !errors.Is(err, jetq.ErrDuplicate) {
+		t.Fatalf("enqueue while running = %v", err)
+	}
+	close(release)
+	eventually(t, func() bool {
+		_, err := c.Enqueue(ctx, sendEmail{To: "ok"}, jetq.UniqueUntilDone("k1"))
+		return err == nil
+	})
+	wait(t, runs, 5*time.Second)
+
+	// Locked while waiting for a retry, free after the job is dead-lettered.
+	if _, err := c.Enqueue(ctx, sendEmail{To: "fail"}, jetq.UniqueUntilDone("k2")); err != nil {
+		t.Fatal(err)
+	}
+	wait(t, runs, 5*time.Second)
+	if _, err := c.Enqueue(ctx, sendEmail{To: "fail"}, jetq.UniqueUntilDone("k2")); !errors.Is(err, jetq.ErrDuplicate) {
+		t.Fatalf("enqueue while retrying = %v", err)
+	}
+	wait(t, runs, 5*time.Second)
+	eventually(t, func() bool {
+		_, err := c.Enqueue(ctx, sendEmail{To: "ok"}, jetq.UniqueUntilDone("k2"))
+		return err == nil
+	})
+
+	// Locked while delayed, free after cancelling.
+	id, err := c.Enqueue(ctx, sendEmail{To: "later"}, jetq.UniqueUntilDone("k3"), jetq.Delay(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Enqueue(ctx, sendEmail{To: "later"}, jetq.UniqueUntilDone("k3")); !errors.Is(err, jetq.ErrDuplicate) {
+		t.Fatalf("enqueue while delayed = %v", err)
+	}
+	if err := c.Cancel(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Enqueue(ctx, sendEmail{To: "ok"}, jetq.UniqueUntilDone("k3"), jetq.Delay(time.Hour)); err != nil {
+		t.Fatalf("enqueue after cancel = %v", err)
+	}
+	if err := c.SyncSchedules(ctx, jetq.Cron("u", "@daily", report{}, jetq.UniqueUntilDone("x"))); err == nil {
+		t.Fatal("expected schedule validation error")
+	}
+}
+
+func TestUniqueUntilDoneKeepsLockWhileSnoozed(t *testing.T) {
+	c := newClient(t)
+	ctx := context.Background()
+	w := c.NewWorker(jetq.Queue{Name: "default"})
+	runs := make(chan struct{}, 2)
+	var snoozed atomic.Bool
+	jetq.Handle(w, func(ctx context.Context, job sendEmail) error {
+		runs <- struct{}{}
+		if snoozed.CompareAndSwap(false, true) {
+			return jetq.Snooze(time.Second)
+		}
+		return nil
+	})
+	start(t, w)
+	if _, err := c.Enqueue(ctx, sendEmail{}, jetq.UniqueUntilDone("snooze")); err != nil {
+		t.Fatal(err)
+	}
+	wait(t, runs, 5*time.Second)
+	time.Sleep(200 * time.Millisecond)
+	if _, err := c.Enqueue(ctx, sendEmail{}, jetq.UniqueUntilDone("snooze")); !errors.Is(err, jetq.ErrDuplicate) {
+		t.Fatalf("enqueue while snoozed = %v", err)
+	}
+	wait(t, runs, 5*time.Second)
+	eventually(t, func() bool {
+		_, err := c.Enqueue(ctx, sendEmail{}, jetq.UniqueUntilDone("snooze"))
+		return err == nil
+	})
+}
+
+// eventually fails the test unless cond becomes true within five seconds.
+func eventually(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("condition not met within 5s")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func TestUniqueUntilDoneReleasedWhenPublishRejected(t *testing.T) {
+	c := newClient(t)
+	ctx := context.Background()
+	if _, err := c.Enqueue(ctx, sendEmail{}, jetq.Unique("window"), jetq.UniqueUntilDone("first")); err != nil {
+		t.Fatal(err)
+	}
+	// The stream rejects the duplicate, so the lock taken for "second" is released.
+	if _, err := c.Enqueue(ctx, sendEmail{}, jetq.Unique("window"), jetq.UniqueUntilDone("second")); !errors.Is(err, jetq.ErrDuplicate) {
+		t.Fatalf("duplicate enqueue = %v", err)
+	}
+	if _, err := c.Enqueue(ctx, sendEmail{}, jetq.UniqueUntilDone("second")); err != nil {
+		t.Fatalf("enqueue after rejected publish = %v", err)
+	}
+}
+
+func TestUniqueUntilDoneLifecycle(t *testing.T) {
+	srv := jetqtest.Start(t)
+	ctx := context.Background()
+	c, err := jetq.New(ctx, srv.JetStream, jetq.WithMemoryStorage(), jetq.WithUniqueLockTTL(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Only one of many concurrent enqueues with the same key succeeds.
+	var wg sync.WaitGroup
+	var ok atomic.Int32
+	for range 10 {
+		wg.Go(func() {
+			if _, err := c.Enqueue(ctx, sendEmail{}, jetq.UniqueUntilDone("race"), jetq.Delay(time.Hour)); err == nil {
+				ok.Add(1)
+			}
+		})
+	}
+	wg.Wait()
+	if ok.Load() != 1 {
+		t.Fatalf("successful enqueues = %d", ok.Load())
+	}
+	// The lock expires with the TTL even though the job never settled.
+	eventually(t, func() bool {
+		_, err := c.Enqueue(ctx, sendEmail{}, jetq.UniqueUntilDone("race"), jetq.Delay(time.Hour))
+		return err == nil
+	})
+
+	w := c.NewWorker(jetq.Queue{Name: "default", MaxAttempts: 1})
+	ran := make(chan string, 4)
+	replaced := make(chan error, 1)
+	jetq.Handle(w, func(ctx context.Context, job sendEmail) error {
+		ran <- job.To
+		if job.To == "fail" {
+			return errors.New("boom")
+		}
+		return nil
+	}, jetq.OnFailure(func(ctx context.Context, job sendEmail, err error) {
+		// The key is free when failure callbacks run.
+		_, enqueueErr := c.Enqueue(ctx, sendEmail{To: "replacement"}, jetq.UniqueUntilDone("failing"), jetq.Delay(time.Hour))
+		replaced <- enqueueErr
+	}))
+	start(t, w)
+
+	// A delayed job releases its lock once it has run.
+	if _, err := c.Enqueue(ctx, sendEmail{To: "delayed"}, jetq.UniqueUntilDone("delayed"), jetq.Delay(500*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if got := wait(t, ran, 5*time.Second); got != "delayed" {
+		t.Fatalf("ran %q", got)
+	}
+	eventually(t, func() bool {
+		_, err := c.Enqueue(ctx, sendEmail{To: "again"}, jetq.UniqueUntilDone("delayed"), jetq.Delay(time.Hour))
+		return err == nil
+	})
+
+	if _, err := c.Enqueue(ctx, sendEmail{To: "fail"}, jetq.UniqueUntilDone("failing")); err != nil {
+		t.Fatal(err)
+	}
+	if err := wait(t, replaced, 5*time.Second); err != nil {
+		t.Fatalf("enqueue from failure callback = %v", err)
+	}
+}
+
+func TestCancelSkipsInFlightCopy(t *testing.T) {
+	c := newClient(t)
+	ctx := context.Background()
+	id, err := c.Enqueue(ctx, sendEmail{}, jetq.Delay(time.Hour), jetq.UniqueUntilDone("cancel-race"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := c.JetStream().Stream(ctx, c.StreamName())
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheduled, err := stream.GetLastMsgForSubject(ctx, "jetq.at."+id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enqueuedAt := scheduled.Header.Get(jetq.HeaderEnqueuedAt)
+	if err := c.Cancel(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	// A copy the scheduler published while Cancel ran is skipped, also when
+	// redelivered; a later job reusing the id with another enqueue time is not.
+	if jetq.CancelledCopy(c, id, "2000-01-01T00:00:00Z") {
+		t.Fatal("copy with another enqueue time was skipped")
+	}
+	for range 2 {
+		if !jetq.CancelledCopy(c, id, enqueuedAt) {
+			t.Fatal("cancelled copy was not skipped")
+		}
+	}
+}
+
+func TestWorkerSkipsCancelledCopy(t *testing.T) {
+	c := newClient(t)
+	ctx := context.Background()
+	w := c.NewWorker(jetq.Queue{Name: "default"})
+	ran := make(chan string, 2)
+	jetq.Handle(w, func(ctx context.Context, job sendEmail) error {
+		ran <- job.To
+		return nil
+	})
+	start(t, w)
+	id, err := c.Enqueue(ctx, sendEmail{To: "cancelled"}, jetq.Delay(time.Second), jetq.UniqueUntilDone("skip"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := c.JetStream().Stream(ctx, c.StreamName())
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheduled, err := stream.GetLastMsgForSubject(ctx, "jetq.at."+id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Record the cancellation without deleting the schedule, as when the
+	// scheduler fires while Cancel runs.
+	state, err := c.JetStream().KeyValue(ctx, c.StreamName()+"_STATE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.Put(ctx, "cancel."+id, []byte(scheduled.Header.Get(jetq.HeaderEnqueuedAt))); err != nil {
+		t.Fatal(err)
+	}
+	expectNothing(t, ran, 2500*time.Millisecond)
+	// The skipped copy released its unique key.
+	if _, err := c.Enqueue(ctx, sendEmail{To: "next"}, jetq.UniqueUntilDone("skip")); err != nil {
+		t.Fatal(err)
+	}
+	if got := wait(t, ran, 5*time.Second); got != "next" {
+		t.Fatalf("ran %q", got)
+	}
+}
+
+func TestUniqueLockReleasedAcrossClients(t *testing.T) {
+	srv := jetqtest.Start(t)
+	ctx := context.Background()
+	// The worker's client sees no state bucket while handling a plain delayed
+	// job; another client then creates it by enqueueing a unique job.
+	workerClient, err := jetq.New(ctx, srv.JetStream, jetq.WithMemoryStorage())
+	if err != nil {
+		t.Fatal(err)
+	}
+	producer, err := jetq.New(ctx, srv.JetStream, jetq.WithMemoryStorage())
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := workerClient.NewWorker(jetq.Queue{Name: "default"})
+	ran := make(chan string, 3)
+	jetq.Handle(w, func(ctx context.Context, job sendEmail) error {
+		ran <- job.To
+		return nil
+	})
+	start(t, w)
+	if _, err := producer.Enqueue(ctx, sendEmail{To: "plain"}, jetq.Delay(500*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	wait(t, ran, 5*time.Second)
+	if _, err := producer.Enqueue(ctx, sendEmail{To: "locked"}, jetq.UniqueUntilDone("cross")); err != nil {
+		t.Fatal(err)
+	}
+	wait(t, ran, 5*time.Second)
+	eventually(t, func() bool {
+		_, err := producer.Enqueue(ctx, sendEmail{To: "again"}, jetq.UniqueUntilDone("cross"), jetq.Delay(time.Hour))
+		return err == nil
+	})
+}
+
+func TestConcurrentCancelKeepsMarker(t *testing.T) {
+	c := newClient(t)
+	ctx := context.Background()
+	stream, err := c.JetStream().Stream(ctx, c.StreamName())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 10 {
+		id, err := c.Enqueue(ctx, sendEmail{}, jetq.Delay(time.Hour))
+		if err != nil {
+			t.Fatal(err)
+		}
+		scheduled, err := stream.GetLastMsgForSubject(ctx, "jetq.at."+id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var wg sync.WaitGroup
+		results := make(chan error, 2)
+		for range 2 {
+			wg.Go(func() { results <- c.Cancel(ctx, id) })
+		}
+		wg.Wait()
+		close(results)
+		succeeded := 0
+		for err := range results {
+			switch {
+			case err == nil:
+				succeeded++
+			case !errors.Is(err, jetq.ErrNotFound):
+				t.Fatalf("Cancel = %v", err)
+			}
+		}
+		if succeeded == 0 {
+			t.Fatal("no Cancel succeeded")
+		}
+		if !jetq.CancelledCopy(c, id, scheduled.Header.Get(jetq.HeaderEnqueuedAt)) {
+			t.Fatal("a successful Cancel lost its marker")
+		}
+	}
+}
+
+func TestStateReadsGoToLeader(t *testing.T) {
+	c := newClient(t)
+	direct, err := jetq.StateLeaderReadsDirect(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if direct {
+		t.Fatal("state reads still use direct gets")
+	}
+}

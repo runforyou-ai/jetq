@@ -39,7 +39,7 @@ q, err := jetq.New(ctx, js) // js is a jetstream.JetStream; creates the streams 
 id, err := q.Enqueue(ctx, WelcomeEmail{UserID: 42},
 	jetq.OnQueue("mail"),
 	jetq.Delay(10*time.Minute),   // or jetq.At(t)
-	jetq.Unique("welcome-42"),    // ErrDuplicate within the duplicate window
+	jetq.UniqueUntilDone("welcome-42"), // ErrDuplicate until that job settles; jetq.Unique(key) uses a time window
 	// jetq.JobID(id) sets the id yourself, e.g. to store it before enqueueing
 )
 _ = q.Cancel(ctx, id)            // cancel a pending delayed job
@@ -107,7 +107,7 @@ Delivery is **at least once**: make handlers idempotent.
 | `$this->release($delay)` | `return jetq.Snooze(d)` |
 | `$this->fail()` | `return jetq.Permanent(err)` |
 | `failed()` / `failed_jobs` | `jetq.OnFailure`, `w.OnFailed`, dead-letter stream |
-| `ShouldBeUnique` | `jetq.Unique(key)` (within the duplicate window) |
+| `ShouldBeUnique` | `jetq.UniqueUntilDone(key)` (until the job settles) or `jetq.Unique(key)` (within the duplicate window) |
 | `$schedule->job(...)->cron(...)->timezone(...)` | `jetq.Cron(key, spec, job).In(tz)` + `q.SyncSchedules` |
 | `queue:work` | `w.Run(ctx)` |
 | `after_commit` | call `Enqueue` after commit |

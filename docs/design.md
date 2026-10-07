@@ -3,7 +3,8 @@
 ## Goals
 
 - A job queue with Laravel-like ergonomics on top of NATS JetStream.
-- Let the NATS server do the hard parts: persistence, redelivery, delays and cron.
+- Let the NATS server do the hard parts: persistence, redelivery, delays and
+  cron.
 - Keep the library database-agnostic. A transactional outbox is an optional
   add-on (see [Roadmap](#roadmap)).
 
@@ -41,6 +42,7 @@ The body is the job encoded as JSON. Headers:
 | `Jetq-Max-Attempts` | Optional per-job attempt limit. |
 | `Jetq-Attempt-Base` | Attempts consumed before a snooze (internal). |
 | `Nats-Msg-Id` | `Unique` key, deduplicated by the stream within its duplicate window. |
+| `Jetq-Unique-Lock` | Lock key of a `UniqueUntilDone` job. |
 
 Application headers set with `WithHeader` (for example `traceparent`) are kept.
 Headers starting with `Jetq-` or `Nats-` are reserved.
@@ -48,13 +50,27 @@ Headers starting with `Jetq-` or `Nats-` are reserved.
 ## Delayed jobs
 
 `Delay`/`At` publish a schedule message on `jetq.at.<id>` with
-`Nats-Schedule: @at <time>` and `Nats-Schedule-Target: jetq.q.<queue>`. When it
-fires, the server publishes a copy (minus scheduling headers and `Nats-Msg-Id`)
-to the queue subject and purges the schedule message. `Cancel(id)` purges the
-schedule subject; once it has fired, `Cancel` returns `ErrNotFound`. Cancel is
-best effort: a schedule that fires between the lookup and the purge still runs.
-Cancelling does not clear the `Unique` key, which stays reserved for the rest of
-the duplicate window.
+`Nats-Schedule: @at <time>` and `Nats-Schedule-Target: jetq.q.<queue>`. When it fires, the
+server publishes a copy (minus scheduling headers and `Nats-Msg-Id`) to the
+queue subject and purges the schedule message. `Cancel(id)` removes the
+pending schedule message. A schedule can fire while `Cancel` runs, so `Cancel`
+first records a marker `cancel.<id>` (holding the job's enqueue time) in the
+`<STREAM>_STATE` bucket, then deletes exactly the schedule message it read. If
+the delete succeeds, `Cancel` returns nil and workers skip a copy the
+scheduler published meanwhile, including redeliveries of it, releasing its
+lock. If it fails because the schedule already fired, `Cancel` returns
+`ErrNotFound` and the job either runs or is skipped; the same holds when
+`Cancel` fails with another error after recording the marker. Markers are never
+withdrawn, so concurrent cancels cannot undo each other; they expire with the
+bucket TTL, and a later job reusing the id has another enqueue time and is not
+skipped. Workers and lock releases read markers and locks through the bucket
+stream's leader, because key-value direct gets may be answered by a lagging
+follower. When the marker cannot be read, the copy is put back like a snooze
+and checked again after 5 seconds instead of running, without using up an
+attempt; if putting it back fails too, the copy is redelivered and that
+delivery counts as an attempt. Cancelling does not clear the `Unique` key, which
+stays reserved for the rest of the duplicate window; a `UniqueUntilDone` lock
+is released.
 
 ## Recurring jobs
 
@@ -146,14 +162,29 @@ concurrently.
 
 - At-least-once delivery. A handler may run more than once (crash, ack lost,
   keep-alive lost); handlers must be idempotent.
-- `Unique` only deduplicates within the stream's duplicate window (default 2m).
-  Long-lived uniqueness belongs in your database.
+- `Unique` only deduplicates within the stream's duplicate window (default
+  2m).
+- `UniqueUntilDone` takes a lock in the `<STREAM>_STATE` key-value bucket,
+  created on first use (an existing bucket keeps its configuration; the client
+  needs permission to create it and to publish to `$KV.<STREAM>_STATE.>`) (key
+  = SHA-256 of the unique key, value = job id) before publishing, and returns
+  `ErrDuplicate` while it is held. The worker releases it before acking a
+  success and after dead-lettering, before failure callbacks run; `Cancel`
+  releases it for delayed jobs; a publish the server rejected releases it;
+  after an uncertain failure such as a timeout the job may have been stored,
+  so the lock is kept. `Cancel` deletes exactly the schedule message it read
+  and releases the lock only if that delete succeeds. A lock is only released
+  by the job that holds it. Snoozed and retrying jobs keep it. Every lock
+  expires at the bucket TTL (`WithUniqueLockTTL`, default 24h) counted from
+  enqueue, which bounds locks left behind by crashes and also ends
+  deduplication for jobs that stay unsettled longer.
 - `Enqueue` is not transactional with your database. Enqueue after commit; a
-  crash between commit and enqueue loses the job. The outbox add-on closes this
-  gap.
-- Job state lives only in JetStream. Store business results in your own tables.
-- Workers of the same queue share one durable consumer whose `AckWait` is set by
-  the last worker to start; give every worker of a queue the same `Queue`
+  crash between commit and enqueue loses the job. The outbox add-on closes
+  this gap.
+- Job state lives only in JetStream. Store business results in your own
+  tables.
+- Workers of the same queue share one durable consumer whose `AckWait` is set
+  by the last worker to start; give every worker of a queue the same `Queue`
   settings.
 - Applications sharing a NATS account must use distinct stream names and
   subject prefixes: consumers are named `jetq-<queue>` and `SyncSchedules`
@@ -182,6 +213,5 @@ node stops the stream.
   the caller's transaction and a relay publishes it, with PostgreSQL and MySQL
   dialect modules.
 - Job chains and batches.
-- Long-lived unique jobs backed by JetStream KV.
 - Dead-letter requeue (API and CLI), dashboard.
 - OpenTelemetry instrumentation.
