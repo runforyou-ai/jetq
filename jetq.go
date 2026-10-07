@@ -34,6 +34,8 @@ const (
 	HeaderError       = "Jetq-Error"
 	HeaderAttempts    = "Jetq-Attempts"
 	HeaderFailedAt    = "Jetq-Failed-At"
+	// HeaderUniqueLock carries the lock key of a job enqueued with [UniqueUntilDone].
+	HeaderUniqueLock = "Jetq-Unique-Lock"
 )
 
 // NATS message scheduling headers (nats-server 2.12+, time zones 2.14+).
@@ -55,6 +57,7 @@ type Client struct {
 	js     jetstream.JetStream
 	stream jetstream.Stream
 	dead   jetstream.Stream
+	locks  jetstream.KeyValue
 	cfg    config
 }
 
@@ -66,6 +69,7 @@ type config struct {
 	storage     jetstream.StorageType
 	duplicates  time.Duration
 	deadMaxAge  time.Duration
+	uniqueTTL   time.Duration
 	logger      *slog.Logger
 	maxJobBytes int32
 }
@@ -93,6 +97,12 @@ func WithDuplicateWindow(d time.Duration) Option { return func(c *config) { c.du
 // WithDeadLetterMaxAge sets how long dead-lettered jobs are kept (default 14 days).
 func WithDeadLetterMaxAge(d time.Duration) Option { return func(c *config) { c.deadMaxAge = d } }
 
+// WithUniqueLockTTL bounds how long a [UniqueUntilDone] key stays locked when
+// its job never settles, for example after a crash between taking the lock and
+// publishing (default 24 hours). Keep it longer than the longest delay used
+// with UniqueUntilDone.
+func WithUniqueLockTTL(d time.Duration) Option { return func(c *config) { c.uniqueTTL = d } }
+
 // WithMaxJobBytes limits the encoded size of a single job (default: server limit).
 // Non-positive values keep the default.
 func WithMaxJobBytes(n int32) Option { return func(c *config) { c.maxJobBytes = max(n, 0) } }
@@ -109,6 +119,7 @@ func New(ctx context.Context, js jetstream.JetStream, opts ...Option) (*Client, 
 		storage:    jetstream.FileStorage,
 		duplicates: 2 * time.Minute,
 		deadMaxAge: 14 * 24 * time.Hour,
+		uniqueTTL:  24 * time.Hour,
 		logger:     slog.Default(),
 	}
 	for _, opt := range opts {
@@ -151,7 +162,17 @@ func New(ctx context.Context, js jetstream.JetStream, opts ...Option) (*Client, 
 	if err != nil {
 		return nil, fmt.Errorf("jetq: create stream %s: %w", cfg.deadName, err)
 	}
-	return &Client{js: js, stream: stream, dead: dead, cfg: cfg}, nil
+	locks, err := js.CreateOrUpdateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket:      cfg.streamName + "_UNIQUE",
+		Description: "jetq locks of unique jobs that have not settled",
+		TTL:         cfg.uniqueTTL,
+		Storage:     cfg.storage,
+		Replicas:    cfg.replicas,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("jetq: create unique lock bucket: %w", err)
+	}
+	return &Client{js: js, stream: stream, dead: dead, locks: locks, cfg: cfg}, nil
 }
 
 // JetStream returns the JetStream context the client was created with.

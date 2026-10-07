@@ -2,6 +2,8 @@ package jetq
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +24,7 @@ type enqueueOptions struct {
 	at          time.Time
 	delay       time.Duration
 	unique      string
+	lock        string
 	maxAttempts int
 	header      nats.Header
 	id          string
@@ -44,6 +47,12 @@ func JobID(id string) EnqueueOption { return func(o *enqueueOptions) { o.id = id
 // Unique deduplicates the job by key within the client's duplicate window:
 // a second enqueue with the same key returns [ErrDuplicate].
 func Unique(key string) EnqueueOption { return func(o *enqueueOptions) { o.unique = key } }
+
+// UniqueUntilDone deduplicates the job by key until it settles: while a job
+// with the same key is pending, delayed, running or waiting for a retry, a new
+// enqueue returns [ErrDuplicate]; once it succeeds, is dead-lettered or is
+// cancelled, the key is free again. See [WithUniqueLockTTL].
+func UniqueUntilDone(key string) EnqueueOption { return func(o *enqueueOptions) { o.lock = key } }
 
 // MaxAttempts overrides the queue's attempt limit for this job.
 func MaxAttempts(n int) EnqueueOption { return func(o *enqueueOptions) { o.maxAttempts = n } }
@@ -112,16 +121,33 @@ func (c *Client) Enqueue(ctx context.Context, job Job, opts ...EnqueueOption) (s
 		msg.Subject = c.delaySubject(id)
 	}
 
+	if o.lock != "" {
+		lock := lockKey(o.lock)
+		if _, err := c.locks.Create(ctx, lock, []byte(id)); err != nil {
+			if errors.Is(err, jetstream.ErrKeyExists) {
+				return "", ErrDuplicate
+			}
+			return "", fmt.Errorf("jetq: lock unique job %s: %w", name, err)
+		}
+		msg.Header.Set(HeaderUniqueLock, lock)
+	}
+
 	pubOpts := []jetstream.PublishOpt{jetstream.WithExpectStream(c.cfg.streamName)}
 	if o.unique != "" {
 		pubOpts = append(pubOpts, jetstream.WithMsgID(o.unique))
 	}
 	ack, err := c.js.PublishMsg(ctx, msg, pubOpts...)
-	if err != nil {
-		return "", fmt.Errorf("jetq: enqueue %s: %w", name, err)
+	if err == nil && ack.Duplicate {
+		err = ErrDuplicate
 	}
-	if ack.Duplicate {
-		return "", ErrDuplicate
+	if err != nil {
+		if lock := msg.Header.Get(HeaderUniqueLock); lock != "" {
+			c.unlock(context.WithoutCancel(ctx), lock, id)
+		}
+		if errors.Is(err, ErrDuplicate) {
+			return "", err
+		}
+		return "", fmt.Errorf("jetq: enqueue %s: %w", name, err)
 	}
 	return id, nil
 }
@@ -160,7 +186,8 @@ func (c *Client) Cancel(ctx context.Context, id string) error {
 		return err
 	}
 	subject := c.delaySubject(id)
-	if _, err := c.stream.GetLastMsgForSubject(ctx, subject); err != nil {
+	scheduled, err := c.stream.GetLastMsgForSubject(ctx, subject)
+	if err != nil {
 		if errors.Is(err, jetstream.ErrMsgNotFound) {
 			return ErrNotFound
 		}
@@ -169,5 +196,32 @@ func (c *Client) Cancel(ctx context.Context, id string) error {
 	if err := c.stream.Purge(ctx, jetstream.WithPurgeSubject(subject)); err != nil {
 		return fmt.Errorf("jetq: cancel %s: %w", id, err)
 	}
+	if lock := scheduled.Header.Get(HeaderUniqueLock); lock != "" {
+		c.unlock(ctx, lock, id)
+	}
 	return nil
+}
+
+// lockKey maps a unique key to a valid key-value key.
+func lockKey(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:])
+}
+
+// unlock releases a UniqueUntilDone lock if it is still held by job id;
+// failures are logged and the lock then expires with its TTL.
+func (c *Client) unlock(ctx context.Context, lock, id string) {
+	entry, err := c.locks.Get(ctx, lock)
+	if errors.Is(err, jetstream.ErrKeyNotFound) {
+		return
+	}
+	if err == nil && string(entry.Value()) != id {
+		return
+	}
+	if err == nil {
+		err = c.locks.Delete(ctx, lock, jetstream.LastRevision(entry.Revision()))
+	}
+	if err != nil {
+		c.cfg.logger.WarnContext(ctx, "jetq unique lock release failed", "id", id, "error", err)
+	}
 }

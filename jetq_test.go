@@ -750,3 +750,110 @@ func TestSlowLogContextIsKeptAlive(t *testing.T) {
 		t.Fatalf("calls = %d", calls.Load())
 	}
 }
+
+func TestUniqueUntilDone(t *testing.T) {
+	c := newClient(t)
+	ctx := context.Background()
+	w := c.NewWorker(jetq.Queue{Name: "default", MaxAttempts: 2, Backoff: jetq.Constant(300 * time.Millisecond)})
+	release := make(chan struct{})
+	runs := make(chan string, 10)
+	jetq.Handle(w, func(ctx context.Context, job sendEmail) error {
+		runs <- job.To
+		switch job.To {
+		case "block":
+			<-release
+		case "fail":
+			return errors.New("boom")
+		}
+		return nil
+	})
+	start(t, w)
+
+	// Locked while running, free again after success.
+	if _, err := c.Enqueue(ctx, sendEmail{To: "block"}, jetq.UniqueUntilDone("k1")); err != nil {
+		t.Fatal(err)
+	}
+	wait(t, runs, 5*time.Second)
+	if _, err := c.Enqueue(ctx, sendEmail{To: "block"}, jetq.UniqueUntilDone("k1")); !errors.Is(err, jetq.ErrDuplicate) {
+		t.Fatalf("enqueue while running = %v", err)
+	}
+	close(release)
+	eventually(t, func() bool {
+		_, err := c.Enqueue(ctx, sendEmail{To: "ok"}, jetq.UniqueUntilDone("k1"))
+		return err == nil
+	})
+	wait(t, runs, 5*time.Second)
+
+	// Locked while waiting for a retry, free after the job is dead-lettered.
+	if _, err := c.Enqueue(ctx, sendEmail{To: "fail"}, jetq.UniqueUntilDone("k2")); err != nil {
+		t.Fatal(err)
+	}
+	wait(t, runs, 5*time.Second)
+	if _, err := c.Enqueue(ctx, sendEmail{To: "fail"}, jetq.UniqueUntilDone("k2")); !errors.Is(err, jetq.ErrDuplicate) {
+		t.Fatalf("enqueue while retrying = %v", err)
+	}
+	wait(t, runs, 5*time.Second)
+	eventually(t, func() bool {
+		_, err := c.Enqueue(ctx, sendEmail{To: "ok"}, jetq.UniqueUntilDone("k2"))
+		return err == nil
+	})
+
+	// Locked while delayed, free after cancelling.
+	id, err := c.Enqueue(ctx, sendEmail{To: "later"}, jetq.UniqueUntilDone("k3"), jetq.Delay(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Enqueue(ctx, sendEmail{To: "later"}, jetq.UniqueUntilDone("k3")); !errors.Is(err, jetq.ErrDuplicate) {
+		t.Fatalf("enqueue while delayed = %v", err)
+	}
+	if err := c.Cancel(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Enqueue(ctx, sendEmail{To: "ok"}, jetq.UniqueUntilDone("k3"), jetq.Delay(time.Hour)); err != nil {
+		t.Fatalf("enqueue after cancel = %v", err)
+	}
+	if err := c.SyncSchedules(ctx, jetq.Cron("u", "@daily", report{}, jetq.UniqueUntilDone("x"))); err == nil {
+		t.Fatal("expected schedule validation error")
+	}
+}
+
+func TestUniqueUntilDoneKeepsLockWhileSnoozed(t *testing.T) {
+	c := newClient(t)
+	ctx := context.Background()
+	w := c.NewWorker(jetq.Queue{Name: "default"})
+	runs := make(chan struct{}, 2)
+	var snoozed atomic.Bool
+	jetq.Handle(w, func(ctx context.Context, job sendEmail) error {
+		runs <- struct{}{}
+		if snoozed.CompareAndSwap(false, true) {
+			return jetq.Snooze(time.Second)
+		}
+		return nil
+	})
+	start(t, w)
+	if _, err := c.Enqueue(ctx, sendEmail{}, jetq.UniqueUntilDone("snooze")); err != nil {
+		t.Fatal(err)
+	}
+	wait(t, runs, 5*time.Second)
+	time.Sleep(200 * time.Millisecond)
+	if _, err := c.Enqueue(ctx, sendEmail{}, jetq.UniqueUntilDone("snooze")); !errors.Is(err, jetq.ErrDuplicate) {
+		t.Fatalf("enqueue while snoozed = %v", err)
+	}
+	wait(t, runs, 5*time.Second)
+	eventually(t, func() bool {
+		_, err := c.Enqueue(ctx, sendEmail{}, jetq.UniqueUntilDone("snooze"))
+		return err == nil
+	})
+}
+
+// eventually fails the test unless cond becomes true within five seconds.
+func eventually(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("condition not met within 5s")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}

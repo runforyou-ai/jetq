@@ -41,6 +41,7 @@ The body is the job encoded as JSON. Headers:
 | `Jetq-Max-Attempts` | Optional per-job attempt limit. |
 | `Jetq-Attempt-Base` | Attempts consumed before a snooze (internal). |
 | `Nats-Msg-Id` | `Unique` key, deduplicated by the stream within its duplicate window. |
+| `Jetq-Unique-Lock` | Lock key of a `UniqueUntilDone` job. |
 
 Application headers set with `WithHeader` (for example `traceparent`) are kept.
 Headers starting with `Jetq-` or `Nats-` are reserved.
@@ -147,7 +148,14 @@ concurrently.
 - At-least-once delivery. A handler may run more than once (crash, ack lost,
   keep-alive lost); handlers must be idempotent.
 - `Unique` only deduplicates within the stream's duplicate window (default 2m).
-  Long-lived uniqueness belongs in your database.
+- `UniqueUntilDone` takes a lock in the `<STREAM>_UNIQUE` key-value bucket
+  (key = SHA-256 of the unique key, value = job id) before publishing, and
+  returns `ErrDuplicate` while it is held. The worker releases it before acking
+  a success and after dead-lettering; `Cancel` releases it for delayed jobs; a
+  failed publish releases it. A lock is only released by the job that holds it.
+  Snoozed and retrying jobs keep it. A crash between taking the lock and
+  publishing, or between settling and releasing, leaves the lock until the
+  bucket TTL (`WithUniqueLockTTL`, default 24h) expires it.
 - `Enqueue` is not transactional with your database. Enqueue after commit; a
   crash between commit and enqueue loses the job. The outbox add-on closes this
   gap.
@@ -182,6 +190,5 @@ node stops the stream.
   the caller's transaction and a relay publishes it, with PostgreSQL and MySQL
   dialect modules.
 - Job chains and batches.
-- Long-lived unique jobs backed by JetStream KV.
 - Dead-letter requeue (API and CLI), dashboard.
 - OpenTelemetry instrumentation.

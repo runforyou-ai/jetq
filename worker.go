@@ -332,6 +332,9 @@ func (w *Worker) process(runCtx, jobCtx context.Context, q Queue, msg jetstream.
 	var retry *retryAfterError
 	switch {
 	case err == nil:
+		// Release the unique lock before acking: a lost ack then risks a
+		// duplicate run, never a key that stays locked.
+		w.releaseLock(settleCtx, msg, info)
 		if ackErr := msg.Ack(); ackErr != nil {
 			logger.WarnContext(settleCtx, "jetq ack failed", "queue", q.Name, "job", info.Name, "id", info.ID, "error", ackErr)
 		}
@@ -481,6 +484,7 @@ func (w *Worker) deadLetter(ctx context.Context, q Queue, msg jetstream.Msg, inf
 	for _, fn := range w.onFailed {
 		w.callback(failCtx, info, func() { fn(failCtx, info, msg.Data(), cause) })
 	}
+	w.releaseLock(ctx, msg, info)
 	if err := msg.Ack(); err != nil {
 		logger.WarnContext(ctx, "jetq ack failed", "queue", q.Name, "job", info.Name, "id", info.ID, "error", err)
 	}
@@ -495,6 +499,13 @@ func (w *Worker) callback(ctx context.Context, info Info, fn func()) {
 		}
 	}()
 	fn()
+}
+
+// releaseLock frees the UniqueUntilDone lock of a settled job.
+func (w *Worker) releaseLock(ctx context.Context, msg jetstream.Msg, info Info) {
+	if lock := msg.Headers().Get(HeaderUniqueLock); lock != "" {
+		w.client.unlock(ctx, lock, info.ID)
+	}
 }
 
 func truncate(s string, n int) string {

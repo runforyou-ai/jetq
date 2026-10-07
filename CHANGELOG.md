@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- `UniqueUntilDone` deduplicates a job by key until it settles, with locks in a
+  key-value bucket (`WithUniqueLockTTL`).
+
 ## v0.1.1
 
 - `Worker.SetLogContext` derives the context of jetq's job log records and failure callbacks.
