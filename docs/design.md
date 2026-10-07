@@ -56,10 +56,12 @@ queue subject and purges the schedule message. `Cancel(id)` removes the
 pending schedule message. A schedule can fire while `Cancel` runs, so `Cancel`
 first stores a marker `cancel.<id>` (holding the job's enqueue time) in the
 `<STREAM>_STATE` bucket, then deletes exactly the schedule message it read. If
-the delete fails, the marker is withdrawn and the job may still run
+the delete fails, the Cancel that wrote the marker withdraws it (a concurrent
+Cancel that found it leaves it alone) and the job may still run
 (`ErrNotFound` when the schedule already fired). If it succeeds, workers skip
 a copy the scheduler published meanwhile, including redeliveries of it, and
-release its lock; the marker expires with the bucket TTL. A job reusing the id
+release its lock; when the marker cannot be read, the copy is redelivered
+after 5 seconds instead of running; the marker expires with the bucket TTL. A job reusing the id
 later has another enqueue time and is not skipped. Cancel stays best effort
 for a copy a worker checked before the marker was written, and for a few
 seconds after the state bucket is first created (workers recheck a missing

@@ -314,7 +314,14 @@ func (w *Worker) process(runCtx, jobCtx context.Context, q Queue, msg jetstream.
 		return context.WithTimeout(context.WithoutCancel(runCtx), settleTimeout)
 	}
 
-	if w.client.cancelled(runCtx, header, info.ID) {
+	cancelled, err := w.client.cancelled(runCtx, header, info.ID)
+	if err != nil {
+		// Whether the job was cancelled is unknown: try again shortly without running it.
+		w.client.cfg.logger.WarnContext(runCtx, "jetq cancellation check failed", "queue", q.Name, "job", info.Name, "id", info.ID, "error", err)
+		_ = msg.NakWithDelay(cancelCheckRetry)
+		return
+	}
+	if cancelled {
 		// Cancelled while the schedule was firing: drop the copy unrun.
 		w.releaseLock(runCtx, msg, info)
 		if ackErr := msg.Ack(); ackErr != nil {
@@ -366,6 +373,10 @@ func (w *Worker) process(runCtx, jobCtx context.Context, q Queue, msg jetstream.
 		}
 	}
 }
+
+// cancelCheckRetry is the delay before redelivering a job whose cancellation
+// could not be checked.
+const cancelCheckRetry = 5 * time.Second
 
 // settleTimeout bounds publishing to the dead-letter stream, snoozing and failure callbacks.
 var settleTimeout = 30 * time.Second

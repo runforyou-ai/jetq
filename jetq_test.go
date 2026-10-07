@@ -1008,3 +1008,78 @@ func TestWorkerSkipsCancelledCopy(t *testing.T) {
 		t.Fatalf("ran %q", got)
 	}
 }
+
+func TestUniqueLockReleasedAcrossClients(t *testing.T) {
+	srv := jetqtest.Start(t)
+	ctx := context.Background()
+	// The worker's client sees no state bucket while handling a plain delayed
+	// job; another client then creates it by enqueueing a unique job.
+	workerClient, err := jetq.New(ctx, srv.JetStream, jetq.WithMemoryStorage())
+	if err != nil {
+		t.Fatal(err)
+	}
+	producer, err := jetq.New(ctx, srv.JetStream, jetq.WithMemoryStorage())
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := workerClient.NewWorker(jetq.Queue{Name: "default"})
+	ran := make(chan string, 3)
+	jetq.Handle(w, func(ctx context.Context, job sendEmail) error {
+		ran <- job.To
+		return nil
+	})
+	start(t, w)
+	if _, err := producer.Enqueue(ctx, sendEmail{To: "plain"}, jetq.Delay(500*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	wait(t, ran, 5*time.Second)
+	if _, err := producer.Enqueue(ctx, sendEmail{To: "locked"}, jetq.UniqueUntilDone("cross")); err != nil {
+		t.Fatal(err)
+	}
+	wait(t, ran, 5*time.Second)
+	eventually(t, func() bool {
+		_, err := producer.Enqueue(ctx, sendEmail{To: "again"}, jetq.UniqueUntilDone("cross"), jetq.Delay(time.Hour))
+		return err == nil
+	})
+}
+
+func TestConcurrentCancelKeepsMarker(t *testing.T) {
+	c := newClient(t)
+	ctx := context.Background()
+	stream, err := c.JetStream().Stream(ctx, c.StreamName())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 10 {
+		id, err := c.Enqueue(ctx, sendEmail{}, jetq.Delay(time.Hour))
+		if err != nil {
+			t.Fatal(err)
+		}
+		scheduled, err := stream.GetLastMsgForSubject(ctx, "jetq.at."+id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var wg sync.WaitGroup
+		results := make(chan error, 2)
+		for range 2 {
+			wg.Go(func() { results <- c.Cancel(ctx, id) })
+		}
+		wg.Wait()
+		close(results)
+		succeeded := 0
+		for err := range results {
+			switch {
+			case err == nil:
+				succeeded++
+			case !errors.Is(err, jetq.ErrNotFound):
+				t.Fatalf("Cancel = %v", err)
+			}
+		}
+		if succeeded == 0 {
+			t.Fatal("no Cancel succeeded")
+		}
+		if !jetq.CancelledCopy(c, id, scheduled.Header.Get(jetq.HeaderEnqueuedAt)) {
+			t.Fatal("a successful Cancel lost its marker")
+		}
+	}
+}
