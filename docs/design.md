@@ -59,10 +59,13 @@ first records a marker `cancel.<id>` (holding the job's enqueue time) in the
 the delete succeeds, `Cancel` returns nil and workers skip a copy the
 scheduler published meanwhile, including redeliveries of it, releasing its
 lock. If it fails because the schedule already fired, `Cancel` returns
-`ErrNotFound` and the job either runs or is skipped. Markers are never
+`ErrNotFound` and the job either runs or is skipped; the same holds when
+`Cancel` fails with another error after recording the marker. Markers are never
 withdrawn, so concurrent cancels cannot undo each other; they expire with the
 bucket TTL, and a later job reusing the id has another enqueue time and is not
-skipped. When the marker cannot be read, the copy is put back like a snooze
+skipped. Workers and lock releases read markers and locks through the bucket
+stream's leader, because key-value direct gets may be answered by a lagging
+follower. When the marker cannot be read, the copy is put back like a snooze
 and checked again after 5 seconds instead of running, without using up an
 attempt; if putting it back fails too, the copy is redelivered and that
 delivery counts as an attempt. Cancelling does not clear the `Unique` key, which

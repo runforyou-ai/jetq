@@ -60,8 +60,9 @@ type Client struct {
 	dead   jetstream.Stream
 	cfg    config
 
-	stateMu sync.Mutex
-	state   jetstream.KeyValue
+	stateMu     sync.Mutex
+	state       jetstream.KeyValue
+	stateLeader jetstream.Stream
 }
 
 type config struct {

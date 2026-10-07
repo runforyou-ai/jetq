@@ -190,7 +190,9 @@ func reservedHeader(key string) bool {
 // returns nil the job does not run: a copy the schedule may have published
 // while Cancel ran is skipped by workers. It returns [ErrNotFound] when the job
 // does not exist or has already become available for processing; when that
-// happens during Cancel, the job either runs or is skipped.
+// happens during Cancel, the job either runs or is skipped. Once Cancel has
+// recorded the cancellation, the job may be skipped even if Cancel then
+// returns an error.
 func (c *Client) Cancel(ctx context.Context, id string) error {
 	if err := validName("job id", id); err != nil {
 		return err
@@ -255,14 +257,51 @@ func (c *Client) cancelled(ctx context.Context, header nats.Header, id string) (
 	if err != nil || state == nil {
 		return false, err
 	}
-	entry, err := state.Get(ctx, cancelKey(id))
-	if errors.Is(err, jetstream.ErrKeyNotFound) {
-		return false, nil
-	}
-	if err != nil {
+	value, _, found, err := c.leaderGet(ctx, state, cancelKey(id))
+	if err != nil || !found {
 		return false, err
 	}
-	return string(entry.Value()) == header.Get(HeaderEnqueuedAt), nil
+	return string(value) == header.Get(HeaderEnqueuedAt), nil
+}
+
+// leaderGet reads a state key through the bucket stream's leader. Key-value
+// gets are direct gets that a lagging follower may answer with an older value,
+// which would hide a just written cancel marker or lock revision.
+func (c *Client) leaderGet(ctx context.Context, state jetstream.KeyValue, key string) (value []byte, revision uint64, found bool, err error) {
+	stream, err := c.stateLeaderStream(ctx, state.Bucket())
+	if err != nil {
+		return nil, 0, false, err
+	}
+	msg, err := stream.GetLastMsgForSubject(ctx, "$KV."+state.Bucket()+"."+key)
+	if errors.Is(err, jetstream.ErrMsgNotFound) {
+		return nil, 0, false, nil
+	}
+	if err != nil {
+		return nil, 0, false, err
+	}
+	switch msg.Header.Get("KV-Operation") {
+	case "DEL", "PURGE":
+		return nil, 0, false, nil
+	}
+	return msg.Data, msg.Sequence, true, nil
+}
+
+// stateLeaderStream returns a handle on the state bucket's stream whose gets
+// go to the stream leader: the handle's cached info has direct gets turned off.
+// Info is never called on it again, so the change stays in place.
+func (c *Client) stateLeaderStream(ctx context.Context, bucket string) (jetstream.Stream, error) {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	if c.stateLeader != nil {
+		return c.stateLeader, nil
+	}
+	stream, err := c.js.Stream(ctx, "KV_"+bucket)
+	if err != nil {
+		return nil, err
+	}
+	stream.CachedInfo().Config.AllowDirect = false
+	c.stateLeader = stream
+	return stream, nil
 }
 
 // lockKey maps a unique key to a valid key-value key.
@@ -284,15 +323,12 @@ func (c *Client) unlock(ctx context.Context, lock, id string) {
 	if locks == nil {
 		return
 	}
-	entry, err := locks.Get(ctx, lock)
-	if errors.Is(err, jetstream.ErrKeyNotFound) {
-		return
-	}
-	if err == nil && string(entry.Value()) != id {
+	value, revision, found, err := c.leaderGet(ctx, locks, lock)
+	if err == nil && (!found || string(value) != id) {
 		return
 	}
 	if err == nil {
-		err = locks.Delete(ctx, lock, jetstream.LastRevision(entry.Revision()))
+		err = locks.Delete(ctx, lock, jetstream.LastRevision(revision))
 	}
 	if err != nil {
 		c.cfg.logger.WarnContext(ctx, "jetq unique lock release failed", "id", id, "error", err)
