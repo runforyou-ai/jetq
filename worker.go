@@ -378,7 +378,7 @@ func (w *Worker) run(ctx context.Context, info Info, payload []byte) (err error)
 }
 
 // deriveLogContext applies the worker's log context function, falling back to
-// ctx when it is unset or panics.
+// ctx when it is unset, panics or returns nil.
 func (w *Worker) deriveLogContext(ctx context.Context, info Info) (derived context.Context) {
 	if w.logContext == nil {
 		return ctx
@@ -390,7 +390,10 @@ func (w *Worker) deriveLogContext(ctx context.Context, info Info) (derived conte
 			derived = ctx
 		}
 	}()
-	return w.logContext(ctx, info)
+	if derived = w.logContext(ctx, info); derived == nil {
+		return ctx
+	}
+	return derived
 }
 
 // keepAlive extends the ack deadline until the returned stop function is called.
