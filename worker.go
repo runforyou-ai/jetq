@@ -314,6 +314,14 @@ func (w *Worker) process(runCtx, jobCtx context.Context, q Queue, msg jetstream.
 		return context.WithTimeout(context.WithoutCancel(runCtx), settleTimeout)
 	}
 
+	if w.client.cancelled(runCtx, header, info.ID) {
+		// Cancelled while the schedule was firing: drop the copy unrun.
+		if ackErr := msg.Ack(); ackErr != nil {
+			w.client.cfg.logger.WarnContext(runCtx, "jetq ack failed", "queue", q.Name, "job", info.Name, "id", info.ID, "error", ackErr)
+		}
+		return
+	}
+
 	if info.Attempt > info.MaxAttempts {
 		settleCtx, cancelSettle := newSettleCtx()
 		defer cancelSettle()
@@ -477,6 +485,9 @@ func (w *Worker) deadLetter(ctx context.Context, q Queue, msg jetstream.Msg, inf
 	logger.ErrorContext(ctx, "jetq job failed permanently", "queue", q.Name, "job", info.Name, "id", info.ID,
 		"attempt", info.Attempt, "error", cause)
 
+	// The job is settled as dead: free its unique key before the callbacks, so
+	// they can enqueue a replacement with the same key.
+	w.releaseLock(ctx, msg, info)
 	failCtx := context.WithValue(ctx, infoKey{}, info)
 	if h, ok := w.handlers[info.Name]; ok && h.failed != nil {
 		w.callback(failCtx, info, func() { h.failed(failCtx, msg.Data(), cause) })
@@ -484,7 +495,6 @@ func (w *Worker) deadLetter(ctx context.Context, q Queue, msg jetstream.Msg, inf
 	for _, fn := range w.onFailed {
 		w.callback(failCtx, info, func() { fn(failCtx, info, msg.Data(), cause) })
 	}
-	w.releaseLock(ctx, msg, info)
 	if err := msg.Ack(); err != nil {
 		logger.WarnContext(ctx, "jetq ack failed", "queue", q.Name, "job", info.Name, "id", info.ID, "error", err)
 	}

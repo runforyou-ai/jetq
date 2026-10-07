@@ -19,6 +19,7 @@ import (
 	"log/slog"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
@@ -57,8 +58,10 @@ type Client struct {
 	js     jetstream.JetStream
 	stream jetstream.Stream
 	dead   jetstream.Stream
-	locks  jetstream.KeyValue
 	cfg    config
+
+	stateMu sync.Mutex
+	state   jetstream.KeyValue
 }
 
 type config struct {
@@ -85,10 +88,10 @@ func WithStreamName(name string) Option { return func(c *config) { c.streamName 
 // (default "jetq"). It must be a single subject token.
 func WithSubjectPrefix(prefix string) Option { return func(c *config) { c.prefix = prefix } }
 
-// WithReplicas sets the replica count of both streams (default 1).
+// WithReplicas sets the replica count of the work, dead-letter and state streams (default 1).
 func WithReplicas(n int) Option { return func(c *config) { c.replicas = n } }
 
-// WithMemoryStorage keeps both streams in memory instead of on disk.
+// WithMemoryStorage keeps the work, dead-letter and state streams in memory instead of on disk.
 func WithMemoryStorage() Option { return func(c *config) { c.storage = jetstream.MemoryStorage } }
 
 // WithDuplicateWindow sets how long [Unique] keys are remembered (default 2 minutes).
@@ -98,11 +101,19 @@ func WithDuplicateWindow(d time.Duration) Option { return func(c *config) { c.du
 func WithDeadLetterMaxAge(d time.Duration) Option { return func(c *config) { c.deadMaxAge = d } }
 
 // WithUniqueLockTTL sets how long a [UniqueUntilDone] lock lasts at most,
-// counted from enqueue (default 24 hours). It frees keys whose job never
+// counted from enqueue (default 24 hours); markers of cancelled delayed jobs
+// last as long. It frees keys whose job never
 // settles, for example after a crash between taking the lock and publishing.
 // Choose it longer than the time a unique job may stay unsettled, including
-// delays, retries and snoozes; after it, the key can be enqueued again.
-func WithUniqueLockTTL(d time.Duration) Option { return func(c *config) { c.uniqueTTL = d } }
+// delays, retries and snoozes; after it, the key can be enqueued again. It
+// applies when the lock bucket is created; non-positive values keep the default.
+func WithUniqueLockTTL(d time.Duration) Option {
+	return func(c *config) {
+		if d > 0 {
+			c.uniqueTTL = d
+		}
+	}
+}
 
 // WithMaxJobBytes limits the encoded size of a single job (default: server limit).
 // Non-positive values keep the default.
@@ -163,17 +174,41 @@ func New(ctx context.Context, js jetstream.JetStream, opts ...Option) (*Client, 
 	if err != nil {
 		return nil, fmt.Errorf("jetq: create stream %s: %w", cfg.deadName, err)
 	}
-	locks, err := js.CreateOrUpdateKeyValue(ctx, jetstream.KeyValueConfig{
-		Bucket:      cfg.streamName + "_UNIQUE",
-		Description: "jetq locks of unique jobs that have not settled",
-		TTL:         cfg.uniqueTTL,
-		Storage:     cfg.storage,
-		Replicas:    cfg.replicas,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("jetq: create unique lock bucket: %w", err)
+	return &Client{js: js, stream: stream, dead: dead, cfg: cfg}, nil
+}
+
+// stateBucket returns the key-value bucket holding UniqueUntilDone locks and
+// markers of cancelled delayed jobs. With create it is created on first use;
+// without, a missing bucket yields nil. An existing bucket is used as is, so
+// its TTL is the one it was created with.
+func (c *Client) stateBucket(ctx context.Context, create bool) (jetstream.KeyValue, error) {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	if c.state != nil {
+		return c.state, nil
 	}
-	return &Client{js: js, stream: stream, dead: dead, locks: locks, cfg: cfg}, nil
+	name := c.cfg.streamName + "_STATE"
+	state, err := c.js.KeyValue(ctx, name)
+	if errors.Is(err, jetstream.ErrBucketNotFound) {
+		if !create {
+			return nil, nil
+		}
+		state, err = c.js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+			Bucket:      name,
+			Description: "jetq unique job locks and cancelled delayed jobs",
+			TTL:         c.cfg.uniqueTTL,
+			Storage:     c.cfg.storage,
+			Replicas:    c.cfg.replicas,
+		})
+		if errors.Is(err, jetstream.ErrBucketExists) {
+			state, err = c.js.KeyValue(ctx, name)
+		}
+	}
+	if err != nil {
+		return nil, fmt.Errorf("jetq: state bucket: %w", err)
+	}
+	c.state = state
+	return state, nil
 }
 
 // JetStream returns the JetStream context the client was created with.
@@ -209,7 +244,8 @@ func validName(kind, name string) error {
 }
 
 // ErrDuplicate is returned by [Client.Enqueue] when a job with the same
-// [Unique] key was enqueued within the duplicate window. The job is not enqueued again.
+// [Unique] key was enqueued within the duplicate window, or a job with the same
+// [UniqueUntilDone] key has not settled. The job is not enqueued again.
 var ErrDuplicate = errors.New("jetq: duplicate job")
 
 // ErrNotFound is returned by [Client.Cancel] when no pending delayed job has the given id.

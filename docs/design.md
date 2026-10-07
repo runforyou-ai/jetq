@@ -51,11 +51,16 @@ Headers starting with `Jetq-` or `Nats-` are reserved.
 `Delay`/`At` publish a schedule message on `jetq.at.<id>` with
 `Nats-Schedule: @at <time>` and `Nats-Schedule-Target: jetq.q.<queue>`. When it
 fires, the server publishes a copy (minus scheduling headers and `Nats-Msg-Id`)
-to the queue subject and purges the schedule message. `Cancel(id)` purges the
-schedule subject; once it has fired, `Cancel` returns `ErrNotFound`. Cancel is
-best effort: a schedule that fires between the lookup and the purge still runs.
-Cancelling does not clear the `Unique` key, which stays reserved for the rest of
-the duplicate window.
+to the queue subject and purges the schedule message. `Cancel(id)` removes the
+pending schedule message. The NATS scheduler copies a due message before
+publishing the copy, so `Cancel` first stores a marker `cancel.<id>` (holding
+the job's enqueue time) in the `<STREAM>_STATE` bucket, then deletes exactly
+the schedule message it read. If the delete fails the schedule already fired:
+the marker is removed and `Cancel` returns `ErrNotFound`. If it succeeds, a
+copy that was already on its way is skipped by the worker, which consumes the
+marker. A job reusing the id later has another enqueue time and is not
+skipped. Cancelling does not clear the `Unique` key, which stays reserved for
+the rest of the duplicate window; a `UniqueUntilDone` lock is released.
 
 ## Recurring jobs
 
@@ -148,10 +153,12 @@ concurrently.
 - At-least-once delivery. A handler may run more than once (crash, ack lost,
   keep-alive lost); handlers must be idempotent.
 - `Unique` only deduplicates within the stream's duplicate window (default 2m).
-- `UniqueUntilDone` takes a lock in the `<STREAM>_UNIQUE` key-value bucket
+- `UniqueUntilDone` takes a lock in the `<STREAM>_STATE` key-value bucket,
+  created on first use (an existing bucket keeps its configuration; the client
+  needs permission to create it and to publish to `$KV.<STREAM>_STATE.>`)
   (key = SHA-256 of the unique key, value = job id) before publishing, and
   returns `ErrDuplicate` while it is held. The worker releases it before acking
-  a success and after dead-lettering; `Cancel` releases it for delayed jobs; a
+  a success and after dead-lettering, before failure callbacks run; `Cancel` releases it for delayed jobs; a
   publish the server rejected releases it; after an uncertain failure such as a
   timeout the job may have been stored, so the lock is kept. `Cancel` deletes
   exactly the schedule message it read and releases the lock only if that

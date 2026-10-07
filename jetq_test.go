@@ -872,3 +872,99 @@ func TestUniqueUntilDoneReleasedWhenPublishRejected(t *testing.T) {
 		t.Fatalf("enqueue after rejected publish = %v", err)
 	}
 }
+
+func TestUniqueUntilDoneLifecycle(t *testing.T) {
+	srv := jetqtest.Start(t)
+	ctx := context.Background()
+	c, err := jetq.New(ctx, srv.JetStream, jetq.WithMemoryStorage(), jetq.WithUniqueLockTTL(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Only one of many concurrent enqueues with the same key succeeds.
+	var wg sync.WaitGroup
+	var ok atomic.Int32
+	for range 10 {
+		wg.Go(func() {
+			if _, err := c.Enqueue(ctx, sendEmail{}, jetq.UniqueUntilDone("race"), jetq.Delay(time.Hour)); err == nil {
+				ok.Add(1)
+			}
+		})
+	}
+	wg.Wait()
+	if ok.Load() != 1 {
+		t.Fatalf("successful enqueues = %d", ok.Load())
+	}
+	// The lock expires with the TTL even though the job never settled.
+	eventually(t, func() bool {
+		_, err := c.Enqueue(ctx, sendEmail{}, jetq.UniqueUntilDone("race"), jetq.Delay(time.Hour))
+		return err == nil
+	})
+
+	w := c.NewWorker(jetq.Queue{Name: "default", MaxAttempts: 1})
+	ran := make(chan string, 4)
+	replaced := make(chan error, 1)
+	jetq.Handle(w, func(ctx context.Context, job sendEmail) error {
+		ran <- job.To
+		if job.To == "fail" {
+			return errors.New("boom")
+		}
+		return nil
+	}, jetq.OnFailure(func(ctx context.Context, job sendEmail, err error) {
+		// The key is free when failure callbacks run.
+		_, enqueueErr := c.Enqueue(ctx, sendEmail{To: "replacement"}, jetq.UniqueUntilDone("failing"), jetq.Delay(time.Hour))
+		replaced <- enqueueErr
+	}))
+	start(t, w)
+
+	// A delayed job releases its lock once it has run.
+	if _, err := c.Enqueue(ctx, sendEmail{To: "delayed"}, jetq.UniqueUntilDone("delayed"), jetq.Delay(500*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if got := wait(t, ran, 5*time.Second); got != "delayed" {
+		t.Fatalf("ran %q", got)
+	}
+	eventually(t, func() bool {
+		_, err := c.Enqueue(ctx, sendEmail{To: "again"}, jetq.UniqueUntilDone("delayed"), jetq.Delay(time.Hour))
+		return err == nil
+	})
+
+	if _, err := c.Enqueue(ctx, sendEmail{To: "fail"}, jetq.UniqueUntilDone("failing")); err != nil {
+		t.Fatal(err)
+	}
+	if err := wait(t, replaced, 5*time.Second); err != nil {
+		t.Fatalf("enqueue from failure callback = %v", err)
+	}
+}
+
+func TestCancelSkipsInFlightCopy(t *testing.T) {
+	c := newClient(t)
+	ctx := context.Background()
+	id, err := c.Enqueue(ctx, sendEmail{}, jetq.Delay(time.Hour), jetq.UniqueUntilDone("cancel-race"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := c.JetStream().Stream(ctx, c.StreamName())
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheduled, err := stream.GetLastMsgForSubject(ctx, "jetq.at."+id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enqueuedAt := scheduled.Header.Get(jetq.HeaderEnqueuedAt)
+	if err := c.Cancel(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	// A copy the scheduler published while Cancel ran is skipped once; a later
+	// job reusing the id with another enqueue time is not.
+	if jetq.CancelledCopy(c, id, "2000-01-01T00:00:00Z") {
+		t.Fatal("copy with another enqueue time was skipped")
+	}
+	if !jetq.CancelledCopy(c, id, enqueuedAt) {
+		t.Fatal("cancelled copy was not skipped")
+	}
+	if jetq.CancelledCopy(c, id, enqueuedAt) {
+		t.Fatal("marker was not consumed")
+	}
+}
