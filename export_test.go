@@ -23,3 +23,17 @@ func CancelledCopy(c *Client, id, enqueuedAt string) bool {
 	cancelled, err := c.cancelled(context.Background(), header, id)
 	return err == nil && cancelled
 }
+
+// StateLeaderReadsDirect reports whether the leader handle of the state bucket
+// still uses direct gets, which would make leader reads fall back to followers.
+func StateLeaderReadsDirect(c *Client) (bool, error) {
+	state, err := c.stateBucket(context.Background(), true)
+	if err != nil {
+		return false, err
+	}
+	stream, err := c.stateLeaderStream(context.Background(), state.Bucket())
+	if err != nil {
+		return false, err
+	}
+	return stream.CachedInfo().Config.AllowDirect, nil
+}

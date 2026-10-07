@@ -272,6 +272,7 @@ func (c *Client) leaderGet(ctx context.Context, state jetstream.KeyValue, key st
 	if err != nil {
 		return nil, 0, false, err
 	}
+	// Keys of a jetq-created bucket live on the default key-value subject $KV.<bucket>.<key>.
 	msg, err := stream.GetLastMsgForSubject(ctx, "$KV."+state.Bucket()+"."+key)
 	if errors.Is(err, jetstream.ErrMsgNotFound) {
 		return nil, 0, false, nil

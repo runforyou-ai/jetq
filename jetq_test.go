@@ -1083,3 +1083,14 @@ func TestConcurrentCancelKeepsMarker(t *testing.T) {
 		}
 	}
 }
+
+func TestStateReadsGoToLeader(t *testing.T) {
+	c := newClient(t)
+	direct, err := jetq.StateLeaderReadsDirect(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if direct {
+		t.Fatal("state reads still use direct gets")
+	}
+}
