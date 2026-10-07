@@ -47,6 +47,7 @@ type Worker struct {
 	handlers        map[string]*handler
 	middleware      []Middleware
 	onFailed        []FailedFunc
+	logContext      func(context.Context, Info) context.Context
 	shutdownTimeout time.Duration
 	started         atomic.Bool
 }
@@ -72,6 +73,16 @@ func (w *Worker) Use(middleware ...Middleware) {
 func (w *Worker) OnFailed(fn FailedFunc) {
 	w.mustNotBeStarted()
 	w.onFailed = append(w.onFailed, fn)
+}
+
+// SetLogContext sets a function that derives the context used for jetq's own
+// log records about a job (retries, dead-lettering, failure callbacks), for
+// example to attach the application's trace or tenant fields that a logging
+// handler reads from the context. Failure callbacks receive the derived
+// context too.
+func (w *Worker) SetLogContext(fn func(ctx context.Context, info Info) context.Context) {
+	w.mustNotBeStarted()
+	w.logContext = fn
 }
 
 // SetShutdownTimeout sets how long [Worker.Run] waits for running jobs after
@@ -289,6 +300,9 @@ func (w *Worker) process(runCtx, jobCtx context.Context, q Queue, msg jetstream.
 	if info.ID == "" {
 		key := strings.TrimPrefix(header.Get(headerScheduler), w.client.cronSubject(""))
 		info.ID = fmt.Sprintf("%s-%d", key, meta.Sequence.Stream)
+	}
+	if w.logContext != nil {
+		runCtx = w.logContext(runCtx, info)
 	}
 
 	// The keep-alive covers both the handler and settlement (dead-lettering,

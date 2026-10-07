@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `Worker.SetLogContext` derives the context of jetq's job log records and failure callbacks.
+
+## v0.1.0
+
 - `RawJob` and `Worker.HandleRaw` for job names known only at runtime; raw
   payloads are delivered byte for byte.
 - `JobID` enqueue option to choose the job id.
