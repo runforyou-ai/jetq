@@ -633,3 +633,19 @@ func TestBackoff(t *testing.T) {
 		}
 	}
 }
+
+func TestSettleTimeoutStartsAfterHandler(t *testing.T) {
+	defer jetq.SetSettleTimeout(time.Second)()
+	c := newClient(t)
+	w := c.NewWorker(jetq.Queue{Name: "default", MaxAttempts: 1})
+	jetq.Handle(w, func(ctx context.Context, job sendEmail) error {
+		time.Sleep(1500 * time.Millisecond)
+		return jetq.Permanent(errors.New("slow failure"))
+	})
+	failed := make(chan jetq.Info, 1)
+	w.OnFailed(func(ctx context.Context, info jetq.Info, payload []byte, err error) { failed <- info })
+	start(t, w)
+	id, _ := c.Enqueue(context.Background(), sendEmail{})
+	wait(t, failed, 10*time.Second)
+	assertDeadLetter(t, c, "default", id, "slow failure", "1")
+}

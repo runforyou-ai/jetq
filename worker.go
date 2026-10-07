@@ -291,11 +291,15 @@ func (w *Worker) process(runCtx, jobCtx context.Context, q Queue, msg jetstream.
 	// failure callbacks, snoozing), so the job is not redelivered meanwhile.
 	stopKeepAlive := keepAlive(msg, q.AckWait)
 	defer stopKeepAlive()
-	// Settlement must finish even when Run's context is cancelled during the shutdown grace period.
-	settleCtx, cancelSettle := context.WithTimeout(context.WithoutCancel(runCtx), settleTimeout)
-	defer cancelSettle()
+	// Settlement must finish even when Run's context is cancelled during the
+	// shutdown grace period; its timeout starts when settlement starts.
+	newSettleCtx := func() (context.Context, context.CancelFunc) {
+		return context.WithTimeout(context.WithoutCancel(runCtx), settleTimeout)
+	}
 
 	if info.Attempt > info.MaxAttempts {
+		settleCtx, cancelSettle := newSettleCtx()
+		defer cancelSettle()
 		// Redelivered after a crash on the last attempt: do not run the handler again.
 		w.deadLetter(settleCtx, q, msg, info, fmt.Errorf("jetq: attempt %d exceeds limit %d after redelivery", info.Attempt, info.MaxAttempts))
 		return
@@ -304,6 +308,8 @@ func (w *Worker) process(runCtx, jobCtx context.Context, q Queue, msg jetstream.
 	ctx, cancel := context.WithCancel(context.WithValue(jobCtx, infoKey{}, info))
 	defer cancel()
 	err = w.run(ctx, info, msg.Data())
+	settleCtx, cancelSettle := newSettleCtx()
+	defer cancelSettle()
 
 	var snooze *snoozeError
 	var retry *retryAfterError
@@ -333,7 +339,7 @@ func (w *Worker) process(runCtx, jobCtx context.Context, q Queue, msg jetstream.
 }
 
 // settleTimeout bounds publishing to the dead-letter stream, snoozing and failure callbacks.
-const settleTimeout = 30 * time.Second
+var settleTimeout = 30 * time.Second
 
 // run invokes the handler through the middleware chain, turning panics into errors.
 func (w *Worker) run(ctx context.Context, info Info, payload []byte) (err error) {
