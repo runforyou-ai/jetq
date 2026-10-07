@@ -709,3 +709,44 @@ func TestLogContext(t *testing.T) {
 		}
 	}
 }
+
+func TestLogContextPanicIsRecovered(t *testing.T) {
+	c := newClient(t)
+	w := c.NewWorker(jetq.Queue{Name: "default"})
+	w.SetLogContext(func(ctx context.Context, info jetq.Info) context.Context { panic("log context bug") })
+	done := make(chan struct{}, 1)
+	jetq.Handle(w, func(ctx context.Context, job sendEmail) error {
+		done <- struct{}{}
+		return nil
+	})
+	start(t, w)
+	if _, err := c.Enqueue(context.Background(), sendEmail{}); err != nil {
+		t.Fatal(err)
+	}
+	wait(t, done, 5*time.Second)
+}
+
+func TestSlowLogContextIsKeptAlive(t *testing.T) {
+	c := newClient(t)
+	w := c.NewWorker(jetq.Queue{Name: "default", AckWait: 300 * time.Millisecond, Concurrency: 2})
+	w.SetLogContext(func(ctx context.Context, info jetq.Info) context.Context {
+		time.Sleep(time.Second)
+		return ctx
+	})
+	var calls atomic.Int32
+	done := make(chan struct{}, 2)
+	jetq.Handle(w, func(ctx context.Context, job sendEmail) error {
+		calls.Add(1)
+		done <- struct{}{}
+		return nil
+	})
+	start(t, w)
+	if _, err := c.Enqueue(context.Background(), sendEmail{}); err != nil {
+		t.Fatal(err)
+	}
+	wait(t, done, 5*time.Second)
+	time.Sleep(time.Second)
+	if calls.Load() != 1 {
+		t.Fatalf("calls = %d", calls.Load())
+	}
+}

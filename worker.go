@@ -79,7 +79,8 @@ func (w *Worker) OnFailed(fn FailedFunc) {
 // log records about a job (retries, dead-lettering, failure callbacks), for
 // example to attach the application's trace or tenant fields that a logging
 // handler reads from the context. Failure callbacks receive the derived
-// context too.
+// context too. fn runs while the job is kept alive; if it panics, the panic is
+// logged and the original context is used.
 func (w *Worker) SetLogContext(fn func(ctx context.Context, info Info) context.Context) {
 	w.mustNotBeStarted()
 	w.logContext = fn
@@ -301,14 +302,12 @@ func (w *Worker) process(runCtx, jobCtx context.Context, q Queue, msg jetstream.
 		key := strings.TrimPrefix(header.Get(headerScheduler), w.client.cronSubject(""))
 		info.ID = fmt.Sprintf("%s-%d", key, meta.Sequence.Stream)
 	}
-	if w.logContext != nil {
-		runCtx = w.logContext(runCtx, info)
-	}
 
 	// The keep-alive covers both the handler and settlement (dead-lettering,
 	// failure callbacks, snoozing), so the job is not redelivered meanwhile.
 	stopKeepAlive := keepAlive(msg, q.AckWait)
 	defer stopKeepAlive()
+	runCtx = w.deriveLogContext(runCtx, info)
 	// Settlement must finish even when Run's context is cancelled during the
 	// shutdown grace period; its timeout starts when settlement starts.
 	newSettleCtx := func() (context.Context, context.CancelFunc) {
@@ -376,6 +375,22 @@ func (w *Worker) run(ctx context.Context, info Info, payload []byte) (err error)
 		next = func(ctx context.Context) error { return mw(ctx, inner) }
 	}
 	return next(ctx)
+}
+
+// deriveLogContext applies the worker's log context function, falling back to
+// ctx when it is unset or panics.
+func (w *Worker) deriveLogContext(ctx context.Context, info Info) (derived context.Context) {
+	if w.logContext == nil {
+		return ctx
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			w.client.cfg.logger.ErrorContext(ctx, "jetq log context panicked", "job", info.Name, "id", info.ID,
+				"panic", r, "stack", string(debug.Stack()))
+			derived = ctx
+		}
+	}()
+	return w.logContext(ctx, info)
 }
 
 // keepAlive extends the ack deadline until the returned stop function is called.
