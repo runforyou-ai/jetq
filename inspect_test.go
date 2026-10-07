@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -246,5 +247,59 @@ func TestJobIDAndHandleRawPanics(t *testing.T) {
 			}()
 			w.HandleRaw(name, func(ctx context.Context, payload json.RawMessage) error { return nil })
 		}()
+	}
+}
+
+func TestDeadLettersQueueFilterAcrossBatches(t *testing.T) {
+	c := newClient(t)
+	ctx := context.Background()
+	w := c.NewWorker(jetq.Queue{Name: "mail", MaxAttempts: 1, Concurrency: 16})
+	failed := make(chan struct{}, 600)
+	jetq.Handle(w, func(ctx context.Context, job sendEmail) error { return errors.New(job.To) })
+	w.OnFailed(func(ctx context.Context, info jetq.Info, payload []byte, err error) { failed <- struct{}{} })
+	start(t, w)
+	for i := range 600 {
+		if _, err := c.Enqueue(ctx, sendEmail{To: strconv.Itoa(i)}, jetq.OnQueue("mail")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for range 600 {
+		wait(t, failed, 10*time.Second)
+	}
+	all, err := c.DeadLetters(ctx, jetq.DeadLetterQuery{Limit: 600})
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, err := c.DeadLetters(ctx, jetq.DeadLetterQuery{Queue: "mail", Limit: 50})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page) != 50 || page[0].Sequence != all[0].Sequence || page[49].Sequence != all[49].Sequence {
+		t.Fatalf("first page: got %d..%d, want %d..%d", page[0].Sequence, page[len(page)-1].Sequence, all[0].Sequence, all[49].Sequence)
+	}
+	next, err := c.DeadLetters(ctx, jetq.DeadLetterQuery{Queue: "mail", Limit: 50, Before: page[49].Sequence})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(next) != 50 || next[0].Sequence != all[50].Sequence {
+		t.Fatalf("second page starts at %d, want %d", next[0].Sequence, all[50].Sequence)
+	}
+}
+
+func TestRawJobPointer(t *testing.T) {
+	c := newClient(t)
+	w := c.NewWorker(jetq.Queue{Name: "default"})
+	got := make(chan string, 1)
+	w.HandleRaw("raw", func(ctx context.Context, payload json.RawMessage) error {
+		got <- string(payload)
+		return nil
+	})
+	start(t, w)
+	original := `{ "a": "<b>" }`
+	if _, err := c.Enqueue(context.Background(), &jetq.RawJob{Name: "raw", Payload: json.RawMessage(original)}); err != nil {
+		t.Fatal(err)
+	}
+	if p := wait(t, got, 5*time.Second); p != original {
+		t.Fatalf("payload = %q", p)
 	}
 }

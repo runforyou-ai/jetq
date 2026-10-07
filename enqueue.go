@@ -128,6 +128,9 @@ func (c *Client) Enqueue(ctx context.Context, job Job, opts ...EnqueueOption) (s
 
 // encodeJob encodes job as JSON; a [RawJob] payload is used byte for byte.
 func encodeJob(job Job) ([]byte, error) {
+	if raw, ok := job.(*RawJob); ok && raw != nil {
+		job = *raw
+	}
 	if raw, ok := job.(RawJob); ok {
 		if len(raw.Payload) == 0 {
 			return []byte("null"), nil

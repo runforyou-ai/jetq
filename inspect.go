@@ -159,34 +159,32 @@ func (c *Client) queueDeadLetters(ctx context.Context, query DeadLetterQuery) ([
 	if err != nil {
 		return nil, fmt.Errorf("jetq: dead letters: %w", err)
 	}
-	remaining := info.NumPending
 	var window []DeadLetter
-	for remaining > 0 {
-		batch, err := consumer.FetchNoWait(int(min(remaining, 256)))
+	if info.NumPending == 0 {
+		return window, nil
+	}
+	messages, err := consumer.Messages(jetstream.PullMaxMessages(256))
+	if err != nil {
+		return nil, fmt.Errorf("jetq: dead letters: %w", err)
+	}
+	defer messages.Stop()
+	for {
+		msg, err := messages.Next(jetstream.NextContext(ctx))
 		if err != nil {
 			return nil, fmt.Errorf("jetq: dead letters: %w", err)
 		}
-		received := 0
-		for msg := range batch.Messages() {
-			received++
-			remaining--
-			meta, err := msg.Metadata()
-			if err != nil {
-				return nil, fmt.Errorf("jetq: dead letters: %w", err)
-			}
-			if query.Before > 0 && meta.Sequence.Stream >= query.Before {
-				remaining = 0
-				break
-			}
-			window = append(window, deadLetter(meta.Sequence.Stream, msg.Headers(), msg.Data()))
-			if len(window) > query.Limit {
-				window = window[1:]
-			}
-		}
-		if err := batch.Error(); err != nil {
+		meta, err := msg.Metadata()
+		if err != nil {
 			return nil, fmt.Errorf("jetq: dead letters: %w", err)
 		}
-		if received == 0 {
+		if query.Before > 0 && meta.Sequence.Stream >= query.Before {
+			break
+		}
+		window = append(window, deadLetter(meta.Sequence.Stream, msg.Headers(), msg.Data()))
+		if len(window) > query.Limit {
+			window = window[1:]
+		}
+		if meta.NumPending == 0 {
 			break
 		}
 	}
