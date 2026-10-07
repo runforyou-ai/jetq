@@ -1,0 +1,23 @@
+version: "2"
+linters:
+  enable:
+    - bodyclose
+    - errorlint
+    - gocritic
+    - misspell
+    - revive
+    - unconvert
+    - unparam
+  settings:
+    revive:
+      rules:
+        - name: exported
+  exclusions:
+    rules:
+      # Examples favour readability over exhaustive error handling.
+      - path: example_test\.go
+        linters: [errcheck, gocritic]
+formatters:
+  enable:
+    - gofmt
+    - goimports
