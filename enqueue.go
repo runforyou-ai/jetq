@@ -51,7 +51,9 @@ func Unique(key string) EnqueueOption { return func(o *enqueueOptions) { o.uniqu
 // UniqueUntilDone deduplicates the job by key until it settles: while a job
 // with the same key is pending, delayed, running or waiting for a retry, a new
 // enqueue returns [ErrDuplicate]; once it succeeds, is dead-lettered or is
-// cancelled, the key is free again. See [WithUniqueLockTTL].
+// cancelled, the key is free again. The lock lasts at most the lock TTL from
+// enqueue (see [WithUniqueLockTTL]), so jobs that stay unsettled longer lose
+// their deduplication.
 func UniqueUntilDone(key string) EnqueueOption { return func(o *enqueueOptions) { o.lock = key } }
 
 // MaxAttempts overrides the queue's attempt limit for this job.
@@ -141,7 +143,9 @@ func (c *Client) Enqueue(ctx context.Context, job Job, opts ...EnqueueOption) (s
 		err = ErrDuplicate
 	}
 	if err != nil {
-		if lock := msg.Header.Get(HeaderUniqueLock); lock != "" {
+		// Release the lock only when the job was certainly not stored; after
+		// a timeout it may have been, and the lock then expires with its TTL.
+		if lock := msg.Header.Get(HeaderUniqueLock); lock != "" && notStored(err) {
 			c.unlock(context.WithoutCancel(ctx), lock, id)
 		}
 		if errors.Is(err, ErrDuplicate) {
@@ -193,13 +197,25 @@ func (c *Client) Cancel(ctx context.Context, id string) error {
 		}
 		return fmt.Errorf("jetq: cancel %s: %w", id, err)
 	}
-	if err := c.stream.Purge(ctx, jetstream.WithPurgeSubject(subject)); err != nil {
+	// Delete exactly the message read above: if the schedule fired in the
+	// meantime, the delete fails and the job is left to run.
+	if err := c.stream.DeleteMsg(ctx, scheduled.Sequence); err != nil {
+		if errors.Is(err, jetstream.ErrMsgDeleteUnsuccessful) || errors.Is(err, jetstream.ErrMsgNotFound) {
+			return ErrNotFound
+		}
 		return fmt.Errorf("jetq: cancel %s: %w", id, err)
 	}
 	if lock := scheduled.Header.Get(HeaderUniqueLock); lock != "" {
 		c.unlock(ctx, lock, id)
 	}
 	return nil
+}
+
+// notStored reports whether a publish error means the server did not store the
+// message: it answered with an error, reported a duplicate, or had no stream.
+func notStored(err error) bool {
+	var apiErr *jetstream.APIError
+	return errors.Is(err, ErrDuplicate) || errors.As(err, &apiErr) || errors.Is(err, jetstream.ErrNoStreamResponse)
 }
 
 // lockKey maps a unique key to a valid key-value key.

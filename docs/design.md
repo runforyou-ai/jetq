@@ -152,10 +152,14 @@ concurrently.
   (key = SHA-256 of the unique key, value = job id) before publishing, and
   returns `ErrDuplicate` while it is held. The worker releases it before acking
   a success and after dead-lettering; `Cancel` releases it for delayed jobs; a
-  failed publish releases it. A lock is only released by the job that holds it.
-  Snoozed and retrying jobs keep it. A crash between taking the lock and
-  publishing, or between settling and releasing, leaves the lock until the
-  bucket TTL (`WithUniqueLockTTL`, default 24h) expires it.
+  publish the server rejected releases it; after an uncertain failure such as a
+  timeout the job may have been stored, so the lock is kept. `Cancel` deletes
+  exactly the schedule message it read and releases the lock only if that
+  delete succeeds. A lock is only released by the job that holds it. Snoozed
+  and retrying jobs keep it. Every lock expires at the bucket TTL
+  (`WithUniqueLockTTL`, default 24h) counted from enqueue, which bounds locks
+  left behind by crashes and also ends deduplication for jobs that stay
+  unsettled longer.
 - `Enqueue` is not transactional with your database. Enqueue after commit; a
   crash between commit and enqueue loses the job. The outbox add-on closes this
   gap.

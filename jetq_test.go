@@ -857,3 +857,18 @@ func eventually(t *testing.T, cond func() bool) {
 		time.Sleep(50 * time.Millisecond)
 	}
 }
+
+func TestUniqueUntilDoneReleasedWhenPublishRejected(t *testing.T) {
+	c := newClient(t)
+	ctx := context.Background()
+	if _, err := c.Enqueue(ctx, sendEmail{}, jetq.Unique("window"), jetq.UniqueUntilDone("first")); err != nil {
+		t.Fatal(err)
+	}
+	// The stream rejects the duplicate, so the lock taken for "second" is released.
+	if _, err := c.Enqueue(ctx, sendEmail{}, jetq.Unique("window"), jetq.UniqueUntilDone("second")); !errors.Is(err, jetq.ErrDuplicate) {
+		t.Fatalf("duplicate enqueue = %v", err)
+	}
+	if _, err := c.Enqueue(ctx, sendEmail{}, jetq.UniqueUntilDone("second")); err != nil {
+		t.Fatalf("enqueue after rejected publish = %v", err)
+	}
+}

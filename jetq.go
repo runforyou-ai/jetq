@@ -97,10 +97,11 @@ func WithDuplicateWindow(d time.Duration) Option { return func(c *config) { c.du
 // WithDeadLetterMaxAge sets how long dead-lettered jobs are kept (default 14 days).
 func WithDeadLetterMaxAge(d time.Duration) Option { return func(c *config) { c.deadMaxAge = d } }
 
-// WithUniqueLockTTL bounds how long a [UniqueUntilDone] key stays locked when
-// its job never settles, for example after a crash between taking the lock and
-// publishing (default 24 hours). Keep it longer than the longest delay used
-// with UniqueUntilDone.
+// WithUniqueLockTTL sets how long a [UniqueUntilDone] lock lasts at most,
+// counted from enqueue (default 24 hours). It frees keys whose job never
+// settles, for example after a crash between taking the lock and publishing.
+// Choose it longer than the time a unique job may stay unsettled, including
+// delays, retries and snoozes; after it, the key can be enqueued again.
 func WithUniqueLockTTL(d time.Duration) Option { return func(c *config) { c.uniqueTTL = d } }
 
 // WithMaxJobBytes limits the encoded size of a single job (default: server limit).
