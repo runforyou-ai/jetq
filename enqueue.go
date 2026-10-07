@@ -125,7 +125,7 @@ func (c *Client) Enqueue(ctx context.Context, job Job, opts ...EnqueueOption) (s
 
 	if o.lock != "" {
 		lock := lockKey(o.lock)
-		locks, err := c.stateBucket(ctx, createBucket)
+		locks, err := c.stateBucket(ctx, true)
 		if err != nil {
 			return "", err
 		}
@@ -186,11 +186,11 @@ func reservedHeader(key string) bool {
 	return strings.HasPrefix(lower, "jetq-") || strings.HasPrefix(lower, "nats-")
 }
 
-// Cancel removes a pending delayed job enqueued with [Delay] or [At]. It
-// returns [ErrNotFound] when the job does not exist or has already become
-// available for processing. When it returns nil, a copy the schedule may have
-// published while Cancel ran is skipped by workers; Cancel is best effort only
-// for a copy a worker picked up before the cancellation was recorded.
+// Cancel removes a pending delayed job enqueued with [Delay] or [At]. When it
+// returns nil the job does not run: a copy the schedule may have published
+// while Cancel ran is skipped by workers. It returns [ErrNotFound] when the job
+// does not exist or has already become available for processing; when that
+// happens during Cancel, the job either runs or is skipped.
 func (c *Client) Cancel(ctx context.Context, id string) error {
 	if err := validName("job id", id); err != nil {
 		return err
@@ -203,39 +203,25 @@ func (c *Client) Cancel(ctx context.Context, id string) error {
 		}
 		return fmt.Errorf("jetq: cancel %s: %w", id, err)
 	}
-	// Mark the job cancelled first: the scheduler may have copied it to the
-	// queue already, and workers skip a marked copy.
-	state, err := c.stateBucket(ctx, createBucket)
+	// Record the cancellation before deleting: the scheduler may be publishing
+	// a copy right now, and workers skip a recorded copy. The marker is never
+	// withdrawn, so a concurrent Cancel cannot undo it; it expires with the
+	// bucket TTL and holds the enqueue time, so a later job reusing the id is
+	// not affected.
+	state, err := c.stateBucket(ctx, true)
 	if err != nil {
 		return fmt.Errorf("jetq: cancel %s: %w", id, err)
 	}
-	marker := cancelKey(id)
-	revision, owned, err := c.markCancelled(ctx, state, marker, scheduled.Header.Get(HeaderEnqueuedAt))
-	if err != nil {
+	if _, err := state.Put(ctx, cancelKey(id), []byte(scheduled.Header.Get(HeaderEnqueuedAt))); err != nil {
 		return fmt.Errorf("jetq: cancel %s: %w", id, err)
 	}
-	// Delete exactly the message read above. On any failure the job may still
-	// run, so the marker is withdrawn by the Cancel that wrote it; a concurrent
-	// Cancel that found the marker leaves it to its owner.
+	// Delete exactly the message read above; if the schedule fired meanwhile,
+	// the delete fails and the copy runs or is skipped, releasing its own lock.
 	if err := c.stream.DeleteMsg(ctx, scheduled.Sequence); err != nil {
-		if owned {
-			withdrawCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), unlockTimeout)
-			if withdrawErr := state.Delete(withdrawCtx, marker, jetstream.LastRevision(revision)); withdrawErr != nil {
-				c.cfg.logger.WarnContext(ctx, "jetq cancel marker withdrawal failed", "id", id, "error", withdrawErr)
-			}
-			cancel()
-		}
 		if errors.Is(err, jetstream.ErrMsgDeleteUnsuccessful) || errors.Is(err, jetstream.ErrMsgNotFound) {
 			return ErrNotFound
 		}
 		return fmt.Errorf("jetq: cancel %s: %w", id, err)
-	}
-	if !owned {
-		// Rewrite the shared marker so that the owner, should its own delete
-		// fail after this one succeeded, cannot withdraw it by revision.
-		if _, err := state.Put(ctx, marker, []byte(scheduled.Header.Get(HeaderEnqueuedAt))); err != nil {
-			return fmt.Errorf("jetq: cancel %s: %w", id, err)
-		}
 	}
 	if lock := scheduled.Header.Get(HeaderUniqueLock); lock != "" {
 		c.unlock(ctx, lock, id)
@@ -250,41 +236,11 @@ func notStored(err error) bool {
 	return errors.Is(err, ErrDuplicate) || errors.As(err, &apiErr) || errors.Is(err, jetstream.ErrNoStreamResponse)
 }
 
-// unlockTimeout bounds releasing a UniqueUntilDone lock or withdrawing a cancel marker.
+// unlockTimeout bounds releasing a UniqueUntilDone lock.
 const unlockTimeout = 5 * time.Second
 
 // cancelKey is the state key marking delayed job id as cancelled.
 func cancelKey(id string) string { return "cancel." + id }
-
-// markCancelled writes the cancel marker holding enqueuedAt. owned is false
-// when a concurrent Cancel of the same job already wrote it; a marker left by
-// an earlier job that reused the id is replaced and owned.
-func (c *Client) markCancelled(ctx context.Context, state jetstream.KeyValue, marker, enqueuedAt string) (revision uint64, owned bool, err error) {
-	for range 2 {
-		revision, err = state.Create(ctx, marker, []byte(enqueuedAt))
-		if err == nil {
-			return revision, true, nil
-		}
-		if !errors.Is(err, jetstream.ErrKeyExists) {
-			return 0, false, err
-		}
-		var entry jetstream.KeyValueEntry
-		entry, err = state.Get(ctx, marker)
-		if errors.Is(err, jetstream.ErrKeyNotFound) {
-			// Withdrawn by another Cancel in between: try to create it again.
-			continue
-		}
-		if err != nil {
-			return 0, false, err
-		}
-		if string(entry.Value()) == enqueuedAt {
-			return entry.Revision(), false, nil
-		}
-		revision, err = state.Update(ctx, marker, []byte(enqueuedAt), entry.Revision())
-		return revision, err == nil, err
-	}
-	return 0, false, err
-}
 
 // cancelled reports whether a job fired from a delayed schedule was cancelled.
 // It returns an error when that cannot be determined; the job must then not
@@ -295,7 +251,7 @@ func (c *Client) cancelled(ctx context.Context, header nats.Header, id string) (
 	if !strings.HasPrefix(header.Get(headerScheduler), c.delaySubject("")) {
 		return false, nil
 	}
-	state, err := c.stateBucket(ctx, cachedLookupBucket)
+	state, err := c.stateBucket(ctx, false)
 	if err != nil || state == nil {
 		return false, err
 	}
@@ -320,7 +276,7 @@ func lockKey(key string) string {
 func (c *Client) unlock(ctx context.Context, lock, id string) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), unlockTimeout)
 	defer cancel()
-	locks, err := c.stateBucket(ctx, lookupBucket)
+	locks, err := c.stateBucket(ctx, false)
 	if err != nil {
 		c.cfg.logger.WarnContext(ctx, "jetq unique lock release failed", "id", id, "error", err)
 		return

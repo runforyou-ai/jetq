@@ -60,9 +60,8 @@ type Client struct {
 	dead   jetstream.Stream
 	cfg    config
 
-	stateMu           sync.Mutex
-	state             jetstream.KeyValue
-	stateMissingUntil time.Time
+	stateMu sync.Mutex
+	state   jetstream.KeyValue
 }
 
 type config struct {
@@ -178,42 +177,20 @@ func New(ctx context.Context, js jetstream.JetStream, opts ...Option) (*Client, 
 	return &Client{js: js, stream: stream, dead: dead, cfg: cfg}, nil
 }
 
-// stateMissingRecheck is how long a missing state bucket is assumed to stay
-// missing before looking again.
-const stateMissingRecheck = 5 * time.Second
-
-// bucketAccess says how stateBucket treats a missing bucket.
-type bucketAccess int
-
-const (
-	// createBucket creates a missing bucket.
-	createBucket bucketAccess = iota
-	// lookupBucket looks the bucket up and yields nil when it is missing.
-	lookupBucket
-	// cachedLookupBucket is lookupBucket that trusts a recent miss; only for
-	// the per-job cancellation check, where a stale miss is acceptable.
-	cachedLookupBucket
-)
-
 // stateBucket returns the key-value bucket holding UniqueUntilDone locks and
-// markers of cancelled delayed jobs, treating a missing bucket per access. An
-// existing bucket is used as is, so its TTL is the one it was created with.
-func (c *Client) stateBucket(ctx context.Context, access bucketAccess) (jetstream.KeyValue, error) {
+// markers of cancelled delayed jobs. With create a missing bucket is created;
+// without, it yields nil. An existing bucket is used as is, so its TTL is the
+// one it was created with.
+func (c *Client) stateBucket(ctx context.Context, create bool) (jetstream.KeyValue, error) {
 	c.stateMu.Lock()
 	defer c.stateMu.Unlock()
 	if c.state != nil {
 		return c.state, nil
 	}
-	// A recent lookup found no bucket: skip the request for a while, so that
-	// delayed jobs do not each pay a round trip when nobody cancels or locks.
-	if access == cachedLookupBucket && time.Now().Before(c.stateMissingUntil) {
-		return nil, nil
-	}
 	name := c.cfg.streamName + "_STATE"
 	state, err := c.js.KeyValue(ctx, name)
 	if errors.Is(err, jetstream.ErrBucketNotFound) {
-		if access != createBucket {
-			c.stateMissingUntil = time.Now().Add(stateMissingRecheck)
+		if !create {
 			return nil, nil
 		}
 		state, err = c.js.CreateKeyValue(ctx, jetstream.KeyValueConfig{

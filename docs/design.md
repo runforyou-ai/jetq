@@ -54,19 +54,18 @@ Headers starting with `Jetq-` or `Nats-` are reserved.
 server publishes a copy (minus scheduling headers and `Nats-Msg-Id`) to the
 queue subject and purges the schedule message. `Cancel(id)` removes the
 pending schedule message. A schedule can fire while `Cancel` runs, so `Cancel`
-first stores a marker `cancel.<id>` (holding the job's enqueue time) in the
+first records a marker `cancel.<id>` (holding the job's enqueue time) in the
 `<STREAM>_STATE` bucket, then deletes exactly the schedule message it read. If
-the delete fails, the job may still run (`ErrNotFound` when the schedule
-already fired) and the Cancel that wrote the marker withdraws it by revision;
-a concurrent Cancel that found the marker and deleted the message rewrites it,
-so that withdrawal no longer matches. If it succeeds, workers skip
-a copy the scheduler published meanwhile, including redeliveries of it, and
-release its lock; when the marker cannot be read, the copy is put back like a snooze and checked
-again after 5 seconds instead of running, without using up an attempt; the marker expires with the bucket TTL. A job reusing the id
-later has another enqueue time and is not skipped. Cancel stays best effort
-for a copy a worker checked before the marker was written, and for a few
-seconds after the state bucket is first created (workers recheck a missing
-bucket every 5 seconds). Cancelling does not clear the `Unique` key, which
+the delete succeeds, `Cancel` returns nil and workers skip a copy the
+scheduler published meanwhile, including redeliveries of it, releasing its
+lock. If it fails because the schedule already fired, `Cancel` returns
+`ErrNotFound` and the job either runs or is skipped. Markers are never
+withdrawn, so concurrent cancels cannot undo each other; they expire with the
+bucket TTL, and a later job reusing the id has another enqueue time and is not
+skipped. When the marker cannot be read, the copy is put back like a snooze
+and checked again after 5 seconds instead of running, without using up an
+attempt; if putting it back fails too, the copy is redelivered and that
+delivery counts as an attempt. Cancelling does not clear the `Unique` key, which
 stays reserved for the rest of the duplicate window; a `UniqueUntilDone` lock
 is released.
 
