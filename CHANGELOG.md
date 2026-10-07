@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.2.0
 
 - `UniqueUntilDone` deduplicates a job by key until it settles, with locks in a
   key-value bucket (`WithUniqueLockTTL`).
