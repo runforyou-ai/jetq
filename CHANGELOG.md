@@ -2,7 +2,9 @@
 
 ## Unreleased
 
-- `RawJob` and `Worker.HandleRaw` for job names known only at runtime.
+- `RawJob` and `Worker.HandleRaw` for job names known only at runtime; raw
+  payloads are delivered byte for byte.
+- `JobID` enqueue option to choose the job id.
 - `Client.Stats` and `Client.DeadLetters` for monitoring.
 
 - Initial release: typed jobs, queues with concurrency, retries with backoff,
