@@ -167,6 +167,9 @@ func TestInspectionIsConcurrencySafe(t *testing.T) {
 				if _, err := c.DeadLetters(ctx, jetq.DeadLetterQuery{}); err != nil {
 					t.Error(err)
 				}
+				if _, err := c.DeadLetters(ctx, jetq.DeadLetterQuery{Queue: "default"}); err != nil {
+					t.Error(err)
+				}
 				if err := c.SyncSchedules(ctx, jetq.Cron("nightly", "@daily", report{})); err != nil {
 					t.Error(err)
 				}

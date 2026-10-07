@@ -17,6 +17,15 @@ type RawJob struct {
 // JobName returns the job name.
 func (j RawJob) JobName() string { return j.Name }
 
+// MarshalJSON returns the payload ("null" when empty), so a RawJob encodes
+// as its payload wherever it is marshalled.
+func (j RawJob) MarshalJSON() ([]byte, error) {
+	if len(j.Payload) == 0 {
+		return []byte("null"), nil
+	}
+	return j.Payload, nil
+}
+
 // RawHandleOption configures a handler registered with [Worker.HandleRaw].
 type RawHandleOption func(*handler)
 

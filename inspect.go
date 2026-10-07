@@ -150,7 +150,8 @@ func (c *Client) DeadLetters(ctx context.Context, query DeadLetterQuery) ([]Dead
 // ordered consumer, keeping the newest query.Limit entries.
 func (c *Client) queueDeadLetters(ctx context.Context, query DeadLetterQuery) ([]DeadLetter, error) {
 	consumer, err := c.js.OrderedConsumer(ctx, c.cfg.deadName, jetstream.OrderedConsumerConfig{
-		FilterSubjects: []string{c.deadSubject(query.Queue)},
+		FilterSubjects:    []string{c.deadSubject(query.Queue)},
+		InactiveThreshold: 30 * time.Second,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("jetq: dead letters: %w", err)
@@ -168,7 +169,8 @@ func (c *Client) queueDeadLetters(ctx context.Context, query DeadLetterQuery) ([
 		return nil, fmt.Errorf("jetq: dead letters: %w", err)
 	}
 	defer messages.Stop()
-	for {
+	// Stop after the entries that existed when the query started, even while new dead letters arrive.
+	for remaining := info.NumPending; remaining > 0; remaining-- {
 		msg, err := messages.Next(jetstream.NextContext(ctx))
 		if err != nil {
 			return nil, fmt.Errorf("jetq: dead letters: %w", err)

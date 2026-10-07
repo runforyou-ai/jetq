@@ -98,8 +98,8 @@ func (c *Client) scheduleMsg(s Schedule) (*nats.Msg, error) {
 	for _, opt := range s.opts {
 		opt(&o)
 	}
-	if o.unique != "" || o.delay != 0 || !o.at.IsZero() {
-		return nil, fmt.Errorf("jetq: schedule %q: Unique, Delay and At do not apply to schedules", s.key)
+	if o.unique != "" || o.delay != 0 || !o.at.IsZero() || o.id != "" {
+		return nil, fmt.Errorf("jetq: schedule %q: Unique, Delay, At and JobID do not apply to schedules", s.key)
 	}
 	if err := validName("queue", o.queue); err != nil {
 		return nil, err
