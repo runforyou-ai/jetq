@@ -168,6 +168,17 @@ func (c *Client) delaySubject(id string) string    { return c.cfg.prefix + ".at.
 func (c *Client) cronSubject(key string) string    { return c.cfg.prefix + ".cron." + key }
 func (c *Client) deadSubject(queue string) string  { return c.cfg.prefix + ".dead." + queue }
 
+// info reads stream information through a fresh stream handle: Info caches
+// the result on the handle, so it must not be called on the shared handles
+// used concurrently by other methods.
+func (c *Client) info(ctx context.Context, stream string, opts ...jetstream.StreamInfoOpt) (*jetstream.StreamInfo, error) {
+	handle, err := c.js.Stream(ctx, stream)
+	if err != nil {
+		return nil, err
+	}
+	return handle.Info(ctx, opts...)
+}
+
 func validName(kind, name string) error {
 	if !nameRE.MatchString(name) {
 		return fmt.Errorf("jetq: invalid %s name %q: use letters, digits, '-' and '_'", kind, name)

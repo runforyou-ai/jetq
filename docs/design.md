@@ -36,7 +36,7 @@ The body is the job encoded as JSON. Headers:
 | Header | Meaning |
 |---|---|
 | `Jetq-Job` | Job name (`JobName()`), used to find the handler. |
-| `Jetq-Id` | Job id (NUID), assigned at enqueue time. |
+| `Jetq-Id` | Job id: a NUID assigned at enqueue time, or the id given with `JobID`. |
 | `Jetq-Enqueued-At` | RFC 3339 enqueue time. |
 | `Jetq-Max-Attempts` | Optional per-job attempt limit. |
 | `Jetq-Attempt-Base` | Attempts consumed before a snooze (internal). |
@@ -117,6 +117,23 @@ and do not stop the worker. A delivery whose attempt already exceeds the limit
 (the previous worker crashed on the last attempt) is dead-lettered without
 running the handler.
 
+## Inspection
+
+`Stats` reads consumer info for every `jetq-<queue>` consumer (ready =
+`NumPending`, in flight = `NumAckPending`) and subject counts of the
+dead-letter, delayed and cron subjects. A job waiting for its retry delay was
+nak'ed with a delay and stays in flight; consumer info cannot tell it apart
+from a running job.
+
+`DeadLetters` without a queue filter walks the dead-letter stream backwards
+from the newest sequence, one message per result. With a queue filter it reads
+that queue's subject through an ordered consumer in batches and keeps the
+newest entries below the cursor. `Before` is an exclusive sequence cursor.
+
+Inspection calls read stream info through fresh stream handles, because
+`Stream.Info` caches its result on the handle and the client is used
+concurrently.
+
 ## Guarantees
 
 - At-least-once delivery. A handler may run more than once (crash, ack lost,
@@ -158,5 +175,5 @@ node stops the stream.
   dialect modules.
 - Job chains and batches.
 - Long-lived unique jobs backed by JetStream KV.
-- Dead-letter inspection and requeue (API and CLI), dashboard.
+- Dead-letter requeue (API and CLI), dashboard.
 - OpenTelemetry instrumentation.

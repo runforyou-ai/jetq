@@ -40,6 +40,7 @@ id, err := q.Enqueue(ctx, WelcomeEmail{UserID: 42},
 	jetq.OnQueue("mail"),
 	jetq.Delay(10*time.Minute),   // or jetq.At(t)
 	jetq.Unique("welcome-42"),    // ErrDuplicate within the duplicate window
+	// jetq.JobID(id) sets the id yourself, e.g. to store it before enqueueing
 )
 _ = q.Cancel(ctx, id)            // cancel a pending delayed job
 
@@ -63,6 +64,19 @@ jetq.Handle(w, func(ctx context.Context, job WelcomeEmail) error {
 w.Use(loggingMiddleware)
 err = w.Run(ctx) // blocks; on cancel, waits for running jobs
 ```
+
+### Runtime job names
+
+When job names are only known at runtime (for example when bridging an existing task system),
+enqueue `jetq.RawJob{Name: name, Payload: json}` and register `w.HandleRaw(name, fn, jetq.OnRawFailure(...))`.
+The payload must be valid JSON and is delivered byte for byte.
+
+### Inspecting queues
+
+`q.Stats(ctx)` reports per queue the jobs not yet delivered (`Ready`), the delivered but unsettled
+jobs, running or waiting for a retry delay (`InFlight`), and the dead-lettered jobs, plus the number
+of pending delayed jobs and installed schedules. `q.DeadLetters(ctx, jetq.DeadLetterQuery{...})` pages
+through dead-lettered jobs, newest first, with their last error.
 
 ### Handler results
 

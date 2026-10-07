@@ -3,7 +3,6 @@ package jetq
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -60,7 +59,7 @@ func (c *Client) SyncSchedules(ctx context.Context, schedules ...Schedule) error
 		desired[msg.Subject] = msg
 	}
 
-	info, err := c.stream.Info(ctx, jetstream.WithSubjectFilter(c.cronSubject(">")))
+	info, err := c.info(ctx, c.cfg.streamName, jetstream.WithSubjectFilter(c.cronSubject(">")))
 	if err != nil {
 		return fmt.Errorf("jetq: list schedules: %w", err)
 	}
@@ -99,8 +98,8 @@ func (c *Client) scheduleMsg(s Schedule) (*nats.Msg, error) {
 	for _, opt := range s.opts {
 		opt(&o)
 	}
-	if o.unique != "" || o.delay != 0 || !o.at.IsZero() {
-		return nil, fmt.Errorf("jetq: schedule %q: Unique, Delay and At do not apply to schedules", s.key)
+	if o.unique != "" || o.delay != 0 || !o.at.IsZero() || o.id != "" {
+		return nil, fmt.Errorf("jetq: schedule %q: Unique, Delay, At and JobID do not apply to schedules", s.key)
 	}
 	if err := validName("queue", o.queue); err != nil {
 		return nil, err
@@ -121,9 +120,9 @@ func (c *Client) scheduleMsg(s Schedule) (*nats.Msg, error) {
 	if name == "" {
 		return nil, fmt.Errorf("jetq: schedule %q: job name is empty", s.key)
 	}
-	data, err := json.Marshal(s.job)
+	data, err := encodeJob(s.job)
 	if err != nil {
-		return nil, fmt.Errorf("jetq: schedule %q: encode job: %w", s.key, err)
+		return nil, fmt.Errorf("jetq: schedule %q: %w", s.key, err)
 	}
 
 	msg := &nats.Msg{Subject: c.cronSubject(s.key), Data: data, Header: nats.Header{}}

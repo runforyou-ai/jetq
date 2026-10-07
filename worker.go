@@ -106,15 +106,8 @@ func OnFailure[T Job](fn func(ctx context.Context, job T, err error)) HandleOpti
 // Handle registers fn for jobs of type T. It panics if a handler for the same
 // job name is already registered or the worker has started.
 func Handle[T Job](w *Worker, fn func(ctx context.Context, job T) error, opts ...HandleOption[T]) {
-	w.mustNotBeStarted()
 	var zero T
 	name := zero.JobName()
-	if name == "" {
-		panic("jetq: job name is empty")
-	}
-	if _, exists := w.handlers[name]; exists {
-		panic("jetq: handler already registered for job " + name)
-	}
 	h := &handler{run: func(ctx context.Context, payload []byte) error {
 		var job T
 		if err := json.Unmarshal(payload, &job); err != nil {
@@ -124,6 +117,17 @@ func Handle[T Job](w *Worker, fn func(ctx context.Context, job T) error, opts ..
 	}}
 	for _, opt := range opts {
 		opt(h)
+	}
+	w.register(name, h)
+}
+
+func (w *Worker) register(name string, h *handler) {
+	w.mustNotBeStarted()
+	if name == "" {
+		panic("jetq: job name is empty")
+	}
+	if _, exists := w.handlers[name]; exists {
+		panic("jetq: handler already registered for job " + name)
 	}
 	w.handlers[name] = h
 }

@@ -24,6 +24,7 @@ type enqueueOptions struct {
 	unique      string
 	maxAttempts int
 	header      nats.Header
+	id          string
 }
 
 // OnQueue puts the job on the named queue (default [DefaultQueue]).
@@ -34,6 +35,11 @@ func Delay(d time.Duration) EnqueueOption { return func(o *enqueueOptions) { o.d
 
 // At makes the job available at t. Delayed jobs can be cancelled with [Client.Cancel].
 func At(t time.Time) EnqueueOption { return func(o *enqueueOptions) { o.at = t } }
+
+// JobID sets the job id instead of a generated one, so it can be stored
+// before the job is enqueued. It must be unique and consist of letters,
+// digits, '-' and '_'.
+func JobID(id string) EnqueueOption { return func(o *enqueueOptions) { o.id = id } }
 
 // Unique deduplicates the job by key within the client's duplicate window:
 // a second enqueue with the same key returns [ErrDuplicate].
@@ -69,12 +75,17 @@ func (c *Client) Enqueue(ctx context.Context, job Job, opts ...EnqueueOption) (s
 	if name == "" {
 		return "", errors.New("jetq: job name is empty")
 	}
-	data, err := json.Marshal(job)
+	data, err := encodeJob(job)
 	if err != nil {
-		return "", fmt.Errorf("jetq: encode job %s: %w", name, err)
+		return "", err
 	}
 
-	id := nuid.Next()
+	id := o.id
+	if id == "" {
+		id = nuid.Next()
+	} else if err := validName("job id", id); err != nil {
+		return "", err
+	}
 	msg := &nats.Msg{Subject: c.queueSubject(o.queue), Data: data, Header: nats.Header{}}
 	for key, values := range o.header {
 		if reservedHeader(key) {
@@ -113,6 +124,27 @@ func (c *Client) Enqueue(ctx context.Context, job Job, opts ...EnqueueOption) (s
 		return "", ErrDuplicate
 	}
 	return id, nil
+}
+
+// encodeJob encodes job as JSON; a [RawJob] payload is used byte for byte.
+func encodeJob(job Job) ([]byte, error) {
+	if raw, ok := job.(*RawJob); ok && raw != nil {
+		job = *raw
+	}
+	if raw, ok := job.(RawJob); ok {
+		if len(raw.Payload) == 0 {
+			return []byte("null"), nil
+		}
+		if !json.Valid(raw.Payload) {
+			return nil, fmt.Errorf("jetq: job %s: payload is not valid JSON", raw.Name)
+		}
+		return raw.Payload, nil
+	}
+	data, err := json.Marshal(job)
+	if err != nil {
+		return nil, fmt.Errorf("jetq: encode job %s: %w", job.JobName(), err)
+	}
+	return data, nil
 }
 
 func reservedHeader(key string) bool {
