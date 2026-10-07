@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.1
 
 - `Worker.SetLogContext` derives the context of jetq's job log records and failure callbacks.
 
