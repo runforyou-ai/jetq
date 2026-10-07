@@ -316,9 +316,12 @@ func (w *Worker) process(runCtx, jobCtx context.Context, q Queue, msg jetstream.
 
 	cancelled, err := w.client.cancelled(runCtx, header, info.ID)
 	if err != nil {
-		// Whether the job was cancelled is unknown: try again shortly without running it.
+		// Whether the job was cancelled is unknown: put it back without running
+		// it, like a snooze, so the check does not use up attempts.
 		w.client.cfg.logger.WarnContext(runCtx, "jetq cancellation check failed", "queue", q.Name, "job", info.Name, "id", info.ID, "error", err)
-		_ = msg.NakWithDelay(cancelCheckRetry)
+		settleCtx, cancelSettle := newSettleCtx()
+		defer cancelSettle()
+		w.snooze(settleCtx, q, msg, info, cancelCheckRetry)
 		return
 	}
 	if cancelled {

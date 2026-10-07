@@ -230,6 +230,13 @@ func (c *Client) Cancel(ctx context.Context, id string) error {
 		}
 		return fmt.Errorf("jetq: cancel %s: %w", id, err)
 	}
+	if !owned {
+		// Rewrite the shared marker so that the owner, should its own delete
+		// fail after this one succeeded, cannot withdraw it by revision.
+		if _, err := state.Put(ctx, marker, []byte(scheduled.Header.Get(HeaderEnqueuedAt))); err != nil {
+			return fmt.Errorf("jetq: cancel %s: %w", id, err)
+		}
+	}
 	if lock := scheduled.Header.Get(HeaderUniqueLock); lock != "" {
 		c.unlock(ctx, lock, id)
 	}
@@ -253,22 +260,30 @@ func cancelKey(id string) string { return "cancel." + id }
 // when a concurrent Cancel of the same job already wrote it; a marker left by
 // an earlier job that reused the id is replaced and owned.
 func (c *Client) markCancelled(ctx context.Context, state jetstream.KeyValue, marker, enqueuedAt string) (revision uint64, owned bool, err error) {
-	revision, err = state.Create(ctx, marker, []byte(enqueuedAt))
-	if err == nil {
-		return revision, true, nil
+	for range 2 {
+		revision, err = state.Create(ctx, marker, []byte(enqueuedAt))
+		if err == nil {
+			return revision, true, nil
+		}
+		if !errors.Is(err, jetstream.ErrKeyExists) {
+			return 0, false, err
+		}
+		var entry jetstream.KeyValueEntry
+		entry, err = state.Get(ctx, marker)
+		if errors.Is(err, jetstream.ErrKeyNotFound) {
+			// Withdrawn by another Cancel in between: try to create it again.
+			continue
+		}
+		if err != nil {
+			return 0, false, err
+		}
+		if string(entry.Value()) == enqueuedAt {
+			return entry.Revision(), false, nil
+		}
+		revision, err = state.Update(ctx, marker, []byte(enqueuedAt), entry.Revision())
+		return revision, err == nil, err
 	}
-	if !errors.Is(err, jetstream.ErrKeyExists) {
-		return 0, false, err
-	}
-	entry, err := state.Get(ctx, marker)
-	if err != nil {
-		return 0, false, err
-	}
-	if string(entry.Value()) == enqueuedAt {
-		return entry.Revision(), false, nil
-	}
-	revision, err = state.Update(ctx, marker, []byte(enqueuedAt), entry.Revision())
-	return revision, err == nil, err
+	return 0, false, err
 }
 
 // cancelled reports whether a job fired from a delayed schedule was cancelled.
