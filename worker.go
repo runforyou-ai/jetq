@@ -316,6 +316,7 @@ func (w *Worker) process(runCtx, jobCtx context.Context, q Queue, msg jetstream.
 
 	if w.client.cancelled(runCtx, header, info.ID) {
 		// Cancelled while the schedule was firing: drop the copy unrun.
+		w.releaseLock(runCtx, msg, info)
 		if ackErr := msg.Ack(); ackErr != nil {
 			w.client.cfg.logger.WarnContext(runCtx, "jetq ack failed", "queue", q.Name, "job", info.Name, "id", info.ID, "error", ackErr)
 		}

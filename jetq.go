@@ -60,8 +60,9 @@ type Client struct {
 	dead   jetstream.Stream
 	cfg    config
 
-	stateMu sync.Mutex
-	state   jetstream.KeyValue
+	stateMu           sync.Mutex
+	state             jetstream.KeyValue
+	stateMissingUntil time.Time
 }
 
 type config struct {
@@ -177,6 +178,10 @@ func New(ctx context.Context, js jetstream.JetStream, opts ...Option) (*Client, 
 	return &Client{js: js, stream: stream, dead: dead, cfg: cfg}, nil
 }
 
+// stateMissingRecheck is how long a missing state bucket is assumed to stay
+// missing before looking again.
+const stateMissingRecheck = 5 * time.Second
+
 // stateBucket returns the key-value bucket holding UniqueUntilDone locks and
 // markers of cancelled delayed jobs. With create it is created on first use;
 // without, a missing bucket yields nil. An existing bucket is used as is, so
@@ -187,10 +192,16 @@ func (c *Client) stateBucket(ctx context.Context, create bool) (jetstream.KeyVal
 	if c.state != nil {
 		return c.state, nil
 	}
+	// A recent lookup found no bucket: skip the request for a while, so that
+	// delayed jobs do not each pay a round trip when nobody cancels or locks.
+	if !create && time.Now().Before(c.stateMissingUntil) {
+		return nil, nil
+	}
 	name := c.cfg.streamName + "_STATE"
 	state, err := c.js.KeyValue(ctx, name)
 	if errors.Is(err, jetstream.ErrBucketNotFound) {
 		if !create {
+			c.stateMissingUntil = time.Now().Add(stateMissingRecheck)
 			return nil, nil
 		}
 		state, err = c.js.CreateKeyValue(ctx, jetstream.KeyValueConfig{

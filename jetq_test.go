@@ -956,15 +956,55 @@ func TestCancelSkipsInFlightCopy(t *testing.T) {
 	if err := c.Cancel(ctx, id); err != nil {
 		t.Fatal(err)
 	}
-	// A copy the scheduler published while Cancel ran is skipped once; a later
-	// job reusing the id with another enqueue time is not.
+	// A copy the scheduler published while Cancel ran is skipped, also when
+	// redelivered; a later job reusing the id with another enqueue time is not.
 	if jetq.CancelledCopy(c, id, "2000-01-01T00:00:00Z") {
 		t.Fatal("copy with another enqueue time was skipped")
 	}
-	if !jetq.CancelledCopy(c, id, enqueuedAt) {
-		t.Fatal("cancelled copy was not skipped")
+	for range 2 {
+		if !jetq.CancelledCopy(c, id, enqueuedAt) {
+			t.Fatal("cancelled copy was not skipped")
+		}
 	}
-	if jetq.CancelledCopy(c, id, enqueuedAt) {
-		t.Fatal("marker was not consumed")
+}
+
+func TestWorkerSkipsCancelledCopy(t *testing.T) {
+	c := newClient(t)
+	ctx := context.Background()
+	w := c.NewWorker(jetq.Queue{Name: "default"})
+	ran := make(chan string, 2)
+	jetq.Handle(w, func(ctx context.Context, job sendEmail) error {
+		ran <- job.To
+		return nil
+	})
+	start(t, w)
+	id, err := c.Enqueue(ctx, sendEmail{To: "cancelled"}, jetq.Delay(time.Second), jetq.UniqueUntilDone("skip"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := c.JetStream().Stream(ctx, c.StreamName())
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheduled, err := stream.GetLastMsgForSubject(ctx, "jetq.at."+id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Record the cancellation without deleting the schedule, as when the
+	// scheduler fires while Cancel runs.
+	state, err := c.JetStream().KeyValue(ctx, c.StreamName()+"_STATE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.Put(ctx, "cancel."+id, []byte(scheduled.Header.Get(jetq.HeaderEnqueuedAt))); err != nil {
+		t.Fatal(err)
+	}
+	expectNothing(t, ran, 2500*time.Millisecond)
+	// The skipped copy released its unique key.
+	if _, err := c.Enqueue(ctx, sendEmail{To: "next"}, jetq.UniqueUntilDone("skip")); err != nil {
+		t.Fatal(err)
+	}
+	if got := wait(t, ran, 5*time.Second); got != "next" {
+		t.Fatalf("ran %q", got)
 	}
 }

@@ -4,6 +4,10 @@
 
 - `UniqueUntilDone` deduplicates a job by key until it settles, with locks in a
   key-value bucket (`WithUniqueLockTTL`).
+- `Cancel` records the cancellation in the `<STREAM>_STATE` key-value bucket,
+  so workers skip a copy the schedule published while it ran. The bucket is
+  created on first use; clients need permission to create it and to use
+  `$KV.<STREAM>_STATE.>`.
 
 ## v0.1.1
 

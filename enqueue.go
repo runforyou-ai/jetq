@@ -188,8 +188,9 @@ func reservedHeader(key string) bool {
 
 // Cancel removes a pending delayed job enqueued with [Delay] or [At]. It
 // returns [ErrNotFound] when the job does not exist or has already become
-// available for processing. When it returns nil the job does not run, even if
-// the schedule was firing at that moment: workers skip a cancelled job.
+// available for processing. When it returns nil, a copy the schedule may have
+// published while Cancel ran is skipped by workers; Cancel is best effort only
+// for a copy a worker picked up before the cancellation was recorded.
 func (c *Client) Cancel(ctx context.Context, id string) error {
 	if err := validName("job id", id); err != nil {
 		return err
@@ -209,14 +210,16 @@ func (c *Client) Cancel(ctx context.Context, id string) error {
 		return fmt.Errorf("jetq: cancel %s: %w", id, err)
 	}
 	marker := cancelKey(id)
-	if _, err := state.Put(ctx, marker, []byte(scheduled.Header.Get(HeaderEnqueuedAt))); err != nil {
+	revision, err := state.Put(ctx, marker, []byte(scheduled.Header.Get(HeaderEnqueuedAt)))
+	if err != nil {
 		return fmt.Errorf("jetq: cancel %s: %w", id, err)
 	}
-	// Delete exactly the message read above: if the schedule fired in the
-	// meantime, the delete fails and the job is left to run.
+	// Delete exactly the message read above. On any failure the job may still
+	// run, so the marker is withdrawn: if the schedule fired meanwhile the
+	// delete fails and the job is left to run.
 	if err := c.stream.DeleteMsg(ctx, scheduled.Sequence); err != nil {
+		_ = state.Delete(context.WithoutCancel(ctx), marker, jetstream.LastRevision(revision))
 		if errors.Is(err, jetstream.ErrMsgDeleteUnsuccessful) || errors.Is(err, jetstream.ErrMsgNotFound) {
-			_ = state.Delete(ctx, marker)
 			return ErrNotFound
 		}
 		return fmt.Errorf("jetq: cancel %s: %w", id, err)
@@ -240,8 +243,9 @@ const unlockTimeout = 5 * time.Second
 // cancelKey is the state key marking delayed job id as cancelled.
 func cancelKey(id string) string { return "cancel." + id }
 
-// cancelled reports whether a job fired from a delayed schedule was cancelled,
-// consuming the marker. The marker holds the enqueue time, so a later job that
+// cancelled reports whether a job fired from a delayed schedule was cancelled.
+// The marker is left in place, so a redelivered copy is skipped too, and
+// expires with the bucket TTL; it holds the enqueue time, so a later job that
 // reuses the id is not affected.
 func (c *Client) cancelled(ctx context.Context, header nats.Header, id string) bool {
 	if !strings.HasPrefix(header.Get(headerScheduler), c.delaySubject("")) {
@@ -252,11 +256,7 @@ func (c *Client) cancelled(ctx context.Context, header nats.Header, id string) b
 		return false
 	}
 	entry, err := state.Get(ctx, cancelKey(id))
-	if err != nil || string(entry.Value()) != header.Get(HeaderEnqueuedAt) {
-		return false
-	}
-	_ = state.Delete(ctx, cancelKey(id), jetstream.LastRevision(entry.Revision()))
-	return true
+	return err == nil && string(entry.Value()) == header.Get(HeaderEnqueuedAt)
 }
 
 // lockKey maps a unique key to a valid key-value key.
@@ -271,8 +271,11 @@ func (c *Client) unlock(ctx context.Context, lock, id string) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), unlockTimeout)
 	defer cancel()
 	locks, err := c.stateBucket(ctx, false)
-	if err != nil || locks == nil {
+	if err != nil {
 		c.cfg.logger.WarnContext(ctx, "jetq unique lock release failed", "id", id, "error", err)
+		return
+	}
+	if locks == nil {
 		return
 	}
 	entry, err := locks.Get(ctx, lock)
