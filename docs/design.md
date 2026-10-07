@@ -103,6 +103,14 @@ jetq decides retry timing and the attempt limit itself; the consumer has
 `AckWait` only bounds recovery after a worker crash. Crash redeliveries count as
 attempts.
 
+### Logging
+
+jetq logs retries, dead-lettering and settlement problems through the
+client's `slog.Logger`. `Worker.SetLogContext` derives the context of those
+records from the job's `Info`, so a logging handler can attach application
+fields such as a trace id or tenant; failure callbacks receive the same
+context.
+
 ### Shutdown
 
 When the `Run` context is cancelled the worker stops fetching, waits for

@@ -3,6 +3,7 @@ package jetq_test
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"math"
 	"sync"
 	"sync/atomic"
@@ -649,4 +650,103 @@ func TestSettleTimeoutStartsAfterHandler(t *testing.T) {
 	id, _ := c.Enqueue(context.Background(), sendEmail{})
 	wait(t, failed, 10*time.Second)
 	assertDeadLetter(t, c, "default", id, "slow failure", "1")
+}
+
+type logKey struct{}
+
+// recordingHandler captures log records together with a context value.
+type recordingHandler struct {
+	mu      sync.Mutex
+	records []string
+}
+
+func (h *recordingHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *recordingHandler) WithAttrs([]slog.Attr) slog.Handler       { return h }
+func (h *recordingHandler) WithGroup(string) slog.Handler            { return h }
+func (h *recordingHandler) Handle(ctx context.Context, r slog.Record) error {
+	value, _ := ctx.Value(logKey{}).(string)
+	h.mu.Lock()
+	h.records = append(h.records, r.Message+"|"+value)
+	h.mu.Unlock()
+	return nil
+}
+
+func TestLogContext(t *testing.T) {
+	handler := &recordingHandler{}
+	srv := jetqtest.Start(t)
+	c, err := jetq.New(context.Background(), srv.JetStream, jetq.WithMemoryStorage(), jetq.WithLogger(slog.New(handler)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := c.NewWorker(jetq.Queue{Name: "default", MaxAttempts: 2, Backoff: jetq.Constant(10 * time.Millisecond)})
+	w.SetLogContext(func(ctx context.Context, info jetq.Info) context.Context {
+		return context.WithValue(ctx, logKey{}, "job:"+info.Name)
+	})
+	callback := make(chan string, 1)
+	jetq.Handle(w, func(ctx context.Context, job sendEmail) error { return errors.New("boom") },
+		jetq.OnFailure(func(ctx context.Context, job sendEmail, err error) {
+			value, _ := ctx.Value(logKey{}).(string)
+			callback <- value
+		}))
+	start(t, w)
+	if _, err := c.Enqueue(context.Background(), sendEmail{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := wait(t, callback, 5*time.Second); got != "job:send-email" {
+		t.Fatalf("callback context value = %q", got)
+	}
+	handler.mu.Lock()
+	defer handler.mu.Unlock()
+	want := map[string]bool{"jetq job failed, will retry|job:send-email": false, "jetq job failed permanently|job:send-email": false}
+	for _, record := range handler.records {
+		if _, ok := want[record]; ok {
+			want[record] = true
+		}
+	}
+	for record, seen := range want {
+		if !seen {
+			t.Errorf("missing log record %q in %v", record, handler.records)
+		}
+	}
+}
+
+func TestLogContextPanicIsRecovered(t *testing.T) {
+	c := newClient(t)
+	w := c.NewWorker(jetq.Queue{Name: "default"})
+	w.SetLogContext(func(ctx context.Context, info jetq.Info) context.Context { panic("log context bug") })
+	done := make(chan struct{}, 1)
+	jetq.Handle(w, func(ctx context.Context, job sendEmail) error {
+		done <- struct{}{}
+		return nil
+	})
+	start(t, w)
+	if _, err := c.Enqueue(context.Background(), sendEmail{}); err != nil {
+		t.Fatal(err)
+	}
+	wait(t, done, 5*time.Second)
+}
+
+func TestSlowLogContextIsKeptAlive(t *testing.T) {
+	c := newClient(t)
+	w := c.NewWorker(jetq.Queue{Name: "default", AckWait: 300 * time.Millisecond, Concurrency: 2})
+	w.SetLogContext(func(ctx context.Context, info jetq.Info) context.Context {
+		time.Sleep(time.Second)
+		return ctx
+	})
+	var calls atomic.Int32
+	done := make(chan struct{}, 2)
+	jetq.Handle(w, func(ctx context.Context, job sendEmail) error {
+		calls.Add(1)
+		done <- struct{}{}
+		return nil
+	})
+	start(t, w)
+	if _, err := c.Enqueue(context.Background(), sendEmail{}); err != nil {
+		t.Fatal(err)
+	}
+	wait(t, done, 5*time.Second)
+	time.Sleep(time.Second)
+	if calls.Load() != 1 {
+		t.Fatalf("calls = %d", calls.Load())
+	}
 }

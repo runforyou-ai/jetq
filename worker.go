@@ -47,6 +47,7 @@ type Worker struct {
 	handlers        map[string]*handler
 	middleware      []Middleware
 	onFailed        []FailedFunc
+	logContext      func(context.Context, Info) context.Context
 	shutdownTimeout time.Duration
 	started         atomic.Bool
 }
@@ -72,6 +73,17 @@ func (w *Worker) Use(middleware ...Middleware) {
 func (w *Worker) OnFailed(fn FailedFunc) {
 	w.mustNotBeStarted()
 	w.onFailed = append(w.onFailed, fn)
+}
+
+// SetLogContext sets a function that derives the context used for jetq's own
+// log records about a job (retries, dead-lettering, failure callbacks), for
+// example to attach the application's trace or tenant fields that a logging
+// handler reads from the context. Failure callbacks receive the derived
+// context too. fn runs while the job is kept alive; if it panics, the panic is
+// logged and the original context is used.
+func (w *Worker) SetLogContext(fn func(ctx context.Context, info Info) context.Context) {
+	w.mustNotBeStarted()
+	w.logContext = fn
 }
 
 // SetShutdownTimeout sets how long [Worker.Run] waits for running jobs after
@@ -295,6 +307,7 @@ func (w *Worker) process(runCtx, jobCtx context.Context, q Queue, msg jetstream.
 	// failure callbacks, snoozing), so the job is not redelivered meanwhile.
 	stopKeepAlive := keepAlive(msg, q.AckWait)
 	defer stopKeepAlive()
+	runCtx = w.deriveLogContext(runCtx, info)
 	// Settlement must finish even when Run's context is cancelled during the
 	// shutdown grace period; its timeout starts when settlement starts.
 	newSettleCtx := func() (context.Context, context.CancelFunc) {
@@ -362,6 +375,25 @@ func (w *Worker) run(ctx context.Context, info Info, payload []byte) (err error)
 		next = func(ctx context.Context) error { return mw(ctx, inner) }
 	}
 	return next(ctx)
+}
+
+// deriveLogContext applies the worker's log context function, falling back to
+// ctx when it is unset, panics or returns nil.
+func (w *Worker) deriveLogContext(ctx context.Context, info Info) (derived context.Context) {
+	if w.logContext == nil {
+		return ctx
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			w.client.cfg.logger.ErrorContext(ctx, "jetq log context panicked", "job", info.Name, "id", info.ID,
+				"panic", r, "stack", string(debug.Stack()))
+			derived = ctx
+		}
+	}()
+	if derived = w.logContext(ctx, info); derived == nil {
+		return ctx
+	}
+	return derived
 }
 
 // keepAlive extends the ack deadline until the returned stop function is called.

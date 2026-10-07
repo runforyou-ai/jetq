@@ -78,6 +78,11 @@ jobs, running or waiting for a retry delay (`InFlight`), and the dead-lettered j
 of pending delayed jobs and installed schedules. `q.DeadLetters(ctx, jetq.DeadLetterQuery{...})` pages
 through dead-lettered jobs, newest first, with their last error.
 
+### Log context
+
+`w.SetLogContext(func(ctx, info) context.Context)` derives the context of jetq's own job log records
+and of failure callbacks, so your logging handler can attach a trace id or tenant.
+
 ### Handler results
 
 | Return | Effect |

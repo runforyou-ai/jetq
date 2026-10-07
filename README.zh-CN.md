@@ -67,6 +67,10 @@ err = w.Run(ctx) // 阻塞；取消后等待正在执行的任务
 
 `q.Stats(ctx)` 返回每个队列尚未投递（`Ready`）、已投递未结算（`InFlight`，含执行中与等待重试）和死信的任务数，以及待执行的延迟任务数和已安装的定时任务数；`q.DeadLetters(ctx, jetq.DeadLetterQuery{...})` 按时间倒序分页读取死信及最后一次错误。
 
+### 日志上下文
+
+`w.SetLogContext(func(ctx, info) context.Context)` 为 jetq 自身的任务日志和失败回调派生 context，日志处理器可据此附加串联编号、租户等字段。
+
 ### 处理函数的返回值
 
 | 返回 | 效果 |
