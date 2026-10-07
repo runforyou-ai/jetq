@@ -58,6 +58,14 @@ jetq.Handle(w, func(ctx context.Context, job WelcomeEmail) error {
 err = w.Run(ctx) // 阻塞；取消后等待正在执行的任务
 ```
 
+### 运行时指定任务名
+
+任务名只能在运行时确定时（例如对接已有的任务系统），投递 `jetq.RawJob{Name: name, Payload: json}`，并用 `w.HandleRaw(name, fn, onFailure)` 注册处理函数。
+
+### 查看队列
+
+`q.Stats(ctx)` 返回每个队列的等待、执行中、死信数量，以及待执行的延迟任务数和已安装的定时任务数；`q.DeadLetters(ctx, jetq.DeadLetterQuery{...})` 按时间倒序分页读取死信及最后一次错误。
+
 ### 处理函数的返回值
 
 | 返回 | 效果 |

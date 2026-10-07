@@ -117,6 +117,13 @@ and do not stop the worker. A delivery whose attempt already exceeds the limit
 (the previous worker crashed on the last attempt) is dead-lettered without
 running the handler.
 
+## Inspection
+
+`Stats` reads consumer info for every `jetq-<queue>` consumer (waiting =
+`NumPending`, running = `NumAckPending`) and subject counts of the dead-letter,
+delayed and cron subjects. `DeadLetters` walks the dead-letter stream backwards
+from the newest sequence; `Before` is an exclusive sequence cursor.
+
 ## Guarantees
 
 - At-least-once delivery. A handler may run more than once (crash, ack lost,
@@ -158,5 +165,5 @@ node stops the stream.
   dialect modules.
 - Job chains and batches.
 - Long-lived unique jobs backed by JetStream KV.
-- Dead-letter inspection and requeue (API and CLI), dashboard.
+- Dead-letter requeue (API and CLI), dashboard.
 - OpenTelemetry instrumentation.

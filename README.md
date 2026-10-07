@@ -64,6 +64,17 @@ w.Use(loggingMiddleware)
 err = w.Run(ctx) // blocks; on cancel, waits for running jobs
 ```
 
+### Runtime job names
+
+When job names are only known at runtime (for example when bridging an existing task system),
+enqueue `jetq.RawJob{Name: name, Payload: json}` and register `w.HandleRaw(name, fn, onFailure)`.
+
+### Inspecting queues
+
+`q.Stats(ctx)` reports waiting, running and dead-lettered counts per queue plus the number of
+pending delayed jobs and installed schedules. `q.DeadLetters(ctx, jetq.DeadLetterQuery{...})` pages
+through dead-lettered jobs, newest first, with their last error.
+
 ### Handler results
 
 | Return | Effect |
