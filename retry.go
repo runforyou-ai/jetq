@@ -10,19 +10,29 @@ import (
 type Backoff func(attempt int) time.Duration
 
 // Exponential doubles the delay after every failed attempt, starting at base
-// and capped at limit.
+// and capped at limit. A non-positive base means one second; a limit below
+// base means base.
 func Exponential(base, limit time.Duration) Backoff {
+	if base <= 0 {
+		base = time.Second
+	}
+	limit = max(limit, base)
 	return func(attempt int) time.Duration {
 		delay := base
 		for i := 1; i < attempt && delay < limit; i++ {
-			delay *= 2
+			if delay > limit/2 {
+				delay = limit
+			} else {
+				delay *= 2
+			}
 		}
-		return min(delay, limit)
+		return delay
 	}
 }
 
-// Constant waits the same delay after every failed attempt.
+// Constant waits the same delay after every failed attempt. A negative delay means zero.
 func Constant(delay time.Duration) Backoff {
+	delay = max(delay, 0)
 	return func(int) time.Duration { return delay }
 }
 

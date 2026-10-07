@@ -51,7 +51,10 @@ Headers starting with `Jetq-` or `Nats-` are reserved.
 `Nats-Schedule: @at <time>` and `Nats-Schedule-Target: jetq.q.<queue>`. When it
 fires, the server publishes a copy (minus scheduling headers and `Nats-Msg-Id`)
 to the queue subject and purges the schedule message. `Cancel(id)` purges the
-schedule subject; once it has fired, `Cancel` returns `ErrNotFound`.
+schedule subject; once it has fired, `Cancel` returns `ErrNotFound`. Cancel is
+best effort: a schedule that fires between the lookup and the purge still runs.
+Cancelling does not clear the `Unique` key, which stays reserved for the rest of
+the duplicate window.
 
 ## Recurring jobs
 
@@ -104,7 +107,15 @@ attempts.
 
 When the `Run` context is cancelled the worker stops fetching, waits for
 running handlers up to the shutdown timeout (default 30s), then cancels their
-contexts and naks them for immediate redelivery elsewhere.
+contexts and naks them for immediate redelivery elsewhere. `Run` returns only
+after every handler has returned, so handlers must honour context cancellation.
+
+Settlement (dead-lettering, failure callbacks, snoozing) stays under the
+keep-alive and uses its own bounded context, so it completes during shutdown and
+the job is not redelivered while it runs. Panics in failure callbacks are logged
+and do not stop the worker. A delivery whose attempt already exceeds the limit
+(the previous worker crashed on the last attempt) is dead-lettered without
+running the handler.
 
 ## Guarantees
 
@@ -116,6 +127,12 @@ contexts and naks them for immediate redelivery elsewhere.
   crash between commit and enqueue loses the job. The outbox add-on closes this
   gap.
 - Job state lives only in JetStream. Store business results in your own tables.
+- Workers of the same queue share one durable consumer whose `AckWait` is set by
+  the last worker to start; give every worker of a queue the same `Queue`
+  settings.
+- Applications sharing a NATS account must use distinct stream names and
+  subject prefixes: consumers are named `jetq-<queue>` and `SyncSchedules`
+  removes schedules it was not given.
 
 ## Embedding NATS
 

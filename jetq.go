@@ -94,7 +94,8 @@ func WithDuplicateWindow(d time.Duration) Option { return func(c *config) { c.du
 func WithDeadLetterMaxAge(d time.Duration) Option { return func(c *config) { c.deadMaxAge = d } }
 
 // WithMaxJobBytes limits the encoded size of a single job (default: server limit).
-func WithMaxJobBytes(n int32) Option { return func(c *config) { c.maxJobBytes = n } }
+// Non-positive values keep the default.
+func WithMaxJobBytes(n int32) Option { return func(c *config) { c.maxJobBytes = max(n, 0) } }
 
 // WithLogger sets the logger used by the client and its workers (default slog.Default()).
 func WithLogger(l *slog.Logger) Option { return func(c *config) { c.logger = l } }

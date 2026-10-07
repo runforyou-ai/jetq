@@ -3,6 +3,7 @@ package jetq_test
 import (
 	"context"
 	"errors"
+	"math"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -187,25 +188,25 @@ func assertDeadLetter(t *testing.T, c *jetq.Client, queue, id, errText, attempts
 		t.Fatal(err)
 	}
 	h := msg.Header
-	if h.Get(jetq.HeaderID) != id || h.Get(jetq.HeaderError) != errText || h.Get(jetq.HeaderAttempts) != attempts || h.Get(jetq.HeaderQueue) != queue {
+	if (id != "" && h.Get(jetq.HeaderID) != id) || h.Get(jetq.HeaderError) != errText || h.Get(jetq.HeaderAttempts) != attempts || h.Get(jetq.HeaderQueue) != queue {
 		t.Fatalf("dead letter headers = %v", h)
 	}
 }
 
 func TestPermanentErrorSkipsRetries(t *testing.T) {
 	c := newClient(t)
-	w := c.NewWorker(jetq.Queue{Name: "default", MaxAttempts: 5})
+	w := c.NewWorker(jetq.Queue{Name: "mail", MaxAttempts: 5})
 	failed := make(chan jetq.Info, 1)
 	jetq.Handle(w, func(ctx context.Context, job sendEmail) error {
 		return jetq.Permanent(errors.New("invalid address"))
 	})
 	w.OnFailed(func(ctx context.Context, info jetq.Info, payload []byte, err error) { failed <- info })
 	start(t, w)
-	id, _ := c.Enqueue(context.Background(), sendEmail{})
+	id, _ := c.Enqueue(context.Background(), sendEmail{}, jetq.OnQueue("mail"))
 	if info := wait(t, failed, 5*time.Second); info.Attempt != 1 {
 		t.Fatalf("attempt = %d", info.Attempt)
 	}
-	assertDeadLetter(t, c, "default", id, "invalid address", "1")
+	assertDeadLetter(t, c, "mail", id, "invalid address", "1")
 }
 
 func TestPanicIsRetried(t *testing.T) {
@@ -355,6 +356,8 @@ func TestScheduleValidation(t *testing.T) {
 		jetq.Cron("k", "@hourly", report{}, jetq.Delay(time.Second)),
 		jetq.Cron("k", "0 2 * * *", report{}).In("Mars/Olympus"),
 		jetq.Cron("k", "@every 1m", report{}).In("Asia/Shanghai"),
+		jetq.Cron("k", "@every 500ms", report{}),
+		jetq.Cron("k", "@fortnightly", report{}),
 	}
 	for _, s := range cases {
 		if err := c.SyncSchedules(ctx, s); err == nil {
@@ -415,18 +418,17 @@ func TestConcurrencyAndMiddleware(t *testing.T) {
 	c := newClient(t)
 	w := c.NewWorker(jetq.Queue{Name: "default", Concurrency: 3})
 	var mu sync.Mutex
-	var order []string
-	w.Use(func(ctx context.Context, next func(context.Context) error) error {
-		mu.Lock()
-		order = append(order, "outer")
-		mu.Unlock()
-		return next(ctx)
-	}, func(ctx context.Context, next func(context.Context) error) error {
-		mu.Lock()
-		order = append(order, "inner")
-		mu.Unlock()
-		return next(ctx)
-	})
+	chains := map[string][]string{}
+	record := func(name string) jetq.Middleware {
+		return func(ctx context.Context, next func(context.Context) error) error {
+			info, _ := jetq.JobInfo(ctx)
+			mu.Lock()
+			chains[info.ID] = append(chains[info.ID], name)
+			mu.Unlock()
+			return next(ctx)
+		}
+	}
+	w.Use(record("outer"), record("inner"))
 	var active, peak atomic.Int32
 	done := make(chan struct{}, 6)
 	jetq.Handle(w, func(ctx context.Context, job sendEmail) error {
@@ -456,8 +458,13 @@ func TestConcurrencyAndMiddleware(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(order) != 12 || order[0] != "outer" || order[1] != "inner" {
-		t.Fatalf("middleware order = %v", order)
+	if len(chains) != 6 {
+		t.Fatalf("chains = %v", chains)
+	}
+	for id, chain := range chains {
+		if len(chain) != 2 || chain[0] != "outer" || chain[1] != "inner" {
+			t.Fatalf("middleware order for %s = %v", id, chain)
+		}
 	}
 }
 
@@ -496,5 +503,133 @@ func TestUnknownJobIsRetried(t *testing.T) {
 	_, _ = c.Enqueue(context.Background(), sendEmail{})
 	if err := wait(t, failed, 5*time.Second); err == nil {
 		t.Fatal("expected error")
+	}
+}
+
+func TestSlowFailureCallbackIsNotRedelivered(t *testing.T) {
+	c := newClient(t)
+	w := c.NewWorker(jetq.Queue{Name: "default", MaxAttempts: 1, AckWait: 500 * time.Millisecond, Concurrency: 2})
+	var handled, failed atomic.Int32
+	jetq.Handle(w, func(ctx context.Context, job sendEmail) error {
+		handled.Add(1)
+		return errors.New("boom")
+	})
+	w.OnFailed(func(ctx context.Context, info jetq.Info, payload []byte, err error) {
+		failed.Add(1)
+		time.Sleep(2 * time.Second)
+	})
+	start(t, w)
+	_, _ = c.Enqueue(context.Background(), sendEmail{})
+	time.Sleep(3500 * time.Millisecond)
+	if handled.Load() != 1 || failed.Load() != 1 {
+		t.Fatalf("handled = %d, failed = %d", handled.Load(), failed.Load())
+	}
+	stream, err := c.JetStream().Stream(context.Background(), c.DeadLetterStreamName())
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := stream.Info(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.State.Msgs != 1 {
+		t.Fatalf("dead letters = %d", info.State.Msgs)
+	}
+}
+
+func TestFailureCallbackPanicIsRecovered(t *testing.T) {
+	c := newClient(t)
+	w := c.NewWorker(jetq.Queue{Name: "default", MaxAttempts: 1})
+	ok := make(chan string, 1)
+	jetq.Handle(w, func(ctx context.Context, job sendEmail) error {
+		if job.To == "bad" {
+			return errors.New("boom")
+		}
+		ok <- job.To
+		return nil
+	}, jetq.OnFailure(func(ctx context.Context, job sendEmail, err error) { panic("callback bug") }))
+	w.OnFailed(func(ctx context.Context, info jetq.Info, payload []byte, err error) { panic("callback bug") })
+	start(t, w)
+	_, _ = c.Enqueue(context.Background(), sendEmail{To: "bad"})
+	_, _ = c.Enqueue(context.Background(), sendEmail{To: "good"})
+	if got := wait(t, ok, 5*time.Second); got != "good" {
+		t.Fatalf("got %q", got)
+	}
+	assertDeadLetter(t, c, "default", "", "boom", "1")
+}
+
+func TestCrashRedeliveryRespectsMaxAttempts(t *testing.T) {
+	c := newClient(t)
+	ctx := context.Background()
+	if _, err := c.Enqueue(ctx, sendEmail{}); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a worker that took the job on its last attempt and crashed.
+	consumer, err := c.JetStream().CreateOrUpdateConsumer(ctx, c.StreamName(), jetstream.ConsumerConfig{
+		Durable: "jetq-default", FilterSubject: "jetq.q.default", AckPolicy: jetstream.AckExplicitPolicy,
+		AckWait: time.Second, MaxDeliver: -1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch, err := consumer.Fetch(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range batch.Messages() {
+	}
+
+	w := c.NewWorker(jetq.Queue{Name: "default", MaxAttempts: 1, AckWait: time.Second})
+	var handled atomic.Int32
+	failed := make(chan jetq.Info, 1)
+	jetq.Handle(w, func(ctx context.Context, job sendEmail) error {
+		handled.Add(1)
+		return nil
+	})
+	w.OnFailed(func(ctx context.Context, info jetq.Info, payload []byte, err error) { failed <- info })
+	start(t, w)
+	if info := wait(t, failed, 10*time.Second); info.Attempt != 2 {
+		t.Fatalf("attempt = %d", info.Attempt)
+	}
+	if handled.Load() != 0 {
+		t.Fatal("handler ran beyond the attempt limit")
+	}
+}
+
+func TestDeadLetterDuringShutdown(t *testing.T) {
+	c := newClient(t)
+	w := c.NewWorker(jetq.Queue{Name: "default"})
+	started := make(chan struct{})
+	jetq.Handle(w, func(ctx context.Context, job sendEmail) error {
+		close(started)
+		time.Sleep(300 * time.Millisecond)
+		return jetq.Permanent(errors.New("invalid"))
+	})
+	runCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- w.Run(runCtx) }()
+	id, _ := c.Enqueue(context.Background(), sendEmail{})
+	wait(t, started, 5*time.Second)
+	cancel()
+	if err := wait(t, done, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	assertDeadLetter(t, c, "default", id, "invalid", "1")
+}
+
+func TestBackoff(t *testing.T) {
+	b := jetq.Exponential(time.Second, time.Duration(math.MaxInt64))
+	if d := b(200); d <= 0 {
+		t.Fatalf("overflowed: %s", d)
+	}
+	b = jetq.Exponential(0, 0)
+	if d := b(3); d != time.Second {
+		t.Fatalf("d = %s", d)
+	}
+	b = jetq.Exponential(time.Second, 10*time.Second)
+	for attempt, want := range map[int]time.Duration{1: time.Second, 2: 2 * time.Second, 4: 8 * time.Second, 5: 10 * time.Second, 50: 10 * time.Second} {
+		if d := b(attempt); d != want {
+			t.Errorf("attempt %d: %s, want %s", attempt, d, want)
+		}
 	}
 }

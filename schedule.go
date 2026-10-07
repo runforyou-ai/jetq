@@ -149,11 +149,22 @@ func (c *Client) scheduleMsg(s Schedule) (*nats.Msg, error) {
 // NATS expects; descriptors and six-field expressions are passed through.
 func normalizeCron(spec string) (string, error) {
 	spec = strings.TrimSpace(spec)
-	if strings.HasPrefix(spec, "@") {
-		if strings.HasPrefix(spec, "@at ") {
-			return "", errors.New("use Delay or At for one-off jobs")
+	if every, ok := strings.CutPrefix(spec, "@every "); ok {
+		d, err := time.ParseDuration(strings.TrimSpace(every))
+		if err != nil || d < time.Second {
+			return "", fmt.Errorf("invalid interval %q: use a duration of at least 1s", every)
 		}
-		return spec, nil
+		return "@every " + d.String(), nil
+	}
+	if strings.HasPrefix(spec, "@at ") {
+		return "", errors.New("use Delay or At for one-off jobs")
+	}
+	if strings.HasPrefix(spec, "@") {
+		switch spec {
+		case "@yearly", "@annually", "@monthly", "@weekly", "@daily", "@midnight", "@hourly":
+			return spec, nil
+		}
+		return "", fmt.Errorf("unknown cron descriptor %q", spec)
 	}
 	switch len(strings.Fields(spec)) {
 	case 5:

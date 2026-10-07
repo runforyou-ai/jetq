@@ -287,38 +287,53 @@ func (w *Worker) process(runCtx, jobCtx context.Context, q Queue, msg jetstream.
 		info.ID = fmt.Sprintf("%s-%d", key, meta.Sequence.Stream)
 	}
 
+	// The keep-alive covers both the handler and settlement (dead-lettering,
+	// failure callbacks, snoozing), so the job is not redelivered meanwhile.
+	stopKeepAlive := keepAlive(msg, q.AckWait)
+	defer stopKeepAlive()
+	// Settlement must finish even when Run's context is cancelled during the shutdown grace period.
+	settleCtx, cancelSettle := context.WithTimeout(context.WithoutCancel(runCtx), settleTimeout)
+	defer cancelSettle()
+
+	if info.Attempt > info.MaxAttempts {
+		// Redelivered after a crash on the last attempt: do not run the handler again.
+		w.deadLetter(settleCtx, q, msg, info, fmt.Errorf("jetq: attempt %d exceeds limit %d after redelivery", info.Attempt, info.MaxAttempts))
+		return
+	}
+
 	ctx, cancel := context.WithCancel(context.WithValue(jobCtx, infoKey{}, info))
 	defer cancel()
-	stopKeepAlive := keepAlive(ctx, msg, q.AckWait)
 	err = w.run(ctx, info, msg.Data())
-	stopKeepAlive()
 
 	var snooze *snoozeError
 	var retry *retryAfterError
 	switch {
 	case err == nil:
 		if ackErr := msg.Ack(); ackErr != nil {
-			logger.WarnContext(runCtx, "jetq ack failed", "queue", q.Name, "job", info.Name, "id", info.ID, "error", ackErr)
+			logger.WarnContext(settleCtx, "jetq ack failed", "queue", q.Name, "job", info.Name, "id", info.ID, "error", ackErr)
 		}
 	case errors.As(err, &snooze):
-		w.snooze(runCtx, q, msg, info, snooze.delay)
+		w.snooze(settleCtx, q, msg, info, snooze.delay)
 	case jobCtx.Err() != nil:
 		// Shutdown timeout cancelled the job: hand it to another worker right away.
 		_ = msg.Nak()
 	case IsPermanent(err) || info.Attempt >= info.MaxAttempts:
-		w.deadLetter(runCtx, q, msg, info, err)
+		w.deadLetter(settleCtx, q, msg, info, err)
 	default:
 		delay := q.Backoff(info.Attempt)
 		if errors.As(err, &retry) {
 			delay = retry.delay
 		}
-		logger.WarnContext(runCtx, "jetq job failed, will retry", "queue", q.Name, "job", info.Name, "id", info.ID,
+		logger.WarnContext(settleCtx, "jetq job failed, will retry", "queue", q.Name, "job", info.Name, "id", info.ID,
 			"attempt", info.Attempt, "max_attempts", info.MaxAttempts, "retry_in", delay, "error", err)
 		if nakErr := msg.NakWithDelay(delay); nakErr != nil {
-			logger.WarnContext(runCtx, "jetq nak failed", "queue", q.Name, "job", info.Name, "id", info.ID, "error", nakErr)
+			logger.WarnContext(settleCtx, "jetq nak failed", "queue", q.Name, "job", info.Name, "id", info.ID, "error", nakErr)
 		}
 	}
 }
+
+// settleTimeout bounds publishing to the dead-letter stream, snoozing and failure callbacks.
+const settleTimeout = 30 * time.Second
 
 // run invokes the handler through the middleware chain, turning panics into errors.
 func (w *Worker) run(ctx context.Context, info Info, payload []byte) (err error) {
@@ -339,9 +354,9 @@ func (w *Worker) run(ctx context.Context, info Info, payload []byte) (err error)
 	return next(ctx)
 }
 
-// keepAlive extends the ack deadline while the handler runs.
-func keepAlive(ctx context.Context, msg jetstream.Msg, ackWait time.Duration) func() {
-	ctx, cancel := context.WithCancel(ctx)
+// keepAlive extends the ack deadline until the returned stop function is called.
+func keepAlive(msg jetstream.Msg, ackWait time.Duration) func() {
+	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -349,16 +364,19 @@ func keepAlive(ctx context.Context, msg jetstream.Msg, ackWait time.Duration) fu
 		defer ticker.Stop()
 		for {
 			select {
-			case <-ctx.Done():
+			case <-stop:
 				return
 			case <-ticker.C:
 				_ = msg.InProgress()
 			}
 		}
 	}()
+	var once sync.Once
 	return func() {
-		cancel()
-		<-done
+		once.Do(func() {
+			close(stop)
+			<-done
+		})
 	}
 }
 
@@ -414,21 +432,32 @@ func (w *Worker) deadLetter(ctx context.Context, q Queue, msg jetstream.Msg, inf
 	logger.ErrorContext(ctx, "jetq job failed permanently", "queue", q.Name, "job", info.Name, "id", info.ID,
 		"attempt", info.Attempt, "error", cause)
 
-	failCtx := context.WithValue(context.WithoutCancel(ctx), infoKey{}, info)
+	failCtx := context.WithValue(ctx, infoKey{}, info)
 	if h, ok := w.handlers[info.Name]; ok && h.failed != nil {
-		h.failed(failCtx, msg.Data(), cause)
+		w.callback(failCtx, info, func() { h.failed(failCtx, msg.Data(), cause) })
 	}
 	for _, fn := range w.onFailed {
-		fn(failCtx, info, msg.Data(), cause)
+		w.callback(failCtx, info, func() { fn(failCtx, info, msg.Data(), cause) })
 	}
 	if err := msg.Ack(); err != nil {
 		logger.WarnContext(ctx, "jetq ack failed", "queue", q.Name, "job", info.Name, "id", info.ID, "error", err)
 	}
 }
 
+// callback runs a failure callback, logging instead of crashing on panic.
+func (w *Worker) callback(ctx context.Context, info Info, fn func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			w.client.cfg.logger.ErrorContext(ctx, "jetq failure callback panicked", "job", info.Name, "id", info.ID,
+				"panic", r, "stack", string(debug.Stack()))
+		}
+	}()
+	fn()
+}
+
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	return s[:n]
+	return strings.ToValidUTF8(s[:n], "")
 }
