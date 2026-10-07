@@ -635,8 +635,8 @@ func TestBackoff(t *testing.T) {
 }
 
 func TestSettleTimeoutStartsAfterHandler(t *testing.T) {
-	defer jetq.SetSettleTimeout(time.Second)()
 	c := newClient(t)
+	t.Cleanup(jetq.SetSettleTimeout(time.Second))
 	w := c.NewWorker(jetq.Queue{Name: "default", MaxAttempts: 1})
 	jetq.Handle(w, func(ctx context.Context, job sendEmail) error {
 		time.Sleep(1500 * time.Millisecond)
