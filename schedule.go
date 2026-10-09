@@ -28,8 +28,8 @@ type Schedule struct {
 // Cron declares a recurring job. key identifies the schedule and must be
 // unique; spec is a standard five-field cron expression ("0 2 * * *"), a
 // six-field expression with leading seconds, or a descriptor such as
-// "@hourly", "@daily" or "@every 5m". Only [OnQueue], [MaxAttempts] and
-// [WithHeader] apply to scheduled jobs.
+// "@hourly", "@daily" or "@every 5m". Only [OnQueue], [MaxAttempts],
+// [Timeout] and [WithHeader] apply to scheduled jobs.
 func Cron(key, spec string, job Job, opts ...EnqueueOption) Schedule {
 	return Schedule{key: key, spec: spec, job: job, opts: opts}
 }
@@ -135,6 +135,9 @@ func (c *Client) scheduleMsg(s Schedule) (*nats.Msg, error) {
 	msg.Header.Set(HeaderJob, name)
 	if o.maxAttempts > 0 {
 		msg.Header.Set(HeaderMaxAttempts, strconv.Itoa(o.maxAttempts))
+	}
+	if o.timeout != nil {
+		msg.Header.Set(HeaderTimeout, o.timeout.String())
 	}
 	msg.Header.Set(headerSchedule, spec)
 	msg.Header.Set(headerScheduleTarget, c.queueSubject(o.queue))

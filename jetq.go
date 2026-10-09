@@ -31,10 +31,12 @@ const (
 	HeaderID          = "Jetq-Id"
 	HeaderEnqueuedAt  = "Jetq-Enqueued-At"
 	HeaderMaxAttempts = "Jetq-Max-Attempts"
-	HeaderQueue       = "Jetq-Queue"
-	HeaderError       = "Jetq-Error"
-	HeaderAttempts    = "Jetq-Attempts"
-	HeaderFailedAt    = "Jetq-Failed-At"
+	// HeaderTimeout carries the per-job timeout set with [Timeout].
+	HeaderTimeout  = "Jetq-Timeout"
+	HeaderQueue    = "Jetq-Queue"
+	HeaderError    = "Jetq-Error"
+	HeaderAttempts = "Jetq-Attempts"
+	HeaderFailedAt = "Jetq-Failed-At"
 	// HeaderUniqueLock carries the lock key of a job enqueued with [UniqueUntilDone].
 	HeaderUniqueLock = "Jetq-Unique-Lock"
 )

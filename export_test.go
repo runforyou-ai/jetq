@@ -14,13 +14,28 @@ func SetSettleTimeout(d time.Duration) func() {
 	return func() { settleTimeout = previous }
 }
 
+// SetAbandonAfter overrides how long a cancelled handler may take to return for a test.
+func SetAbandonAfter(d time.Duration) func() {
+	previous := abandonAfter
+	abandonAfter = d
+	return func() { abandonAfter = previous }
+}
+
+// SetUnknownJobRetry overrides the delay before a job without a handler is
+// offered again for a test.
+func SetUnknownJobRetry(d time.Duration) func() {
+	previous := unknownJobRetry
+	unknownJobRetry = d
+	return func() { unknownJobRetry = previous }
+}
+
 // CancelledCopy reports whether a copy of delayed job id fired by its schedule
 // with the given enqueue time would be skipped as cancelled.
 func CancelledCopy(c *Client, id, enqueuedAt string) bool {
 	header := nats.Header{}
 	header.Set(headerScheduler, c.delaySubject(id))
 	header.Set(HeaderEnqueuedAt, enqueuedAt)
-	cancelled, err := c.cancelled(context.Background(), header, id)
+	cancelled, err := c.cancelled(context.Background(), header, id, false)
 	return err == nil && cancelled
 }
 

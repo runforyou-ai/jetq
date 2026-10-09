@@ -17,7 +17,8 @@ import (
 type Stats struct {
 	// Queues has one entry per queue that a worker has consumed, sorted by name.
 	Queues []QueueStats
-	// Delayed is the number of pending delayed jobs across all queues.
+	// Delayed is the number of pending delayed jobs across all queues,
+	// including jobs waiting for a retry or a snooze.
 	Delayed uint64
 	// Schedules is the number of installed recurring schedules.
 	Schedules int
@@ -28,10 +29,11 @@ type QueueStats struct {
 	Queue string
 	// Ready is the number of jobs not yet delivered to any worker.
 	Ready uint64
-	// InFlight is the number of delivered jobs that are not settled yet: jobs
-	// that are running and jobs waiting for their retry delay.
+	// InFlight is the number of delivered jobs that are not settled yet, mostly
+	// running jobs. Jobs waiting for a retry or a snooze count as [Stats.Delayed].
 	InFlight int
-	// Redelivered is the number of in-flight jobs that have been delivered more than once.
+	// Redelivered is the number of in-flight jobs that have been delivered more
+	// than once, after a worker crash or a failed settlement.
 	Redelivered int
 	// Dead is the number of dead-lettered jobs still kept for this queue.
 	Dead uint64

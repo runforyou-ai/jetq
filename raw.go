@@ -32,7 +32,10 @@ type RawHandleOption func(*handler)
 // OnRawFailure registers a callback for when a raw job is dead-lettered.
 func OnRawFailure(fn func(ctx context.Context, payload json.RawMessage, err error)) RawHandleOption {
 	return func(h *handler) {
-		h.failed = func(ctx context.Context, payload []byte, err error) { fn(ctx, payload, err) }
+		h.failed = func(ctx context.Context, payload []byte, err error) error {
+			fn(ctx, payload, err)
+			return nil
+		}
 	}
 }
 

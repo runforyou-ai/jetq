@@ -26,6 +26,7 @@ type enqueueOptions struct {
 	unique      string
 	lock        string
 	maxAttempts int
+	timeout     *time.Duration
 	header      nats.Header
 	id          string
 }
@@ -33,7 +34,8 @@ type enqueueOptions struct {
 // OnQueue puts the job on the named queue (default [DefaultQueue]).
 func OnQueue(queue string) EnqueueOption { return func(o *enqueueOptions) { o.queue = queue } }
 
-// Delay makes the job available after d. Delayed jobs can be cancelled with [Client.Cancel].
+// Delay makes the job available after d, computed with the local clock as an
+// absolute time. Delayed jobs can be cancelled with [Client.Cancel].
 func Delay(d time.Duration) EnqueueOption { return func(o *enqueueOptions) { o.delay = d } }
 
 // At makes the job available at t. Delayed jobs can be cancelled with [Client.Cancel].
@@ -58,6 +60,15 @@ func UniqueUntilDone(key string) EnqueueOption { return func(o *enqueueOptions) 
 
 // MaxAttempts overrides the queue's attempt limit for this job.
 func MaxAttempts(n int) EnqueueOption { return func(o *enqueueOptions) { o.maxAttempts = n } }
+
+// Timeout overrides the queue's per-attempt timeout ([Queue.Timeout]) for
+// this job; a non-positive d means no limit.
+func Timeout(d time.Duration) EnqueueOption {
+	return func(o *enqueueOptions) {
+		d = max(d, 0)
+		o.timeout = &d
+	}
+}
 
 // WithHeader adds a message header, for example a W3C traceparent. Headers
 // starting with "Jetq-" or "Nats-" are reserved.
@@ -109,6 +120,9 @@ func (c *Client) Enqueue(ctx context.Context, job Job, opts ...EnqueueOption) (s
 	msg.Header.Set(HeaderEnqueuedAt, time.Now().UTC().Format(time.RFC3339Nano))
 	if o.maxAttempts > 0 {
 		msg.Header.Set(HeaderMaxAttempts, strconv.Itoa(o.maxAttempts))
+	}
+	if o.timeout != nil {
+		msg.Header.Set(HeaderTimeout, o.timeout.String())
 	}
 
 	at := o.at
@@ -186,13 +200,16 @@ func reservedHeader(key string) bool {
 	return strings.HasPrefix(lower, "jetq-") || strings.HasPrefix(lower, "nats-")
 }
 
-// Cancel removes a pending delayed job enqueued with [Delay] or [At]. When it
-// returns nil the job does not run: a copy the schedule may have published
+// Cancel removes a pending delayed job: one enqueued with [Delay] or [At], or
+// a job waiting for a retry or a snooze. When it returns nil the job does not
+// run (again): a copy the schedule may have published
 // while Cancel ran is skipped by workers. It returns [ErrNotFound] when the job
 // does not exist or has already become available for processing; when that
 // happens during Cancel, the job either runs or is skipped. Once Cancel has
 // recorded the cancellation, the job may be skipped even if Cancel then
-// returns an error.
+// returns an error or ErrNotFound: a copy fired from the schedule and its
+// later retries and snoozes are skipped, so a job that was running when
+// Cancel lost the race finishes its current attempt but is not retried.
 func (c *Client) Cancel(ctx context.Context, id string) error {
 	if err := validName("job id", id); err != nil {
 		return err
@@ -249,8 +266,10 @@ func cancelKey(id string) string { return "cancel." + id }
 // run yet. The marker is left in place, so a redelivered copy is skipped too,
 // and expires with the bucket TTL; it holds the enqueue time, so a later job
 // that reuses the id is not affected.
-func (c *Client) cancelled(ctx context.Context, header nats.Header, id string) (bool, error) {
-	if !strings.HasPrefix(header.Get(headerScheduler), c.delaySubject("")) {
+func (c *Client) cancelled(ctx context.Context, header nats.Header, id string, redelivered bool) (bool, error) {
+	// A redelivery may be the original of a job whose put-back copy was
+	// cancelled after the ack of that delivery was lost.
+	if !c.wasDelayed(header) && !redelivered {
 		return false, nil
 	}
 	state, err := c.stateBucket(ctx, false)
@@ -262,6 +281,12 @@ func (c *Client) cancelled(ctx context.Context, header nats.Header, id string) (
 		return false, err
 	}
 	return string(value) == header.Get(HeaderEnqueuedAt), nil
+}
+
+// wasDelayed reports whether a job message was fired from a delayed job, or
+// put back by a worker after it was.
+func (c *Client) wasDelayed(header nats.Header) bool {
+	return strings.HasPrefix(header.Get(headerScheduler), c.delaySubject("")) || header.Get(headerDelayed) != ""
 }
 
 // leaderGet reads a state key through the bucket stream's leader. Key-value
