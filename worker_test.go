@@ -294,7 +294,8 @@ func TestWorkerRecreatesDeletedConsumer(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, _ = c.Enqueue(ctx, sendEmail{})
-	wait(t, ran, 10*time.Second)
+	// A fetch in flight may only notice the deletion through a missing heartbeat.
+	wait(t, ran, 30*time.Second)
 }
 
 func TestCancelMarkerSurvivesImmediateRequeue(t *testing.T) {
@@ -541,4 +542,53 @@ func TestTimeoutZeroDisablesQueueTimeout(t *testing.T) {
 	if err := wait(t, done, 5*time.Second); err != nil {
 		t.Fatalf("handler context = %v", err)
 	}
+}
+
+func TestCancelDuringRedeliveryStopsImmediateRequeue(t *testing.T) {
+	c := newClient(t)
+	ctx := context.Background()
+	id, err := c.Enqueue(ctx, sendEmail{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumer, err := c.JetStream().CreateOrUpdateConsumer(ctx, c.StreamName(), jetstream.ConsumerConfig{
+		Durable: "jetq-default", FilterSubject: "jetq.q.default", AckPolicy: jetstream.AckExplicitPolicy,
+		AckWait: time.Second, MaxDeliver: -1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch, err := consumer.Fetch(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A retry copy is pending after a lost ack; the original comes back.
+	for msg := range batch.Messages() {
+		copyMsg := nats.NewMsg("jetq.at." + id)
+		copyMsg.Data = msg.Data()
+		for key, values := range msg.Headers() {
+			if !strings.HasPrefix(key, "Nats-") {
+				copyMsg.Header[key] = values
+			}
+		}
+		copyMsg.Header.Set("Jetq-Attempt-Base", "1")
+		copyMsg.Header.Set("Nats-Schedule", "@at "+time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano))
+		copyMsg.Header.Set("Nats-Schedule-Target", "jetq.q.default")
+		if _, err := c.JetStream().PublishMsg(ctx, copyMsg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w := c.NewWorker(jetq.Queue{Name: "default", AckWait: time.Second})
+	runs := make(chan struct{}, 2)
+	jetq.Handle(w, func(ctx context.Context, job sendEmail) error {
+		runs <- struct{}{}
+		// The job is cancelled while the original runs, which then snoozes.
+		if err := c.Cancel(ctx, id); err != nil {
+			t.Errorf("Cancel = %v", err)
+		}
+		return jetq.Snooze(0)
+	})
+	start(t, w)
+	wait(t, runs, 5*time.Second)
+	expectNothing(t, runs, 2*time.Second)
 }

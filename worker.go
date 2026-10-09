@@ -317,7 +317,8 @@ func (w *Worker) consume(ctx, jobCtx context.Context, q Queue, consumer jetstrea
 		case <-time.After(time.Second):
 		}
 		// The consumer was deleted, or fetching keeps failing: create it again.
-		if errors.Is(err, jetstream.ErrConsumerDeleted) || errors.Is(err, jetstream.ErrConsumerNotFound) || failures%recreateAfter == 0 {
+		if errors.Is(err, jetstream.ErrConsumerDeleted) || errors.Is(err, jetstream.ErrConsumerNotFound) ||
+			errors.Is(err, jetstream.ErrNoHeartbeat) || failures%recreateAfter == 0 {
 			if recreated, err := w.consumer(ctx, q); err == nil {
 				consumer = recreated
 			} else if ctx.Err() == nil {
@@ -682,8 +683,9 @@ func (w *Worker) requeue(ctx context.Context, d delivery, delay time.Duration, b
 	}
 	next.Header.Set(HeaderID, info.ID)
 	next.Header.Set(headerAttemptBase, strconv.Itoa(base))
-	if c.wasDelayed(d.msg.Headers()) {
-		// Keep the copy subject to cancellation markers when it skips the scheduler.
+	if c.wasDelayed(d.msg.Headers()) || d.redelivered > 0 {
+		// Keep the copy subject to cancellation markers when it skips the
+		// scheduler; a redelivery may be the original of a cancelled copy.
 		next.Header.Set(headerDelayed, "1")
 	}
 	for key, value := range set {

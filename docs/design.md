@@ -137,8 +137,8 @@ delayed jobs. If republishing fails, the delivery is nak'ed with the delay
 instead and its redelivery counts as the next attempt, also for snoozes and
 shutdown interruptions. A copy put back without a delay skips the scheduler,
 so it carries `Jetq-Delayed` when the job was a delayed job, which keeps it
-subject to cancellation markers. Redeliveries are checked against markers
-too, since the original of a job put back before its ack was lost may come
+subject to cancellation markers; so does a copy put back from a
+redelivery. Redeliveries are checked against markers too, since the original of a job put back before its ack was lost may come
 back after the copy was cancelled.
 
 If the ack after putting back is lost, the original is redelivered while the
@@ -212,7 +212,8 @@ redelivery after a lost ack within the dead-letter stream's duplicate window
 `AckWait` shorter than that window. Failure callbacks run again, so they must
 be idempotent.
 
-If fetching fails because the consumer was deleted, or five times in a row,
+If fetching fails because the consumer was deleted or stopped sending
+heartbeats, or five times in a row,
 the worker waits a second and creates the consumer again with its own
 settings.
 
