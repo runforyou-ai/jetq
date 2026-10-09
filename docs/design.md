@@ -115,13 +115,17 @@ For each message:
    - success: `Ack`;
    - `Snooze(d)`: put back after `d` with attempt base = attempt - 1, so this
      attempt is not counted, and `Jetq-Snoozes` + 1;
+   - permanent error: dead-letter (below), also during shutdown;
    - shutdown timeout cancelled the handler: put back right away with attempt
      base = attempt - 1;
-   - permanent error or attempts exhausted: copy to the dead-letter stream with
+   - attempts exhausted: copy to the dead-letter stream with
      `Jetq-Error`, `Jetq-Attempts`, `Jetq-Failed-At`, `Jetq-Queue`; run
      `OnFailure` and `OnFailed`; `Ack`;
-   - otherwise: put back after `RetryAfter` or `Backoff(attempt)` with attempt
-     base = attempt.
+   - otherwise: retry after `RetryAfter` or `Backoff(attempt)`. Delays of a
+     second or more put the job back with attempt base = attempt; shorter ones
+     `NakWithDelay` the delivery, because the server fires delayed jobs no
+     sooner than about 250ms and such a retry holds a slot of `MaxAckPending`
+     only briefly.
 
 Putting back republishes the job with the same id, as a delayed job on
 `jetq.at.<id>` when there is a delay, and then acks the delivery. Jobs waiting
@@ -129,7 +133,16 @@ for a retry or a snooze are therefore not in flight: the consumer's
 `MaxAckPending` (default 1000) only counts running jobs, and a backlog of
 failing jobs never blocks healthy ones. They can be cancelled like other
 delayed jobs. If republishing fails, the delivery is nak'ed with the delay
-instead and its redelivery counts as the next attempt.
+instead and its redelivery counts as the next attempt, also for snoozes and
+shutdown interruptions. A copy put back without a delay skips the scheduler,
+so it carries `Jetq-Delayed` when the job was a delayed job, which keeps it
+subject to cancellation markers.
+
+If the ack after putting back is lost, the original is redelivered while the
+copy is pending. When that redelivery settles the job (success or dead letter),
+the worker deletes a delayed copy on `jetq.at.<id>` that has an attempt base and
+the same `Jetq-Enqueued-At`. A copy put back without a delay, or one that fired
+already, runs again; delivery stays at least once.
 
 jetq decides retry timing and the attempt limit itself; the consumer has
 `MaxDeliver: -1` and no server backoff, so there is a single source of truth.
@@ -141,14 +154,17 @@ with the clock of the process that publishes them; keep clocks synchronised.
 
 ### Timeouts
 
-`Queue.Timeout`, overridden per job by `Timeout(d)` (header `Jetq-Timeout`),
-bounds one attempt: when it passes, the handler's context is cancelled with
-cause `ErrTimeout` and the attempt fails with an error wrapping `ErrTimeout`,
-retried like any other failure. A handler that has not returned 10 seconds
-after its context was cancelled, by a timeout or by shutdown, is abandoned:
-its goroutine keeps running, but the worker settles the job, frees the slot
-and stops keeping the message alive. Abandoned handlers therefore no longer
-count towards `Concurrency`.
+`Queue.Timeout`, overridden per job by `Timeout(d)` (header `Jetq-Timeout`;
+zero means no limit), bounds one attempt: when it passes, the handler's context
+is cancelled with cause `ErrTimeout` and the attempt fails with an error
+wrapping `ErrTimeout`, whatever the handler then returns (including `nil` or a
+snooze), and is retried like any other failure. A handler that has not
+returned 10 seconds after its context was cancelled, by a timeout or by
+shutdown, is abandoned: its goroutine keeps running, but the worker settles
+the job, frees the slot and stops keeping the message alive. Abandoned
+handlers no longer count towards `Concurrency`, and settling the job may
+release its `UniqueUntilDone` lock or run failure callbacks while the
+abandoned code still runs.
 
 ### Unknown jobs
 
@@ -174,8 +190,10 @@ context.
 When the `Run` context is cancelled the worker stops fetching, waits for
 running handlers up to the shutdown timeout (default 30s), then cancels their
 contexts and puts their jobs back for immediate delivery elsewhere without
-using up the attempt. `Run` returns once every handler has returned or been
-abandoned (10 seconds after the cancellation), and the jobs are settled.
+using up the attempt (a job failing with a `Permanent` error is dead-lettered
+instead). `Run` returns once every handler has returned or been abandoned (10
+seconds after the cancellation) and the jobs are settled; failure callbacks
+that ignore their context's cancellation still hold it up.
 
 Settlement (dead-lettering, failure callbacks, putting back) stays under the
 keep-alive and uses its own bounded context, so it completes during shutdown and
@@ -186,11 +204,13 @@ running the handler.
 
 The dead-letter copy carries `Nats-Msg-Id: jetq-dead-<stream sequence>`, so a
 redelivery after a lost ack within the dead-letter stream's duplicate window
-(2m) does not add a second entry; failure callbacks run again, so they must be
-idempotent.
+(the server default, usually 2m) does not add a second entry; this needs an
+`AckWait` shorter than that window. Failure callbacks run again, so they must
+be idempotent.
 
-If fetching fails, for example because the consumer was deleted, the worker
-waits a second and creates the consumer again.
+If fetching fails because the consumer was deleted, or five times in a row,
+the worker waits a second and creates the consumer again with its own
+settings.
 
 ## Inspection
 

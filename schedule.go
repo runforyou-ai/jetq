@@ -136,7 +136,7 @@ func (c *Client) scheduleMsg(s Schedule) (*nats.Msg, error) {
 	if o.maxAttempts > 0 {
 		msg.Header.Set(HeaderMaxAttempts, strconv.Itoa(o.maxAttempts))
 	}
-	if o.timeout > 0 {
+	if o.timeout != nil {
 		msg.Header.Set(HeaderTimeout, o.timeout.String())
 	}
 	msg.Header.Set(headerSchedule, spec)

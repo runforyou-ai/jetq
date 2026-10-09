@@ -269,6 +269,7 @@ func (w *Worker) consume(ctx, jobCtx context.Context, q Queue, consumer jetstrea
 	for i := 0; i < q.Concurrency; i++ {
 		slots <- struct{}{}
 	}
+	failures := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -304,15 +305,19 @@ func (w *Worker) consume(ctx, jobCtx context.Context, q Queue, consumer jetstrea
 		for ; received < free; received++ {
 			slots <- struct{}{}
 		}
-		if err != nil && ctx.Err() == nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, nats.ErrTimeout) {
-			w.client.cfg.logger.WarnContext(ctx, "jetq fetch failed", "queue", q.Name, "error", err)
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(time.Second):
-			}
-			// The consumer may have been deleted or lost: create it again, which
-			// is a no-op when it still exists.
+		if err == nil || ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, nats.ErrTimeout) {
+			failures = 0
+			continue
+		}
+		failures++
+		w.client.cfg.logger.WarnContext(ctx, "jetq fetch failed", "queue", q.Name, "error", err)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Second):
+		}
+		// The consumer was deleted, or fetching keeps failing: create it again.
+		if errors.Is(err, jetstream.ErrConsumerDeleted) || errors.Is(err, jetstream.ErrConsumerNotFound) || failures%recreateAfter == 0 {
 			if recreated, err := w.consumer(ctx, q); err == nil {
 				consumer = recreated
 			} else if ctx.Err() == nil {
@@ -346,8 +351,8 @@ func (w *Worker) process(runCtx, jobCtx context.Context, q Queue, msg jetstream.
 	if n, err := strconv.Atoi(header.Get(HeaderMaxAttempts)); err == nil && n > 0 {
 		info.MaxAttempts = n
 	}
-	if d, err := time.ParseDuration(header.Get(HeaderTimeout)); err == nil && d > 0 {
-		info.Timeout = d
+	if d, err := time.ParseDuration(header.Get(HeaderTimeout)); err == nil {
+		info.Timeout = max(d, 0)
 	}
 	if n, err := strconv.Atoi(header.Get(headerSnoozes)); err == nil && n > 0 {
 		info.Snoozes = n
@@ -359,7 +364,7 @@ func (w *Worker) process(runCtx, jobCtx context.Context, q Queue, msg jetstream.
 		key := strings.TrimPrefix(header.Get(headerScheduler), w.client.cronSubject(""))
 		info.ID = fmt.Sprintf("%s-%d", key, meta.Sequence.Stream)
 	}
-	d := delivery{msg: msg, seq: meta.Sequence.Stream, info: info, queue: q}
+	d := delivery{msg: msg, seq: meta.Sequence.Stream, redelivered: meta.NumDelivered - 1, info: info, queue: q}
 
 	// The keep-alive covers both the handler and settlement (dead-lettering,
 	// failure callbacks, requeueing), so the job is not redelivered meanwhile.
@@ -415,6 +420,7 @@ func (w *Worker) process(runCtx, jobCtx context.Context, q Queue, msg jetstream.
 	var retry *retryAfterError
 	switch {
 	case err == nil:
+		w.dropRequeued(settleCtx, d)
 		// Release the unique lock before acking: a lost ack then risks a
 		// duplicate run, never a key that stays locked.
 		w.releaseLock(settleCtx, msg, info)
@@ -423,13 +429,15 @@ func (w *Worker) process(runCtx, jobCtx context.Context, q Queue, msg jetstream.
 		}
 	case errors.As(err, &snooze):
 		w.requeue(settleCtx, d, snooze.delay, info.Attempt-1, map[string]string{headerSnoozes: strconv.Itoa(info.Snoozes + 1)})
+	case IsPermanent(err):
+		w.deadLetter(settleCtx, d, err)
 	case jobCtx.Err() != nil:
 		// The shutdown timeout interrupted the job: put it back right away
 		// without using up the attempt.
 		logger.WarnContext(settleCtx, "jetq job interrupted by shutdown, putting it back", "queue", q.Name, "job", info.Name, "id", info.ID,
 			"attempt", info.Attempt, "error", err)
 		w.requeue(settleCtx, d, 0, info.Attempt-1, nil)
-	case IsPermanent(err) || info.Attempt >= info.MaxAttempts:
+	case info.Attempt >= info.MaxAttempts:
 		w.deadLetter(settleCtx, d, err)
 	default:
 		delay := q.Backoff(info.Attempt)
@@ -438,16 +446,33 @@ func (w *Worker) process(runCtx, jobCtx context.Context, q Queue, msg jetstream.
 		}
 		logger.WarnContext(settleCtx, "jetq job failed, will retry", "queue", q.Name, "job", info.Name, "id", info.ID,
 			"attempt", info.Attempt, "max_attempts", info.MaxAttempts, "retry_in", delay, "error", err)
+		if delay < minRequeueDelay {
+			// Short delays: redeliver the same message, which counts the next attempt.
+			if nakErr := msg.NakWithDelay(delay); nakErr != nil {
+				logger.WarnContext(settleCtx, "jetq nak failed", "queue", q.Name, "job", info.Name, "id", info.ID, "error", nakErr)
+			}
+			return
+		}
 		w.requeue(settleCtx, d, delay, info.Attempt, nil)
 	}
 }
 
+// recreateAfter is the number of consecutive fetch failures after which a
+// worker creates its consumer again.
+const recreateAfter = 5
+
+// minRequeueDelay is the shortest retry delay for which a failed job is put
+// back as a delayed job; shorter delays nak the delivery, because the server
+// fires delayed jobs no sooner than 250ms.
+const minRequeueDelay = time.Second
+
 // delivery is one delivery of a job to this worker.
 type delivery struct {
-	msg   jetstream.Msg
-	seq   uint64 // stream sequence of the message
-	info  Info
-	queue Queue
+	msg         jetstream.Msg
+	seq         uint64 // stream sequence of the message
+	redelivered uint64 // deliveries of the message before this one
+	info        Info
+	queue       Queue
 }
 
 // cancelCheckRetry is the delay before redelivering a job whose cancellation
@@ -496,7 +521,11 @@ func (w *Worker) attempt(logCtx, jobCtx context.Context, info Info, h *handler, 
 			err = fmt.Errorf("jetq: job %s abandoned, it did not return within %s of cancellation: %w", info.Name, abandonAfter, context.Cause(ctx))
 		}
 	}
-	if err != nil && errors.Is(context.Cause(ctx), ErrTimeout) && jobCtx.Err() == nil && !errors.Is(err, ErrTimeout) {
+	// Once the timeout has passed the attempt fails, whatever the handler returned.
+	if errors.Is(context.Cause(ctx), ErrTimeout) && jobCtx.Err() == nil && !errors.Is(err, ErrTimeout) {
+		if err == nil || errors.As(err, new(*snoozeError)) {
+			err = context.DeadlineExceeded
+		}
 		err = fmt.Errorf("%w after %s: %w", ErrTimeout, info.Timeout, err)
 	}
 	return err
@@ -599,7 +628,34 @@ const (
 	headerSnoozes = "Jetq-Snoozes"
 	// headerUnknownSince is when a worker first found no handler for the job.
 	headerUnknownSince = "Jetq-Unknown-Since"
+	// headerDelayed marks a job that was once a delayed job, so that it stays
+	// subject to cancellation markers.
+	headerDelayed = "Jetq-Delayed"
 )
+
+// dropRequeued deletes a delayed copy that an earlier delivery of this job put
+// back before its ack was lost, when this redelivery settles the job; the copy
+// would otherwise run the settled job again.
+func (w *Worker) dropRequeued(ctx context.Context, d delivery) {
+	if d.redelivered == 0 {
+		return
+	}
+	c := w.client
+	pending, err := c.stream.GetLastMsgForSubject(ctx, c.delaySubject(d.info.ID))
+	if err != nil {
+		if !errors.Is(err, jetstream.ErrMsgNotFound) {
+			c.cfg.logger.WarnContext(ctx, "jetq check for requeued copy failed", "queue", d.info.Queue, "job", d.info.Name, "id", d.info.ID, "error", err)
+		}
+		return
+	}
+	h := pending.Header
+	if h.Get(headerAttemptBase) == "" || h.Get(HeaderEnqueuedAt) != d.msg.Headers().Get(HeaderEnqueuedAt) {
+		return
+	}
+	if err := c.stream.DeleteMsg(ctx, pending.Sequence); err != nil && !errors.Is(err, jetstream.ErrMsgNotFound) {
+		c.cfg.logger.WarnContext(ctx, "jetq requeued copy removal failed", "queue", d.info.Queue, "job", d.info.Name, "id", d.info.ID, "error", err)
+	}
+}
 
 // requeue publishes the job again with the same id, available after delay
 // (as a delayed job when delay is positive), and acks this delivery. The next
@@ -620,6 +676,10 @@ func (w *Worker) requeue(ctx context.Context, d delivery, delay time.Duration, b
 	}
 	next.Header.Set(HeaderID, info.ID)
 	next.Header.Set(headerAttemptBase, strconv.Itoa(base))
+	if c.wasDelayed(d.msg.Headers()) {
+		// Keep the copy subject to cancellation markers when it skips the scheduler.
+		next.Header.Set(headerDelayed, "1")
+	}
 	for key, value := range set {
 		next.Header.Set(key, value)
 	}
@@ -675,6 +735,7 @@ func (w *Worker) deadLetter(ctx context.Context, d delivery, cause error) {
 			"attempt", info.Attempt, "error", cause)
 	}
 
+	w.dropRequeued(ctx, d)
 	// The job is settled as dead: free its unique key before the callbacks, so
 	// they can enqueue a replacement with the same key.
 	w.releaseLock(ctx, msg, info)

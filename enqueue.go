@@ -26,7 +26,7 @@ type enqueueOptions struct {
 	unique      string
 	lock        string
 	maxAttempts int
-	timeout     time.Duration
+	timeout     *time.Duration
 	header      nats.Header
 	id          string
 }
@@ -61,8 +61,14 @@ func UniqueUntilDone(key string) EnqueueOption { return func(o *enqueueOptions) 
 // MaxAttempts overrides the queue's attempt limit for this job.
 func MaxAttempts(n int) EnqueueOption { return func(o *enqueueOptions) { o.maxAttempts = n } }
 
-// Timeout overrides the queue's per-attempt timeout ([Queue.Timeout]) for this job.
-func Timeout(d time.Duration) EnqueueOption { return func(o *enqueueOptions) { o.timeout = d } }
+// Timeout overrides the queue's per-attempt timeout ([Queue.Timeout]) for
+// this job; a non-positive d means no limit.
+func Timeout(d time.Duration) EnqueueOption {
+	return func(o *enqueueOptions) {
+		d = max(d, 0)
+		o.timeout = &d
+	}
+}
 
 // WithHeader adds a message header, for example a W3C traceparent. Headers
 // starting with "Jetq-" or "Nats-" are reserved.
@@ -115,7 +121,7 @@ func (c *Client) Enqueue(ctx context.Context, job Job, opts ...EnqueueOption) (s
 	if o.maxAttempts > 0 {
 		msg.Header.Set(HeaderMaxAttempts, strconv.Itoa(o.maxAttempts))
 	}
-	if o.timeout > 0 {
+	if o.timeout != nil {
 		msg.Header.Set(HeaderTimeout, o.timeout.String())
 	}
 
@@ -261,7 +267,7 @@ func cancelKey(id string) string { return "cancel." + id }
 // and expires with the bucket TTL; it holds the enqueue time, so a later job
 // that reuses the id is not affected.
 func (c *Client) cancelled(ctx context.Context, header nats.Header, id string) (bool, error) {
-	if !strings.HasPrefix(header.Get(headerScheduler), c.delaySubject("")) {
+	if !c.wasDelayed(header) {
 		return false, nil
 	}
 	state, err := c.stateBucket(ctx, false)
@@ -273,6 +279,12 @@ func (c *Client) cancelled(ctx context.Context, header nats.Header, id string) (
 		return false, err
 	}
 	return string(value) == header.Get(HeaderEnqueuedAt), nil
+}
+
+// wasDelayed reports whether a job message was fired from a delayed job, or
+// put back by a worker after it was.
+func (c *Client) wasDelayed(header nats.Header) bool {
+	return strings.HasPrefix(header.Get(headerScheduler), c.delaySubject("")) || header.Get(headerDelayed) != ""
 }
 
 // leaderGet reads a state key through the bucket stream's leader. Key-value

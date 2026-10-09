@@ -2,8 +2,8 @@
 
 ## Unreleased
 
-- Jobs waiting for a retry are put back as delayed jobs instead of being
-  nak'ed with a delay, so they no longer count against the consumer's
+- Jobs waiting for a retry of a second or more are put back as delayed jobs
+  instead of being nak'ed with a delay, so they no longer count against the consumer's
   `MaxAckPending`: a backlog of failing jobs no longer stalls a queue. They
   count as `Stats.Delayed` instead of `InFlight` and can be cancelled.
 - Jobs interrupted by the shutdown timeout are put back without using up an
@@ -13,7 +13,7 @@
   (default 1h).
 - `Queue.Timeout` and the `Timeout` enqueue option bound an attempt
   (`ErrTimeout`); handlers that ignore cancellation are abandoned after 10
-  seconds, so `Worker.Run` always returns.
+  seconds, so `Worker.Run` returns even then.
 - `Info.Timeout` and `Info.Snoozes`.
 - Dead-letter copies are deduplicated per delivered message; `OnFailure`
   logs payloads that do not decode; keep-alives are sent at least every 5

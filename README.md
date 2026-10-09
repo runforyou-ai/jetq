@@ -99,7 +99,8 @@ Jobs waiting for a retry or a snooze are stored as delayed jobs, so they never h
 can be cancelled with `Cancel`. A job this worker has no handler for (for example during a rolling
 deploy) is put back for other workers without using up an attempt and dead-lettered after
 `w.SetUnknownJobTimeout` (default 1h). Jobs interrupted by the shutdown timeout are put back without
-using up an attempt; handlers that ignore cancellation are abandoned 10 seconds later.
+using up an attempt; handlers that ignore cancellation are abandoned 10 seconds later. Retry delays
+under a second are served by redelivery, and delayed jobs fire no sooner than about 250ms.
 
 Delivery is **at least once**: make handlers idempotent.
 
