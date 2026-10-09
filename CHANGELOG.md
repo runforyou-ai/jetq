@@ -15,6 +15,18 @@
   (`ErrTimeout`); handlers that ignore cancellation are abandoned after 10
   seconds, so `Worker.Run` returns even then.
 - `Info.Timeout` and `Info.Snoozes`.
+- `Enqueue` errors wrap `ErrUncertain` when the job may have been stored, and
+  the job id is returned with them; other errors mean it was not stored. A
+  `UniqueUntilDone` job is published a second time with the same message id to
+  resolve such an outcome and releases its lock when the publish was certainly
+  not stored. A context that is already done fails `Enqueue` before anything
+  is published. `Unique` keys starting with `jetq-` are reserved.
+- `Enqueue` returns `ErrJobIDInUse` instead of replacing a pending delayed job
+  with the same `JobID`; retries and snoozes never replace one either and are
+  redelivered after their delay instead, which counts as an attempt.
+- `DeadLetters` without a queue filter reads a page through one ordered
+  consumer instead of one request per entry; reads fail when no entry arrives
+  within 5 seconds instead of waiting.
 - Dead-letter copies are deduplicated per delivered message; `OnFailure`
   logs payloads that do not decode; keep-alives are sent at least every 5
   seconds; workers recreate their consumer after fetch failures.

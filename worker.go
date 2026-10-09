@@ -692,12 +692,19 @@ func (w *Worker) requeue(ctx context.Context, d delivery, delay time.Duration, b
 	for key, value := range set {
 		next.Header.Set(key, value)
 	}
+	pubOpts := []jetstream.PublishOpt{jetstream.WithExpectStream(c.cfg.streamName)}
 	if delay > 0 {
 		next.Header.Set(headerSchedule, "@at "+time.Now().Add(delay).UTC().Format(time.RFC3339Nano))
 		next.Header.Set(headerScheduleTarget, next.Subject)
 		next.Subject = c.delaySubject(info.ID)
+		// Never replace another pending delayed job that has the same id.
+		pubOpts = append(pubOpts, jetstream.WithExpectLastSequencePerSubject(0))
 	}
-	if _, err := c.js.PublishMsg(ctx, next, jetstream.WithExpectStream(c.cfg.streamName)); err != nil {
+	if _, err := c.js.PublishMsg(ctx, next, pubOpts...); err != nil {
+		if err = classify(err); errors.Is(err, ErrJobIDInUse) {
+			w.requeueTaken(ctx, d, delay)
+			return
+		}
 		c.cfg.logger.WarnContext(ctx, "jetq requeue failed", "queue", info.Queue, "job", info.Name, "id", info.ID, "error", err)
 		if nakErr := d.msg.NakWithDelay(delay); nakErr != nil {
 			c.cfg.logger.WarnContext(ctx, "jetq nak failed", "queue", info.Queue, "job", info.Name, "id", info.ID, "error", nakErr)
@@ -707,6 +714,28 @@ func (w *Worker) requeue(ctx context.Context, d delivery, delay time.Duration, b
 	if err := d.msg.Ack(); err != nil {
 		// The copy is stored; this delivery comes back after AckWait and runs again.
 		c.cfg.logger.WarnContext(ctx, "jetq ack failed", "queue", info.Queue, "job", info.Name, "id", info.ID, "error", err)
+	}
+}
+
+// requeueTaken handles a delayed requeue whose subject jetq.at.<id> is taken.
+// A pending copy of this same job, put back by an earlier delivery whose ack
+// was lost, already covers it, so the delivery is acked. Otherwise another job
+// reuses the id, which JobID forbids: that job is left alone and this delivery
+// is nak'ed with the delay, so the redelivery counts as an attempt.
+func (w *Worker) requeueTaken(ctx context.Context, d delivery, delay time.Duration) {
+	c := w.client
+	info := d.info
+	pending, err := c.stream.GetLastMsgForSubject(ctx, c.delaySubject(info.ID))
+	if err == nil && sameJob(pending.Header, d.msg.Headers()) {
+		if err := d.msg.Ack(); err != nil {
+			c.cfg.logger.WarnContext(ctx, "jetq ack failed", "queue", info.Queue, "job", info.Name, "id", info.ID, "error", err)
+		}
+		return
+	}
+	c.cfg.logger.WarnContext(ctx, "jetq job id taken by another delayed job, redelivering the job after its delay",
+		"queue", info.Queue, "job", info.Name, "id", info.ID, "retry_in", delay)
+	if err := d.msg.NakWithDelay(delay); err != nil {
+		c.cfg.logger.WarnContext(ctx, "jetq nak failed", "queue", info.Queue, "job", info.Name, "id", info.ID, "error", err)
 	}
 }
 
