@@ -266,8 +266,10 @@ func cancelKey(id string) string { return "cancel." + id }
 // run yet. The marker is left in place, so a redelivered copy is skipped too,
 // and expires with the bucket TTL; it holds the enqueue time, so a later job
 // that reuses the id is not affected.
-func (c *Client) cancelled(ctx context.Context, header nats.Header, id string) (bool, error) {
-	if !c.wasDelayed(header) {
+func (c *Client) cancelled(ctx context.Context, header nats.Header, id string, redelivered bool) (bool, error) {
+	// A redelivery may be the original of a job whose put-back copy was
+	// cancelled after the ack of that delivery was lost.
+	if !c.wasDelayed(header) && !redelivered {
 		return false, nil
 	}
 	state, err := c.stateBucket(ctx, false)

@@ -377,7 +377,7 @@ func (w *Worker) process(runCtx, jobCtx context.Context, q Queue, msg jetstream.
 		return context.WithTimeout(context.WithoutCancel(runCtx), settleTimeout)
 	}
 
-	cancelled, err := w.client.cancelled(runCtx, header, info.ID)
+	cancelled, err := w.client.cancelled(runCtx, header, info.ID, meta.NumDelivered > 1)
 	if err != nil {
 		// Whether the job was cancelled is unknown: put it back without running
 		// it, so the check does not use up attempts.
@@ -431,7 +431,7 @@ func (w *Worker) process(runCtx, jobCtx context.Context, q Queue, msg jetstream.
 		w.requeue(settleCtx, d, snooze.delay, info.Attempt-1, map[string]string{headerSnoozes: strconv.Itoa(info.Snoozes + 1)})
 	case IsPermanent(err):
 		w.deadLetter(settleCtx, d, err)
-	case jobCtx.Err() != nil:
+	case jobCtx.Err() != nil && !errors.Is(err, ErrTimeout):
 		// The shutdown timeout interrupted the job: put it back right away
 		// without using up the attempt.
 		logger.WarnContext(settleCtx, "jetq job interrupted by shutdown, putting it back", "queue", q.Name, "job", info.Name, "id", info.ID,
@@ -521,12 +521,18 @@ func (w *Worker) attempt(logCtx, jobCtx context.Context, info Info, h *handler, 
 			err = fmt.Errorf("jetq: job %s abandoned, it did not return within %s of cancellation: %w", info.Name, abandonAfter, context.Cause(ctx))
 		}
 	}
-	// Once the timeout has passed the attempt fails, whatever the handler returned.
-	if errors.Is(context.Cause(ctx), ErrTimeout) && jobCtx.Err() == nil && !errors.Is(err, ErrTimeout) {
-		if err == nil || errors.As(err, new(*snoozeError)) {
+	// Once the timeout has passed, also when shutdown followed, the attempt is
+	// an ordinary failure whatever the handler returned: its error only
+	// contributes its text, so snoozes, RetryAfter and Permanent do not apply.
+	if errors.Is(context.Cause(ctx), ErrTimeout) {
+		if err == nil {
 			err = context.DeadlineExceeded
 		}
-		err = fmt.Errorf("%w after %s: %w", ErrTimeout, info.Timeout, err)
+		if !errors.Is(err, ErrTimeout) {
+			err = fmt.Errorf("%w after %s: %s", ErrTimeout, info.Timeout, err.Error())
+		} else {
+			err = fmt.Errorf("%w after %s: %s", ErrTimeout, info.Timeout, strings.TrimPrefix(err.Error(), ErrTimeout.Error()+": "))
+		}
 	}
 	return err
 }

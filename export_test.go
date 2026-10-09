@@ -35,7 +35,7 @@ func CancelledCopy(c *Client, id, enqueuedAt string) bool {
 	header := nats.Header{}
 	header.Set(headerScheduler, c.delaySubject(id))
 	header.Set(HeaderEnqueuedAt, enqueuedAt)
-	cancelled, err := c.cancelled(context.Background(), header, id)
+	cancelled, err := c.cancelled(context.Background(), header, id, false)
 	return err == nil && cancelled
 }
 

@@ -446,3 +446,99 @@ func TestRedeliveryDropsRequeuedCopy(t *testing.T) {
 	wait(t, runs, 5*time.Second)
 	expectNothing(t, runs, 3*time.Second)
 }
+
+func TestTimeoutBeforeShutdownStillFails(t *testing.T) {
+	c := newClient(t)
+	w := c.NewWorker(jetq.Queue{Name: "default", MaxAttempts: 1, Timeout: 100 * time.Millisecond})
+	w.SetShutdownTimeout(50 * time.Millisecond)
+	timedOut := make(chan struct{})
+	proceed := make(chan struct{})
+	jetq.Handle(w, func(ctx context.Context, job sendEmail) error {
+		<-ctx.Done()
+		close(timedOut)
+		<-proceed
+		return nil
+	})
+	failed := make(chan error, 1)
+	w.OnFailed(func(ctx context.Context, info jetq.Info, payload []byte, err error) { failed <- err })
+	runCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- w.Run(runCtx) }()
+	_, _ = c.Enqueue(context.Background(), sendEmail{})
+	wait(t, timedOut, 5*time.Second)
+	cancel()
+	time.Sleep(100 * time.Millisecond) // let the shutdown timeout cancel the job too
+	close(proceed)
+	if err := wait(t, failed, 5*time.Second); !errors.Is(err, jetq.ErrTimeout) {
+		t.Fatalf("failure = %v", err)
+	}
+	<-done
+}
+
+func TestCancelledRetrySkipsRedeliveredOriginal(t *testing.T) {
+	c := newClient(t)
+	ctx := context.Background()
+	id, err := c.Enqueue(ctx, sendEmail{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A worker put the job back for a retry but its ack was lost, then the
+	// retry was cancelled.
+	consumer, err := c.JetStream().CreateOrUpdateConsumer(ctx, c.StreamName(), jetstream.ConsumerConfig{
+		Durable: "jetq-default", FilterSubject: "jetq.q.default", AckPolicy: jetstream.AckExplicitPolicy,
+		AckWait: time.Second, MaxDeliver: -1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch, err := consumer.Fetch(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for msg := range batch.Messages() {
+		copyMsg := nats.NewMsg("jetq.at." + id)
+		copyMsg.Data = msg.Data()
+		for key, values := range msg.Headers() {
+			if !strings.HasPrefix(key, "Nats-") {
+				copyMsg.Header[key] = values
+			}
+		}
+		copyMsg.Header.Set("Jetq-Attempt-Base", "1")
+		copyMsg.Header.Set("Nats-Schedule", "@at "+time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano))
+		copyMsg.Header.Set("Nats-Schedule-Target", "jetq.q.default")
+		if _, err := c.JetStream().PublishMsg(ctx, copyMsg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := c.Cancel(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	w := c.NewWorker(jetq.Queue{Name: "default", AckWait: time.Second})
+	runs := make(chan struct{}, 1)
+	jetq.Handle(w, func(ctx context.Context, job sendEmail) error {
+		runs <- struct{}{}
+		return nil
+	})
+	start(t, w)
+	expectNothing(t, runs, 3*time.Second)
+}
+
+func TestTimeoutZeroDisablesQueueTimeout(t *testing.T) {
+	c := newClient(t)
+	w := c.NewWorker(jetq.Queue{Name: "default", Timeout: 50 * time.Millisecond})
+	done := make(chan error, 1)
+	jetq.Handle(w, func(ctx context.Context, job sendEmail) error {
+		select {
+		case <-ctx.Done():
+			done <- ctx.Err()
+		case <-time.After(300 * time.Millisecond):
+			done <- nil
+		}
+		return nil
+	})
+	start(t, w)
+	_, _ = c.Enqueue(context.Background(), sendEmail{}, jetq.Timeout(0))
+	if err := wait(t, done, 5*time.Second); err != nil {
+		t.Fatalf("handler context = %v", err)
+	}
+}

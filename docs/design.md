@@ -44,6 +44,7 @@ The body is the job encoded as JSON. Headers:
 | `Jetq-Attempt-Base` | Attempts used before the job was put back (internal). |
 | `Jetq-Snoozes` | Number of snoozes (internal, exposed as `Info.Snoozes`). |
 | `Jetq-Unknown-Since` | When a worker first found no handler for the job (internal). |
+| `Jetq-Delayed` | The job was a delayed job before it was put back without a delay; keeps it subject to cancellation markers (internal). |
 | `Nats-Msg-Id` | `Unique` key, deduplicated by the stream within its duplicate window. |
 | `Jetq-Unique-Lock` | Lock key of a `UniqueUntilDone` job. |
 
@@ -136,7 +137,9 @@ delayed jobs. If republishing fails, the delivery is nak'ed with the delay
 instead and its redelivery counts as the next attempt, also for snoozes and
 shutdown interruptions. A copy put back without a delay skips the scheduler,
 so it carries `Jetq-Delayed` when the job was a delayed job, which keeps it
-subject to cancellation markers.
+subject to cancellation markers. Redeliveries are checked against markers
+too, since the original of a job put back before its ack was lost may come
+back after the copy was cancelled.
 
 If the ack after putting back is lost, the original is redelivered while the
 copy is pending. When that redelivery settles the job (success or dead letter),
@@ -157,8 +160,9 @@ with the clock of the process that publishes them; keep clocks synchronised.
 `Queue.Timeout`, overridden per job by `Timeout(d)` (header `Jetq-Timeout`;
 zero means no limit), bounds one attempt: when it passes, the handler's context
 is cancelled with cause `ErrTimeout` and the attempt fails with an error
-wrapping `ErrTimeout`, whatever the handler then returns (including `nil` or a
-snooze), and is retried like any other failure. A handler that has not
+wrapping `ErrTimeout`, whatever the handler then returns (`nil`, a snooze,
+`RetryAfter` or `Permanent` contribute only their text), and is retried like
+any other failure, also when shutdown cancels the job after the timeout. A handler that has not
 returned 10 seconds after its context was cancelled, by a timeout or by
 shutdown, is abandoned: its goroutine keeps running, but the worker settles
 the job, frees the slot and stops keeping the message alive. Abandoned
