@@ -199,7 +199,7 @@ func TestRetryDoesNotReplaceDelayedJobWithSameID(t *testing.T) {
 	wait(t, started, 5*time.Second)
 	wait(t, ran, 5*time.Second)
 	// Another delayed job takes the id while the first one runs; the retry
-	// does not replace it and goes back without its delay.
+	// does not replace it and is redelivered after its delay.
 	if _, err := c.Enqueue(ctx, sendEmail{To: "delayed"}, jetq.JobID("shared"), jetq.Delay(2*time.Second)); err != nil {
 		t.Fatal(err)
 	}

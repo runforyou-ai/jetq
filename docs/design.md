@@ -59,8 +59,9 @@ expecting the subject to be empty (`Nats-Expected-Last-Subject-Sequence: 0`):
 publishing on it would replace a pending delayed job with the same id, so
 `Enqueue` returns `ErrJobIDInUse` instead. A retry or snooze that finds the
 subject taken acks the delivery when the pending message is the same job (put
-back by an earlier delivery whose ack was lost), and otherwise goes back to
-the queue without its delay. Ids of jobs that are not delayed
+back by an earlier delivery whose ack was lost); otherwise another job reuses
+the id, against the `JobID` contract, and the delivery is nak'ed with the
+delay, so its redelivery counts as an attempt. Ids of jobs that are not delayed
 are not checked. When it fires, the
 server publishes a copy (minus scheduling headers and `Nats-Msg-Id`) to the
 queue subject and purges the schedule message. `Cancel(id)` removes the
@@ -234,7 +235,9 @@ failed settlement.
 
 `DeadLetters` without a queue filter reads the `Limit` sequences below the
 cursor through an ordered consumer, stepping further back by the number of
-entries still missing when deleted entries leave gaps. With a queue filter it reads
+entries still missing when deleted entries leave gaps. Reads fail when no
+entry arrives within 5 seconds, for example because entries were deleted while
+reading. With a queue filter it reads
 that queue's subject through an ordered consumer in batches and keeps the
 newest entries below the cursor. `Before` is an exclusive sequence cursor.
 
@@ -265,7 +268,9 @@ concurrently.
   enqueue time), for example already put back for a retry. Otherwise it
   returns the job id and an error wrapping `ErrUncertain` and keeps the lock.
   A lock whose `Create` failed is removed if it was written and the job id was
-  generated for this call. `Cancel` deletes exactly the schedule message it read
+  generated for this call; with a caller-chosen id it may stay until it
+  expires, since it cannot be told apart from a lock of an earlier enqueue of
+  the same id. `Cancel` deletes exactly the schedule message it read
   and releases the lock only if that delete succeeds. A lock is only released
   by the job that holds it. Snoozed and retrying jobs keep it. Every lock
   expires at the bucket TTL (`WithUniqueLockTTL`, default 24h) counted from

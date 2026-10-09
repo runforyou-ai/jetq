@@ -182,14 +182,7 @@ func (c *Client) readDeadLetters(ctx context.Context, start, end uint64) ([]Dead
 	}
 	defer messages.Stop()
 	for {
-		// Entries deleted while reading would leave Next waiting for new ones:
-		// a quiet second ends the pass.
-		nextCtx, cancel := context.WithTimeout(ctx, time.Second)
-		msg, err := messages.Next(jetstream.NextContext(nextCtx))
-		cancel()
-		if err != nil && ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
-			return out, nil
-		}
+		msg, err := nextDeadLetter(ctx, messages)
 		if err != nil {
 			return nil, err
 		}
@@ -232,7 +225,7 @@ func (c *Client) queueDeadLetters(ctx context.Context, query DeadLetterQuery) ([
 	defer messages.Stop()
 	// Stop after the entries that existed when the query started, even while new dead letters arrive.
 	for remaining := info.NumPending; remaining > 0; remaining-- {
-		msg, err := messages.Next(jetstream.NextContext(ctx))
+		msg, err := nextDeadLetter(ctx, messages)
 		if err != nil {
 			return nil, fmt.Errorf("jetq: dead letters: %w", err)
 		}
@@ -253,6 +246,22 @@ func (c *Client) queueDeadLetters(ctx context.Context, query DeadLetterQuery) ([
 	}
 	slices.Reverse(window)
 	return window, nil
+}
+
+// deadLetterWait bounds the wait for the next entry of a dead-letter read.
+const deadLetterWait = 5 * time.Second
+
+// nextDeadLetter returns the next message of a dead-letter read. Entries
+// deleted while reading would leave it waiting for new ones, so it fails after
+// deadLetterWait without a message.
+func nextDeadLetter(ctx context.Context, messages jetstream.MessagesContext) (jetstream.Msg, error) {
+	nextCtx, cancel := context.WithTimeout(ctx, deadLetterWait)
+	defer cancel()
+	msg, err := messages.Next(jetstream.NextContext(nextCtx))
+	if err != nil && ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
+		return nil, fmt.Errorf("no entry within %s, entries may have been deleted while reading: %w", deadLetterWait, err)
+	}
+	return msg, err
 }
 
 func deadLetter(seq uint64, h nats.Header, data []byte) DeadLetter {

@@ -702,7 +702,7 @@ func (w *Worker) requeue(ctx context.Context, d delivery, delay time.Duration, b
 	}
 	if _, err := c.js.PublishMsg(ctx, next, pubOpts...); err != nil {
 		if err = classify(err); errors.Is(err, ErrJobIDInUse) {
-			w.requeueTaken(ctx, d, base, set)
+			w.requeueTaken(ctx, d, delay)
 			return
 		}
 		c.cfg.logger.WarnContext(ctx, "jetq requeue failed", "queue", info.Queue, "job", info.Name, "id", info.ID, "error", err)
@@ -719,9 +719,10 @@ func (w *Worker) requeue(ctx context.Context, d delivery, delay time.Duration, b
 
 // requeueTaken handles a delayed requeue whose subject jetq.at.<id> is taken.
 // A pending copy of this same job, put back by an earlier delivery whose ack
-// was lost, already covers it, so the delivery is acked. Another job with the
-// same id is left alone and this job goes back without its delay.
-func (w *Worker) requeueTaken(ctx context.Context, d delivery, base int, set map[string]string) {
+// was lost, already covers it, so the delivery is acked. Otherwise another job
+// reuses the id, which JobID forbids: that job is left alone and this delivery
+// is nak'ed with the delay, so the redelivery counts as an attempt.
+func (w *Worker) requeueTaken(ctx context.Context, d delivery, delay time.Duration) {
 	c := w.client
 	info := d.info
 	pending, err := c.stream.GetLastMsgForSubject(ctx, c.delaySubject(info.ID))
@@ -731,9 +732,11 @@ func (w *Worker) requeueTaken(ctx context.Context, d delivery, base int, set map
 		}
 		return
 	}
-	c.cfg.logger.WarnContext(ctx, "jetq job id taken by another delayed job, putting the job back without delay",
-		"queue", info.Queue, "job", info.Name, "id", info.ID)
-	w.requeue(ctx, d, 0, base, set)
+	c.cfg.logger.WarnContext(ctx, "jetq job id taken by another delayed job, redelivering the job after its delay",
+		"queue", info.Queue, "job", info.Name, "id", info.ID, "retry_in", delay)
+	if err := d.msg.NakWithDelay(delay); err != nil {
+		c.cfg.logger.WarnContext(ctx, "jetq nak failed", "queue", info.Queue, "job", info.Name, "id", info.ID, "error", err)
+	}
 }
 
 // deadLetter copies the job to the dead-letter stream, runs failure callbacks

@@ -197,8 +197,9 @@ func (c *Client) Enqueue(ctx context.Context, job Job, opts ...EnqueueOption) (s
 		resolveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), resolveTimeout)
 		resolved := c.publishJob(resolveCtx, msg, pubOpts, true)
 		cancel()
-		if resolved == nil || errors.Is(resolved, ErrJobIDInUse) {
-			err = resolved
+		// A rejection of the second publish says nothing about the first.
+		if resolved == nil {
+			err = nil
 		}
 	}
 	switch {
