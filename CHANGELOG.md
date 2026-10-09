@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.3.0
 
 - Jobs waiting for a retry of a second or more are put back as delayed jobs
   instead of being nak'ed with a delay, so they no longer count against the consumer's
