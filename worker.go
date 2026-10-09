@@ -316,7 +316,8 @@ func (w *Worker) consume(ctx, jobCtx context.Context, q Queue, consumer jetstrea
 			return
 		case <-time.After(time.Second):
 		}
-		// The consumer was deleted, or fetching keeps failing: create it again.
+		// The consumer was deleted or stopped sending heartbeats, or fetching
+		// keeps failing: create it again.
 		if errors.Is(err, jetstream.ErrConsumerDeleted) || errors.Is(err, jetstream.ErrConsumerNotFound) ||
 			errors.Is(err, jetstream.ErrNoHeartbeat) || failures%recreateAfter == 0 {
 			if recreated, err := w.consumer(ctx, q); err == nil {

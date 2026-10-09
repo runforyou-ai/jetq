@@ -44,7 +44,7 @@ The body is the job encoded as JSON. Headers:
 | `Jetq-Attempt-Base` | Attempts used before the job was put back (internal). |
 | `Jetq-Snoozes` | Number of snoozes (internal, exposed as `Info.Snoozes`). |
 | `Jetq-Unknown-Since` | When a worker first found no handler for the job (internal). |
-| `Jetq-Delayed` | The job was a delayed job before it was put back without a delay; keeps it subject to cancellation markers (internal). |
+| `Jetq-Delayed` | Set on a copy put back without a delay from a delayed job or a redelivery; keeps it subject to cancellation markers (internal). |
 | `Nats-Msg-Id` | `Unique` key, deduplicated by the stream within its duplicate window. |
 | `Jetq-Unique-Lock` | Lock key of a `UniqueUntilDone` job. |
 
