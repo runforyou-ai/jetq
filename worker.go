@@ -701,7 +701,10 @@ func (w *Worker) requeue(ctx context.Context, d delivery, delay time.Duration, b
 		pubOpts = append(pubOpts, jetstream.WithExpectLastSequencePerSubject(0))
 	}
 	if _, err := c.js.PublishMsg(ctx, next, pubOpts...); err != nil {
-		err = classify(err)
+		if err = classify(err); errors.Is(err, ErrJobIDInUse) {
+			w.requeueTaken(ctx, d, base, set)
+			return
+		}
 		c.cfg.logger.WarnContext(ctx, "jetq requeue failed", "queue", info.Queue, "job", info.Name, "id", info.ID, "error", err)
 		if nakErr := d.msg.NakWithDelay(delay); nakErr != nil {
 			c.cfg.logger.WarnContext(ctx, "jetq nak failed", "queue", info.Queue, "job", info.Name, "id", info.ID, "error", nakErr)
@@ -712,6 +715,25 @@ func (w *Worker) requeue(ctx context.Context, d delivery, delay time.Duration, b
 		// The copy is stored; this delivery comes back after AckWait and runs again.
 		c.cfg.logger.WarnContext(ctx, "jetq ack failed", "queue", info.Queue, "job", info.Name, "id", info.ID, "error", err)
 	}
+}
+
+// requeueTaken handles a delayed requeue whose subject jetq.at.<id> is taken.
+// A pending copy of this same job, put back by an earlier delivery whose ack
+// was lost, already covers it, so the delivery is acked. Another job with the
+// same id is left alone and this job goes back without its delay.
+func (w *Worker) requeueTaken(ctx context.Context, d delivery, base int, set map[string]string) {
+	c := w.client
+	info := d.info
+	pending, err := c.stream.GetLastMsgForSubject(ctx, c.delaySubject(info.ID))
+	if err == nil && sameJob(pending.Header, d.msg.Headers()) {
+		if err := d.msg.Ack(); err != nil {
+			c.cfg.logger.WarnContext(ctx, "jetq ack failed", "queue", info.Queue, "job", info.Name, "id", info.ID, "error", err)
+		}
+		return
+	}
+	c.cfg.logger.WarnContext(ctx, "jetq job id taken by another delayed job, putting the job back without delay",
+		"queue", info.Queue, "job", info.Name, "id", info.ID)
+	w.requeue(ctx, d, 0, base, set)
 }
 
 // deadLetter copies the job to the dead-letter stream, runs failure callbacks

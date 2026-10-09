@@ -18,14 +18,13 @@
 - `Enqueue` errors wrap `ErrUncertain` when the job may have been stored, and
   the job id is returned with them; other errors mean it was not stored. A
   `UniqueUntilDone` job is published a second time with the same message id to
-  resolve such an outcome, releases its lock when the publish was certainly
-  not stored, and enqueueing it again with `JobID(id)` takes over its own lock
-  instead of returning `ErrDuplicate`. A context that is already done fails
-  `Enqueue` before anything is written.
+  resolve such an outcome and releases its lock when the publish was certainly
+  not stored. A context that is already done fails `Enqueue` before anything
+  is published. `Unique` keys starting with `jetq-` are reserved.
 - `Enqueue` returns `ErrJobIDInUse` instead of replacing a pending delayed job
   with the same `JobID`; retries and snoozes never replace one either.
-- `DeadLetters` without a queue filter reads a page in one batch instead of
-  one request per entry.
+- `DeadLetters` without a queue filter reads a page through one ordered
+  consumer instead of one request per entry.
 - Dead-letter copies are deduplicated per delivered message; `OnFailure`
   logs payloads that do not decode; keep-alives are sent at least every 5
   seconds; workers recreate their consumer after fetch failures.

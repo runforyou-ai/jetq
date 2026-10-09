@@ -51,7 +51,8 @@ func At(t time.Time) EnqueueOption { return func(o *enqueueOptions) { o.at = t }
 func JobID(id string) EnqueueOption { return func(o *enqueueOptions) { o.id = id } }
 
 // Unique deduplicates the job by key within the client's duplicate window:
-// a second enqueue with the same key returns [ErrDuplicate].
+// a second enqueue with the same key returns [ErrDuplicate]. Keys starting
+// with "jetq-" are reserved.
 func Unique(key string) EnqueueOption { return func(o *enqueueOptions) { o.unique = key } }
 
 // UniqueUntilDone deduplicates the job by key until it settles: while a job
@@ -59,9 +60,7 @@ func Unique(key string) EnqueueOption { return func(o *enqueueOptions) { o.uniqu
 // enqueue returns [ErrDuplicate]; once it succeeds, is dead-lettered or is
 // cancelled, the key is free again. The lock lasts at most the lock TTL from
 // enqueue (see [WithUniqueLockTTL]), so jobs that stay unsettled longer lose
-// their deduplication. Enqueueing a job with the [JobID] that holds the key
-// does not return ErrDuplicate but publishes it again, deduplicated within the
-// stream's duplicate window; that resolves an [ErrUncertain] outcome.
+// their deduplication.
 func UniqueUntilDone(key string) EnqueueOption { return func(o *enqueueOptions) { o.lock = key } }
 
 // MaxAttempts overrides the queue's attempt limit for this job.
@@ -155,42 +154,50 @@ func (c *Client) Enqueue(ctx context.Context, job Job, opts ...EnqueueOption) (s
 		pubOpts = append(pubOpts, jetstream.WithExpectLastSequencePerSubject(0))
 	}
 
+	if strings.HasPrefix(o.unique, "jetq-") {
+		return "", fmt.Errorf("jetq: unique key %q: the prefix jetq- is reserved", o.unique)
+	}
 	var revision uint64
 	if o.lock != "" {
 		lock := lockKey(o.lock)
-		taken, err := c.lockJob(ctx, lock, id, o.id != "")
-		revision = taken.revision
+		var taken bool
+		taken, revision, err = c.lockJob(ctx, lock, id, o.id == "")
 		if err != nil {
 			return "", fmt.Errorf("jetq: lock unique job %s: %w", name, err)
 		}
-		if taken.byOther {
+		if taken {
 			return "", ErrDuplicate
 		}
 		msg.Header.Set(HeaderUniqueLock, lock)
 	}
+	lock := msg.Header.Get(HeaderUniqueLock)
+	if err := ctx.Err(); err != nil {
+		// Nothing was published.
+		if lock != "" {
+			c.unlock(ctx, lock, id)
+		}
+		return "", err
+	}
 
-	// With a message id a second publish tells whether a first one with an
-	// unknown outcome was stored. UniqueUntilDone jobs get one derived from
-	// the lock revision, which is the same when the same JobID is enqueued
-	// again while it holds the lock.
-	msgID, ownMsgID := o.unique, false
-	if msgID == "" && o.lock != "" {
-		msgID, ownMsgID = "jetq-lock-"+strconv.FormatUint(revision, 10), true
+	// A UniqueUntilDone job gets a message id of its own, so that a second
+	// publish tells whether a first one with an unknown outcome was stored.
+	msgID := o.unique
+	resolvable := o.lock != "" && o.unique == ""
+	if resolvable {
+		msgID = "jetq-lock-" + strconv.FormatUint(revision, 10)
 	}
 	if msgID != "" {
 		pubOpts = append(pubOpts, jetstream.WithMsgID(msgID))
 	}
-	lock := msg.Header.Get(HeaderUniqueLock)
-	err = c.publishJob(ctx, msg, pubOpts, msgID, ownMsgID)
-	if err != nil && lock != "" && !notStored(err) {
-		// Publish again, deduplicated by the message id, to learn the outcome.
+	started := time.Now()
+	err = c.publishJob(ctx, msg, pubOpts, resolvable)
+	// The second publish is deduplicated only within the stream's duplicate
+	// window; keep a margin for the time the publishes take.
+	if err != nil && resolvable && !notStored(err) && time.Since(started)+resolveTimeout < c.cfg.duplicates/2 {
 		resolveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), resolveTimeout)
-		resolved := c.publishJob(resolveCtx, msg, pubOpts, msgID, ownMsgID)
+		resolved := c.publishJob(resolveCtx, msg, pubOpts, true)
 		cancel()
-		switch {
-		case resolved == nil:
-			err = nil
-		case errors.Is(resolved, ErrJobIDInUse):
+		if resolved == nil || errors.Is(resolved, ErrJobIDInUse) {
 			err = resolved
 		}
 	}
@@ -212,7 +219,7 @@ func (c *Client) Enqueue(ctx context.Context, job Job, opts ...EnqueueOption) (s
 		return id, fmt.Errorf("jetq: enqueue %s: %w", name, err)
 	default:
 		// The job may have been stored: a UniqueUntilDone lock stays until the
-		// job settles, the same JobID is enqueued again or the lock expires.
+		// job settles or the lock expires.
 		return id, fmt.Errorf("jetq: enqueue %s: %w: %w", name, ErrUncertain, err)
 	}
 }
@@ -220,52 +227,34 @@ func (c *Client) Enqueue(ctx context.Context, job Job, opts ...EnqueueOption) (s
 // resolveTimeout bounds the second publish that resolves an uncertain one.
 const resolveTimeout = 5 * time.Second
 
-// lockResult is the outcome of taking a UniqueUntilDone lock.
-type lockResult struct {
-	byOther  bool   // another job holds the lock
-	revision uint64 // revision of the lock held by this job
-}
-
-// lockJob takes the UniqueUntilDone lock for job id. With a caller-chosen id,
-// a lock already held by the same id belongs to an earlier enqueue of this
-// job whose outcome was unknown, so this call takes it over.
-func (c *Client) lockJob(ctx context.Context, lock, id string, chosenID bool) (lockResult, error) {
+// lockJob takes the UniqueUntilDone lock for job id and reports whether
+// another job holds it, and the revision of the new lock. When Create fails
+// otherwise, a lock it may have written is removed if the id is unique to
+// this call.
+func (c *Client) lockJob(ctx context.Context, lock, id string, generatedID bool) (taken bool, revision uint64, err error) {
 	locks, err := c.stateBucket(ctx, true)
 	if err != nil {
-		return lockResult{}, err
+		return false, 0, err
 	}
-	for range 2 {
-		revision, err := locks.Create(ctx, lock, []byte(id))
-		if err == nil {
-			return lockResult{revision: revision}, nil
-		}
-		if !errors.Is(err, jetstream.ErrKeyExists) {
-			// The lock may have been written although the call failed.
-			c.unlock(ctx, lock, id)
-			return lockResult{}, err
-		}
-		if !chosenID {
-			return lockResult{byOther: true}, nil
-		}
-		value, revision, found, err := c.leaderGet(ctx, locks, lock)
-		if err != nil {
-			return lockResult{}, err
-		}
-		if found {
-			return lockResult{byOther: string(value) != id, revision: revision}, nil
-		}
-		// Released meanwhile: try to take it again.
+	revision, err = locks.Create(ctx, lock, []byte(id))
+	switch {
+	case err == nil:
+		return false, revision, nil
+	case errors.Is(err, jetstream.ErrKeyExists):
+		return true, 0, nil
 	}
-	return lockResult{byOther: true}, nil
+	if generatedID {
+		c.unlock(ctx, lock, id)
+	}
+	return false, 0, err
 }
 
-// publishJob publishes a job once. msgID is the message id the job was
-// published with, if any; ownMsgID means it identifies this job alone, so a
-// duplicate means the job is already stored. It returns nil when the job is
-// stored, [ErrDuplicate] for a duplicate of a [Unique] key, an error wrapping
-// [ErrJobIDInUse] when another pending delayed job has the id, or the
-// publish error.
-func (c *Client) publishJob(ctx context.Context, msg *nats.Msg, pubOpts []jetstream.PublishOpt, msgID string, ownMsgID bool) error {
+// publishJob publishes a job once. It returns nil when the job is stored,
+// [ErrDuplicate] for a duplicate message id, an error wrapping [ErrJobIDInUse]
+// when another pending delayed job has the id, or the publish error. With
+// ownMsgID the message id belongs to this job alone, so a duplicate means the
+// job is stored already.
+func (c *Client) publishJob(ctx context.Context, msg *nats.Msg, pubOpts []jetstream.PublishOpt, ownMsgID bool) error {
 	ack, err := c.js.PublishMsg(ctx, msg, pubOpts...)
 	switch {
 	case err == nil && ack.Duplicate && !ownMsgID:
@@ -274,23 +263,26 @@ func (c *Client) publishJob(ctx context.Context, msg *nats.Msg, pubOpts []jetstr
 		return nil
 	}
 	err = classify(err)
-	if !errors.Is(err, ErrJobIDInUse) || msgID == "" {
+	if !errors.Is(err, ErrJobIDInUse) || !ownMsgID {
 		return err
 	}
-	// A delayed job with this id is pending: it is this job if it carries
-	// the message id.
+	// A delayed job with this id is pending: it may be this job, published by
+	// an earlier attempt, or already put back for a retry by a worker.
 	pending, getErr := c.stream.GetLastMsgForSubject(ctx, msg.Subject)
 	switch {
 	case getErr != nil:
-		// Whether the pending job is this one is unknown.
 		return fmt.Errorf("%w: read pending delayed job: %w", ErrUncertain, getErr)
-	case pending.Header.Get(jetstream.MsgIDHeader) != msgID:
-		return err
-	case ownMsgID:
+	case sameJob(pending.Header, msg.Header):
 		return nil
 	default:
-		return ErrDuplicate
+		return err
 	}
+}
+
+// sameJob reports whether two messages carry the same enqueued job: the same
+// id and the same enqueue time.
+func sameJob(a, b nats.Header) bool {
+	return a.Get(HeaderID) == b.Get(HeaderID) && a.Get(HeaderEnqueuedAt) == b.Get(HeaderEnqueuedAt)
 }
 
 // encodeJob encodes job as JSON; a [RawJob] payload is used byte for byte.
@@ -379,7 +371,8 @@ func notStored(err error) bool {
 	return errors.Is(err, ErrDuplicate) || errors.Is(err, ErrJobIDInUse) || errors.As(err, &apiErr) ||
 		errors.Is(err, jetstream.ErrNoStreamResponse) || errors.Is(err, nats.ErrMaxPayload) ||
 		errors.Is(err, nats.ErrBadSubject) || errors.Is(err, nats.ErrInvalidConnection) ||
-		errors.Is(err, nats.ErrConnectionDraining) || errors.Is(err, nats.ErrReconnectBufExceeded)
+		errors.Is(err, nats.ErrConnectionDraining) || errors.Is(err, nats.ErrReconnectBufExceeded) ||
+		errors.Is(err, nats.ErrHeadersNotSupported) || errors.Is(err, nats.ErrBadHeaderMsg)
 }
 
 // classify wraps the stream's rejection of a delayed job's publish, because

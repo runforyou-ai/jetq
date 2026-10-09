@@ -269,14 +269,15 @@ var ErrJobIDInUse = errors.New("jetq: job id in use by a pending delayed job")
 // the job as possibly enqueued; enqueueing it again may run it twice, unless
 // it uses [Unique] within the duplicate window or [UniqueUntilDone].
 //
-// For a [UniqueUntilDone] job, Enqueue first publishes it a second time,
-// deduplicated by a message id derived from its lock so that the stream
-// stores it at most once, and returns success if that tells the outcome; this
-// may enqueue the job after ctx was cancelled. Otherwise the lock is kept:
-// enqueueing the same key returns [ErrDuplicate] until the job settles or the
-// lock expires, except that enqueueing it again with the returned id
-// ([JobID]) and the same key publishes it again, deduplicated within the
-// stream's duplicate window. Retry that way to resolve the outcome.
+// For a [UniqueUntilDone] job without [Unique], Enqueue first publishes it a
+// second time, deduplicated by a message id derived from its lock so that the
+// stream stores it at most once, and returns success if the server answers;
+// this may enqueue the job after ctx was cancelled. It does so only while the
+// stream's duplicate window has not passed since the first publish (based on
+// [WithDuplicateWindow]). Otherwise the lock is kept: enqueueing the same key
+// returns [ErrDuplicate] until the job settles, if it was stored, or the lock
+// expires (see [WithUniqueLockTTL]). Log the error; whether the job runs shows
+// in its effects.
 var ErrUncertain = errors.New("jetq: enqueue outcome unknown")
 
 // ErrNotFound is returned by [Client.Cancel] when no pending delayed job has the given id.

@@ -2,6 +2,7 @@ package jetq
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strconv"
@@ -112,8 +113,9 @@ type DeadLetterQuery struct {
 
 // DeadLetters returns dead-lettered jobs, newest first.
 //
-// Without a queue filter it reads the newest Limit entries below the cursor in
-// one batch. With a queue filter it reads that queue's dead letters in batches
+// Without a queue filter it reads the newest Limit entries below the cursor
+// in one pass, plus one more for each stretch of deleted entries it has to
+// step over. With a queue filter it reads that queue's dead letters in batches
 // up to the cursor, so its cost grows with the number of dead letters kept for
 // that queue.
 func (c *Client) DeadLetters(ctx context.Context, query DeadLetterQuery) ([]DeadLetter, error) {
@@ -180,7 +182,14 @@ func (c *Client) readDeadLetters(ctx context.Context, start, end uint64) ([]Dead
 	}
 	defer messages.Stop()
 	for {
-		msg, err := messages.Next(jetstream.NextContext(ctx))
+		// Entries deleted while reading would leave Next waiting for new ones:
+		// a quiet second ends the pass.
+		nextCtx, cancel := context.WithTimeout(ctx, time.Second)
+		msg, err := messages.Next(jetstream.NextContext(nextCtx))
+		cancel()
+		if err != nil && ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
+			return out, nil
+		}
 		if err != nil {
 			return nil, err
 		}

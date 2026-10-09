@@ -100,7 +100,7 @@ func TestUncertainPublishIsResolved(t *testing.T) {
 	}
 }
 
-func TestUncertainPublishKeepsLockUntilRetried(t *testing.T) {
+func TestUncertainPublishKeepsLock(t *testing.T) {
 	c, f := newFlakyClient(t)
 	ctx := context.Background()
 	f.fail(false, false)
@@ -108,39 +108,29 @@ func TestUncertainPublishKeepsLockUntilRetried(t *testing.T) {
 	if !errors.Is(err, jetq.ErrUncertain) || errors.Is(err, jetq.ErrDuplicate) || id == "" {
 		t.Fatalf("Enqueue = %q, %v", id, err)
 	}
-	// The job may be stored, so the key stays taken for other jobs.
+	// The job may be stored, so the key stays taken.
 	if _, err := c.Enqueue(ctx, sendEmail{To: "a"}, jetq.UniqueUntilDone("unknown")); !errors.Is(err, jetq.ErrDuplicate) {
 		t.Fatalf("enqueue of another job = %v", err)
 	}
-	// Enqueueing the same job id again resolves it.
-	if _, err := c.Enqueue(ctx, sendEmail{To: "a"}, jetq.UniqueUntilDone("unknown"), jetq.JobID(id)); err != nil {
-		t.Fatalf("retry = %v", err)
+
+	// A job that was stored although both publishes failed runs once and
+	// then frees its key.
+	stored, f2 := newFlakyClient(t)
+	f2.fail(true, false)
+	if _, err := stored.Enqueue(ctx, sendEmail{To: "a"}, jetq.UniqueUntilDone("stored")); !errors.Is(err, jetq.ErrUncertain) {
+		t.Fatalf("Enqueue = %v", err)
 	}
-	ran, counts := runCount(t, c)
+	ran, counts := runCount(t, stored)
 	wait(t, ran, 5*time.Second)
 	eventually(t, func() bool {
-		_, err := c.Enqueue(ctx, sendEmail{To: "b"}, jetq.UniqueUntilDone("unknown"), jetq.Delay(time.Hour))
+		_, err := stored.Enqueue(ctx, sendEmail{To: "b"}, jetq.UniqueUntilDone("stored"), jetq.Delay(time.Hour))
 		return err == nil
 	})
 	if counts.Load() != 1 {
 		t.Fatalf("runs = %d", counts.Load())
 	}
-
-	// A job published and then retried with the same id runs once.
-	stored, f2 := newFlakyClient(t)
-	f2.fail(true, false)
-	id, err = stored.Enqueue(ctx, sendEmail{To: "a"}, jetq.UniqueUntilDone("stored"), jetq.Delay(300*time.Millisecond))
-	if !errors.Is(err, jetq.ErrUncertain) {
-		t.Fatalf("Enqueue = %v", err)
-	}
-	if _, err := stored.Enqueue(ctx, sendEmail{To: "a"}, jetq.UniqueUntilDone("stored"), jetq.JobID(id), jetq.Delay(300*time.Millisecond)); err != nil {
-		t.Fatalf("retry = %v", err)
-	}
-	ran, counts = runCount(t, stored)
-	wait(t, ran, 5*time.Second)
-	expectNothing(t, ran, time.Second)
-	if counts.Load() != 1 {
-		t.Fatalf("runs = %d", counts.Load())
+	if _, err := stored.Enqueue(ctx, sendEmail{}, jetq.Unique("jetq-lock-1")); err == nil {
+		t.Fatal("reserved unique key accepted")
 	}
 }
 
@@ -187,7 +177,7 @@ func TestJobIDInUse(t *testing.T) {
 func TestRetryDoesNotReplaceDelayedJobWithSameID(t *testing.T) {
 	c := newClient(t)
 	ctx := context.Background()
-	w := c.NewWorker(jetq.Queue{Name: "default", Backoff: jetq.Constant(300 * time.Millisecond)})
+	w := c.NewWorker(jetq.Queue{Name: "default", Backoff: jetq.Constant(time.Second)})
 	ran := make(chan string, 4)
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -208,15 +198,17 @@ func TestRetryDoesNotReplaceDelayedJobWithSameID(t *testing.T) {
 	}
 	wait(t, started, 5*time.Second)
 	wait(t, ran, 5*time.Second)
-	// Another delayed job takes the id while the first one runs; its retry
-	// does not replace it.
-	if _, err := c.Enqueue(ctx, sendEmail{To: "delayed"}, jetq.JobID("shared"), jetq.Delay(time.Second)); err != nil {
+	// Another delayed job takes the id while the first one runs; the retry
+	// does not replace it and goes back without its delay.
+	if _, err := c.Enqueue(ctx, sendEmail{To: "delayed"}, jetq.JobID("shared"), jetq.Delay(2*time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	close(release)
-	got := map[string]bool{wait(t, ran, 5*time.Second): true, wait(t, ran, 5*time.Second): true}
-	if !got["retrying"] || !got["delayed"] {
-		t.Fatalf("ran %v", got)
+	if got := wait(t, ran, 5*time.Second); got != "retrying" {
+		t.Fatalf("ran %q", got)
+	}
+	if got := wait(t, ran, 5*time.Second); got != "delayed" {
+		t.Fatalf("ran %q", got)
 	}
 }
 

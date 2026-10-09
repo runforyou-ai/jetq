@@ -43,7 +43,8 @@ id, err := q.Enqueue(ctx, WelcomeEmail{UserID: 42},
 	// jetq.JobID(id) sets the id yourself, e.g. to store it before enqueueing
 )
 // errors.Is(err, jetq.ErrUncertain): the job may or may not be enqueued (timeout, lost
-// connection); id is returned, and enqueueing again with jetq.JobID(id) resolves it.
+// connection); id is returned. A UniqueUntilDone job is published once more to settle
+// this, even after ctx is cancelled, and otherwise keeps its key until it settles or expires.
 _ = q.Cancel(ctx, id)            // cancel a pending delayed job
 
 // Recurring jobs: every instance passes the same full set at startup.

@@ -37,8 +37,8 @@ id, err := q.Enqueue(ctx, WelcomeEmail{UserID: 42},
 	jetq.UniqueUntilDone("welcome-42"), // 同键任务结束前重复投递返回 ErrDuplicate；jetq.Unique(key) 按时间窗口去重
 	// jetq.JobID(id) 自行指定任务编号，例如投递前先保存它
 )
-// errors.Is(err, jetq.ErrUncertain)：任务可能已投递也可能没有（超时、连接断开）；此时仍返回 id，
-// 用 jetq.JobID(id) 再次投递即可确定结果。
+// errors.Is(err, jetq.ErrUncertain)：任务可能已投递也可能没有（超时、连接断开）；此时仍返回 id。
+// UniqueUntilDone 任务会再发布一次以确定结果（ctx 已取消也会），仍无法确定时保留键直到任务结束或锁过期。
 _ = q.Cancel(ctx, id)            // 取消尚未到点的延迟任务
 
 // 定时任务：各实例启动时传入同一份完整清单。

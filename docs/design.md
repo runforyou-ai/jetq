@@ -57,8 +57,10 @@ Headers starting with `Jetq-` or `Nats-` are reserved.
 `Nats-Schedule: @at <time>` and `Nats-Schedule-Target: jetq.q.<queue>`,
 expecting the subject to be empty (`Nats-Expected-Last-Subject-Sequence: 0`):
 publishing on it would replace a pending delayed job with the same id, so
-`Enqueue` returns `ErrJobIDInUse` instead, and a retry or snooze that finds
-the subject taken is nak'ed with its delay. Ids of jobs that are not delayed
+`Enqueue` returns `ErrJobIDInUse` instead. A retry or snooze that finds the
+subject taken acks the delivery when the pending message is the same job (put
+back by an earlier delivery whose ack was lost), and otherwise goes back to
+the queue without its delay. Ids of jobs that are not delayed
 are not checked. When it fires, the
 server publishes a copy (minus scheduling headers and `Nats-Msg-Id`) to the
 queue subject and purges the schedule message. `Cancel(id)` removes the
@@ -230,8 +232,9 @@ dead-letter, delayed and cron subjects. Jobs waiting for a retry or a snooze
 count as delayed; `Redelivered` counts jobs redelivered after a crash or a
 failed settlement.
 
-`DeadLetters` without a queue filter walks the dead-letter stream backwards
-from the newest sequence, one message per result. With a queue filter it reads
+`DeadLetters` without a queue filter reads the `Limit` sequences below the
+cursor through an ordered consumer, stepping further back by the number of
+entries still missing when deleted entries leave gaps. With a queue filter it reads
 that queue's subject through an ordered consumer in batches and keeps the
 newest entries below the cursor. `Before` is an exclusive sequence cursor.
 
@@ -253,13 +256,16 @@ concurrently.
   success and after dead-lettering, before failure callbacks run; `Cancel`
   releases it for delayed jobs; a publish the server rejected or the client
   did not send releases it. After an uncertain failure such as a timeout the
-  job may have been stored: `Enqueue` publishes it once more with the same
-  message id (`jetq-lock-<lock revision>`), which the stream stores at most
-  once within its duplicate window, and returns success when the server
-  answers. If that fails too, it returns the job id and an error wrapping
-  `ErrUncertain` and keeps the lock; enqueueing again with `JobID(id)` and the
-  same key takes over the lock and publishes again with the same message id.
-  A lock whose `Create` failed is removed if it was written. `Cancel` deletes exactly the schedule message it read
+  job may have been stored: without `Unique`, and while half the duplicate
+  window has not passed, `Enqueue` publishes it once more with the same
+  message id (`jetq-lock-<lock revision>`, so `Unique` keys starting with
+  `jetq-` are rejected), which the stream stores at most once, and returns
+  success when the server answers. A rejection because the delayed subject is
+  taken counts as stored when the pending message is the same job (same id and
+  enqueue time), for example already put back for a retry. Otherwise it
+  returns the job id and an error wrapping `ErrUncertain` and keeps the lock.
+  A lock whose `Create` failed is removed if it was written and the job id was
+  generated for this call. `Cancel` deletes exactly the schedule message it read
   and releases the lock only if that delete succeeds. A lock is only released
   by the job that holds it. Snoozed and retrying jobs keep it. Every lock
   expires at the bucket TTL (`WithUniqueLockTTL`, default 24h) counted from
