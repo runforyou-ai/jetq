@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+- Jobs waiting for a retry are put back as delayed jobs instead of being
+  nak'ed with a delay, so they no longer count against the consumer's
+  `MaxAckPending`: a backlog of failing jobs no longer stalls a queue. They
+  count as `Stats.Delayed` instead of `InFlight` and can be cancelled.
+- Jobs interrupted by the shutdown timeout are put back without using up an
+  attempt.
+- Jobs without a registered handler are put back for other workers without
+  using up an attempt and dead-lettered after `Worker.SetUnknownJobTimeout`
+  (default 1h).
+- `Queue.Timeout` and the `Timeout` enqueue option bound an attempt
+  (`ErrTimeout`); handlers that ignore cancellation are abandoned after 10
+  seconds, so `Worker.Run` always returns.
+- `Info.Timeout` and `Info.Snoozes`.
+- Dead-letter copies are deduplicated per delivered message; `OnFailure`
+  logs payloads that do not decode; keep-alives are sent at least every 5
+  seconds; workers recreate their consumer after fetch failures.
+
 ## v0.2.0
 
 - `UniqueUntilDone` deduplicates a job by key until it settles, with locks in a

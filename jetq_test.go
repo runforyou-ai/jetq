@@ -495,19 +495,6 @@ func TestShutdownWaitsForRunningJob(t *testing.T) {
 	}
 }
 
-func TestUnknownJobIsRetried(t *testing.T) {
-	c := newClient(t)
-	w := c.NewWorker(jetq.Queue{Name: "default", MaxAttempts: 1})
-	failed := make(chan error, 1)
-	jetq.Handle(w, func(ctx context.Context, job report) error { return nil })
-	w.OnFailed(func(ctx context.Context, info jetq.Info, payload []byte, err error) { failed <- err })
-	start(t, w)
-	_, _ = c.Enqueue(context.Background(), sendEmail{})
-	if err := wait(t, failed, 5*time.Second); err == nil {
-		t.Fatal("expected error")
-	}
-}
-
 func TestSlowFailureCallbackIsNotRedelivered(t *testing.T) {
 	c := newClient(t)
 	w := c.NewWorker(jetq.Queue{Name: "default", MaxAttempts: 1, AckWait: 500 * time.Millisecond, Concurrency: 2})

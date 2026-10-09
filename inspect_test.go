@@ -141,9 +141,9 @@ func TestStatsCountsReadyAndInFlight(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// One job waits for its retry delay, two were never delivered.
-	if q := stats.Queues[0]; q.Ready != 2 || q.InFlight != 1 {
-		t.Fatalf("stats = %+v", q)
+	// One job waits for its retry delay as a delayed job, two were never delivered.
+	if q := stats.Queues[0]; q.Ready != 2 || q.InFlight != 0 || stats.Delayed != 1 {
+		t.Fatalf("stats = %+v", stats)
 	}
 }
 

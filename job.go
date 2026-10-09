@@ -29,7 +29,15 @@ type Info struct {
 	Attempt int
 	// MaxAttempts is the number of attempts after which the job is dead-lettered.
 	MaxAttempts int
-	// EnqueuedAt is when the job was enqueued (zero for scheduled jobs).
+	// Timeout is how long this attempt may run (zero: no limit), from
+	// [Queue.Timeout] or [Timeout].
+	Timeout time.Duration
+	// Snoozes is how many times the job was snoozed with [Snooze], for example
+	// to give up after a number of snoozes.
+	Snoozes int
+	// EnqueuedAt is when [Client.Enqueue] was called, by the producer's clock;
+	// for a delayed job that is before it became available. It is zero for jobs
+	// fired by a recurring schedule.
 	EnqueuedAt time.Time
 	// Header carries the message headers, including headers set with [WithHeader].
 	Header nats.Header

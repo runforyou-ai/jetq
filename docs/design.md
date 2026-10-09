@@ -40,7 +40,10 @@ The body is the job encoded as JSON. Headers:
 | `Jetq-Id` | Job id: a NUID assigned at enqueue time, or the id given with `JobID`. |
 | `Jetq-Enqueued-At` | RFC 3339 enqueue time. |
 | `Jetq-Max-Attempts` | Optional per-job attempt limit. |
-| `Jetq-Attempt-Base` | Attempts consumed before a snooze (internal). |
+| `Jetq-Timeout` | Optional per-job attempt timeout (Go duration). |
+| `Jetq-Attempt-Base` | Attempts used before the job was put back (internal). |
+| `Jetq-Snoozes` | Number of snoozes (internal, exposed as `Info.Snoozes`). |
+| `Jetq-Unknown-Since` | When a worker first found no handler for the job (internal). |
 | `Nats-Msg-Id` | `Unique` key, deduplicated by the stream within its duplicate window. |
 | `Jetq-Unique-Lock` | Lock key of a `UniqueUntilDone` job. |
 
@@ -53,14 +56,17 @@ Headers starting with `Jetq-` or `Nats-` are reserved.
 `Nats-Schedule: @at <time>` and `Nats-Schedule-Target: jetq.q.<queue>`. When it fires, the
 server publishes a copy (minus scheduling headers and `Nats-Msg-Id`) to the
 queue subject and purges the schedule message. `Cancel(id)` removes the
-pending schedule message. A schedule can fire while `Cancel` runs, so `Cancel`
+pending schedule message; jobs waiting for a retry or a snooze are stored the
+same way and can be cancelled too. A schedule can fire while `Cancel` runs, so `Cancel`
 first records a marker `cancel.<id>` (holding the job's enqueue time) in the
 `<STREAM>_STATE` bucket, then deletes exactly the schedule message it read. If
 the delete succeeds, `Cancel` returns nil and workers skip a copy the
 scheduler published meanwhile, including redeliveries of it, releasing its
 lock. If it fails because the schedule already fired, `Cancel` returns
 `ErrNotFound` and the job either runs or is skipped; the same holds when
-`Cancel` fails with another error after recording the marker. Markers are never
+`Cancel` fails with another error after recording the marker. Retries and
+snoozes of a job whose marker was recorded are skipped too, so a running job
+finishes its current attempt but is not retried. Markers are never
 withdrawn, so concurrent cancels cannot undo each other; they expire with the
 bucket TTL, and a later job reusing the id has another enqueue time and is not
 skipped. Workers and lock releases read markers and locks through the bucket
@@ -99,25 +105,61 @@ timer runs.
 
 For each message:
 
-1. Build `Info`: attempt = JetStream delivery count (+ snooze base).
-2. Start a keep-alive that sends `InProgress` every `AckWait/3`.
-3. Run middleware and the handler; panics become errors; undecodable payloads
-   are permanent errors; unknown job names are ordinary errors (a newer
-   producer may be ahead of this worker).
-4. Settle:
+1. Build `Info`: attempt = JetStream delivery count + attempt base.
+2. Start a keep-alive that sends `InProgress` every `AckWait/3`, at most every
+   5 seconds.
+3. Without a handler for the job name, put it back (see below).
+4. Run middleware and the handler under the attempt timeout; panics become
+   errors; undecodable payloads are permanent errors.
+5. Settle:
    - success: `Ack`;
-   - `Snooze(d)`: republish as a delayed job with the same id and an attempt
-     base so this attempt is not counted, then `Ack`;
-   - shutdown timeout cancelled the handler: `Nak` for immediate redelivery;
+   - `Snooze(d)`: put back after `d` with attempt base = attempt - 1, so this
+     attempt is not counted, and `Jetq-Snoozes` + 1;
+   - shutdown timeout cancelled the handler: put back right away with attempt
+     base = attempt - 1;
    - permanent error or attempts exhausted: copy to the dead-letter stream with
      `Jetq-Error`, `Jetq-Attempts`, `Jetq-Failed-At`, `Jetq-Queue`; run
      `OnFailure` and `OnFailed`; `Ack`;
-   - otherwise: `NakWithDelay(RetryAfter or Backoff(attempt))`.
+   - otherwise: put back after `RetryAfter` or `Backoff(attempt)` with attempt
+     base = attempt.
+
+Putting back republishes the job with the same id, as a delayed job on
+`jetq.at.<id>` when there is a delay, and then acks the delivery. Jobs waiting
+for a retry or a snooze are therefore not in flight: the consumer's
+`MaxAckPending` (default 1000) only counts running jobs, and a backlog of
+failing jobs never blocks healthy ones. They can be cancelled like other
+delayed jobs. If republishing fails, the delivery is nak'ed with the delay
+instead and its redelivery counts as the next attempt.
 
 jetq decides retry timing and the attempt limit itself; the consumer has
 `MaxDeliver: -1` and no server backoff, so there is a single source of truth.
 `AckWait` only bounds recovery after a worker crash. Crash redeliveries count as
 attempts.
+
+Delay times (`Delay`, snoozes, retries) are turned into an absolute `@at` time
+with the clock of the process that publishes them; keep clocks synchronised.
+
+### Timeouts
+
+`Queue.Timeout`, overridden per job by `Timeout(d)` (header `Jetq-Timeout`),
+bounds one attempt: when it passes, the handler's context is cancelled with
+cause `ErrTimeout` and the attempt fails with an error wrapping `ErrTimeout`,
+retried like any other failure. A handler that has not returned 10 seconds
+after its context was cancelled, by a timeout or by shutdown, is abandoned:
+its goroutine keeps running, but the worker settles the job, frees the slot
+and stops keeping the message alive. Abandoned handlers therefore no longer
+count towards `Concurrency`.
+
+### Unknown jobs
+
+When a worker has no handler for a job, for example because a newer version or
+another service produces it, the worker puts it back after 10 seconds without
+using up an attempt and records in `Jetq-Unknown-Since` when this first
+happened. Middleware and handlers do not run. Once
+`SetUnknownJobTimeout` (default 1h) has passed since then, the worker
+dead-letters the job; only `OnFailed` callbacks run, since the job's own
+`OnFailure` is registered elsewhere. A non-positive timeout puts it back
+forever.
 
 ### Logging
 
@@ -131,23 +173,32 @@ context.
 
 When the `Run` context is cancelled the worker stops fetching, waits for
 running handlers up to the shutdown timeout (default 30s), then cancels their
-contexts and naks them for immediate redelivery elsewhere. `Run` returns only
-after every handler has returned, so handlers must honour context cancellation.
+contexts and puts their jobs back for immediate delivery elsewhere without
+using up the attempt. `Run` returns once every handler has returned or been
+abandoned (10 seconds after the cancellation), and the jobs are settled.
 
-Settlement (dead-lettering, failure callbacks, snoozing) stays under the
+Settlement (dead-lettering, failure callbacks, putting back) stays under the
 keep-alive and uses its own bounded context, so it completes during shutdown and
 the job is not redelivered while it runs. Panics in failure callbacks are logged
 and do not stop the worker. A delivery whose attempt already exceeds the limit
 (the previous worker crashed on the last attempt) is dead-lettered without
 running the handler.
 
+The dead-letter copy carries `Nats-Msg-Id: jetq-dead-<stream sequence>`, so a
+redelivery after a lost ack within the dead-letter stream's duplicate window
+(2m) does not add a second entry; failure callbacks run again, so they must be
+idempotent.
+
+If fetching fails, for example because the consumer was deleted, the worker
+waits a second and creates the consumer again.
+
 ## Inspection
 
 `Stats` reads consumer info for every `jetq-<queue>` consumer (ready =
 `NumPending`, in flight = `NumAckPending`) and subject counts of the
-dead-letter, delayed and cron subjects. A job waiting for its retry delay was
-nak'ed with a delay and stays in flight; consumer info cannot tell it apart
-from a running job.
+dead-letter, delayed and cron subjects. Jobs waiting for a retry or a snooze
+count as delayed; `Redelivered` counts jobs redelivered after a crash or a
+failed settlement.
 
 `DeadLetters` without a queue filter walks the dead-letter stream backwards
 from the newest sequence, one message per result. With a queue filter it reads
@@ -185,7 +236,8 @@ concurrently.
   tables.
 - Workers of the same queue share one durable consumer whose `AckWait` is set
   by the last worker to start; give every worker of a queue the same `Queue`
-  settings.
+  settings. Keep-alives are sent at least every 5 seconds, so mixed `AckWait`
+  values of 15 seconds or more are safe during a rolling deploy.
 - Applications sharing a NATS account must use distinct stream names and
   subject prefixes: consumers are named `jetq-<queue>` and `SyncSchedules`
   removes schedules it was not given.

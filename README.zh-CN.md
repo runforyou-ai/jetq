@@ -7,7 +7,7 @@ jetq 是基于 [NATS JetStream](https://docs.nats.io/nats-concepts/jetstream) �
 - **强类型任务**：任务是实现 `JobName()` 的结构体，处理函数直接拿到解码后的结构体。
 - **重试**：按队列设置最大尝试次数和退避；`Permanent` 直接失败，`RetryAfter` 指定下次时间，`Snooze` 推迟执行且不计入尝试次数。
 - **延迟与定时由服务端调度**：使用 JetStream 消息调度，应用里不需要调度进程、轮询或选主。
-- **长任务**：处理中自动续期；worker 崩溃后，任务在 `AckWait` 后重新投递。
+- **长任务**：处理中自动续期；worker 崩溃后，任务在 `AckWait` 后重新投递；`Queue.Timeout` 与 `jetq.Timeout(d)` 限制单次尝试的执行时间。
 - **死信**：尝试次数用完的任务进入死信 stream，带最后一次错误，并调用 `OnFailure` 回调。
 - **接口小**：一个 stream，每个队列一个 consumer，直接使用 `nats.go`。嵌入式还是独立 NATS 由应用决定。
 
@@ -65,7 +65,7 @@ err = w.Run(ctx) // 阻塞；取消后等待正在执行的任务
 
 ### 查看队列
 
-`q.Stats(ctx)` 返回每个队列尚未投递（`Ready`）、已投递未结算（`InFlight`，含执行中与等待重试）和死信的任务数，以及待执行的延迟任务数和已安装的定时任务数；`q.DeadLetters(ctx, jetq.DeadLetterQuery{...})` 按时间倒序分页读取死信及最后一次错误。
+`q.Stats(ctx)` 返回每个队列尚未投递（`Ready`）、已投递未结算（`InFlight`，主要是执行中）和死信的任务数，以及待执行的延迟任务数（含等待重试与推迟的任务）和已安装的定时任务数；`q.DeadLetters(ctx, jetq.DeadLetterQuery{...})` 按时间倒序分页读取死信及最后一次错误。
 
 ### 日志上下文
 
@@ -79,8 +79,11 @@ err = w.Run(ctx) // 阻塞；取消后等待正在执行的任务
 | 普通错误 | 按退避重试；次数用完进入死信 |
 | `jetq.RetryAfter(d, err)` | 在 `d` 后重试 |
 | `jetq.Permanent(err)` | 直接进入死信 |
-| `jetq.Snooze(d)` | `d` 后再执行，不计入尝试次数 |
+| `jetq.Snooze(d)` | `d` 后再执行，不计入尝试次数（`Info.Snoozes` 记录推迟次数） |
 | panic | 按错误处理 |
+| 超时 | context 以 `jetq.ErrTimeout` 为原因取消，本次尝试失败 |
+
+等待重试或推迟的任务以延迟任务的形式保存，不会占住队列，也可以用 `Cancel` 取消。worker 没有注册处理函数的任务（例如滚动部署期间）会放回给其他 worker 且不计入尝试次数，超过 `w.SetUnknownJobTimeout`（默认 1 小时）后进入死信。停机超时中断的任务放回队列且不计入尝试次数；不响应取消的处理函数在 10 秒后被放弃。
 
 投递语义是**至少一次**，处理函数必须幂等。
 
@@ -92,6 +95,7 @@ err = w.Run(ctx) // 阻塞；取消后等待正在执行的任务
 | `handle()` | `jetq.Handle(w, fn)` |
 | `Job::dispatch()->onQueue('mail')->delay(...)` | `q.Enqueue(ctx, job, jetq.OnQueue("mail"), jetq.Delay(d))` |
 | `$tries`、`backoff()` | `Queue.MaxAttempts`、`Queue.Backoff`、`jetq.MaxAttempts(n)` |
+| `$timeout` | `Queue.Timeout`、`jetq.Timeout(d)` |
 | `$this->release($delay)` | `return jetq.Snooze(d)` |
 | `$this->fail()` | `return jetq.Permanent(err)` |
 | `failed()`、`failed_jobs` | `jetq.OnFailure`、`w.OnFailed`、死信 stream |
