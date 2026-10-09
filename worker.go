@@ -692,12 +692,16 @@ func (w *Worker) requeue(ctx context.Context, d delivery, delay time.Duration, b
 	for key, value := range set {
 		next.Header.Set(key, value)
 	}
+	pubOpts := []jetstream.PublishOpt{jetstream.WithExpectStream(c.cfg.streamName)}
 	if delay > 0 {
 		next.Header.Set(headerSchedule, "@at "+time.Now().Add(delay).UTC().Format(time.RFC3339Nano))
 		next.Header.Set(headerScheduleTarget, next.Subject)
 		next.Subject = c.delaySubject(info.ID)
+		// Never replace another pending delayed job that has the same id.
+		pubOpts = append(pubOpts, jetstream.WithExpectLastSequencePerSubject(0))
 	}
-	if _, err := c.js.PublishMsg(ctx, next, jetstream.WithExpectStream(c.cfg.streamName)); err != nil {
+	if _, err := c.js.PublishMsg(ctx, next, pubOpts...); err != nil {
+		err = classify(err)
 		c.cfg.logger.WarnContext(ctx, "jetq requeue failed", "queue", info.Queue, "job", info.Name, "id", info.ID, "error", err)
 		if nakErr := d.msg.NakWithDelay(delay); nakErr != nil {
 			c.cfg.logger.WarnContext(ctx, "jetq nak failed", "queue", info.Queue, "job", info.Name, "id", info.ID, "error", nakErr)

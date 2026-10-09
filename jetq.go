@@ -59,7 +59,6 @@ var nameRE = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 type Client struct {
 	js     jetstream.JetStream
 	stream jetstream.Stream
-	dead   jetstream.Stream
 	cfg    config
 
 	stateMu     sync.Mutex
@@ -165,7 +164,7 @@ func New(ctx context.Context, js jetstream.JetStream, opts ...Option) (*Client, 
 	if err != nil {
 		return nil, fmt.Errorf("jetq: create stream %s: %w", cfg.streamName, err)
 	}
-	dead, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+	_, err = js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
 		Name:        cfg.deadName,
 		Description: "jetq dead-lettered jobs",
 		Subjects:    []string{cfg.prefix + ".dead.>"},
@@ -177,7 +176,7 @@ func New(ctx context.Context, js jetstream.JetStream, opts ...Option) (*Client, 
 	if err != nil {
 		return nil, fmt.Errorf("jetq: create stream %s: %w", cfg.deadName, err)
 	}
-	return &Client{js: js, stream: stream, dead: dead, cfg: cfg}, nil
+	return &Client{js: js, stream: stream, cfg: cfg}, nil
 }
 
 // stateBucket returns the key-value bucket holding UniqueUntilDone locks and
@@ -186,10 +185,13 @@ func New(ctx context.Context, js jetstream.JetStream, opts ...Option) (*Client, 
 // one it was created with.
 func (c *Client) stateBucket(ctx context.Context, create bool) (jetstream.KeyValue, error) {
 	c.stateMu.Lock()
-	defer c.stateMu.Unlock()
-	if c.state != nil {
-		return c.state, nil
+	cached := c.state
+	c.stateMu.Unlock()
+	if cached != nil {
+		return cached, nil
 	}
+	// Look the bucket up outside the lock, so a slow server does not block
+	// other calls; concurrent lookups keep the first handle.
 	name := c.cfg.streamName + "_STATE"
 	state, err := c.js.KeyValue(ctx, name)
 	if errors.Is(err, jetstream.ErrBucketNotFound) {
@@ -210,8 +212,12 @@ func (c *Client) stateBucket(ctx context.Context, create bool) (jetstream.KeyVal
 	if err != nil {
 		return nil, fmt.Errorf("jetq: state bucket: %w", err)
 	}
-	c.state = state
-	return state, nil
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	if c.state == nil {
+		c.state = state
+	}
+	return c.state, nil
 }
 
 // JetStream returns the JetStream context the client was created with.
@@ -250,6 +256,28 @@ func validName(kind, name string) error {
 // [Unique] key was enqueued within the duplicate window, or a job with the same
 // [UniqueUntilDone] key has not settled. The job is not enqueued again.
 var ErrDuplicate = errors.New("jetq: duplicate job")
+
+// ErrJobIDInUse is returned by [Client.Enqueue] when a pending delayed job,
+// including one waiting for a retry or a snooze, has the id given with
+// [JobID]. The job is not enqueued.
+var ErrJobIDInUse = errors.New("jetq: job id in use by a pending delayed job")
+
+// ErrUncertain is wrapped by errors of [Client.Enqueue] when the job may or
+// may not have been enqueued: the publish failed without an answer from the
+// server, for example after a timeout, a context cancelled while publishing
+// or a lost connection. Enqueue then returns the job id with the error. Treat
+// the job as possibly enqueued; enqueueing it again may run it twice, unless
+// it uses [Unique] within the duplicate window or [UniqueUntilDone].
+//
+// For a [UniqueUntilDone] job, Enqueue first publishes it a second time,
+// deduplicated by a message id derived from its lock so that the stream
+// stores it at most once, and returns success if that tells the outcome; this
+// may enqueue the job after ctx was cancelled. Otherwise the lock is kept:
+// enqueueing the same key returns [ErrDuplicate] until the job settles or the
+// lock expires, except that enqueueing it again with the returned id
+// ([JobID]) and the same key publishes it again, deduplicated within the
+// stream's duplicate window. Retry that way to resolve the outcome.
+var ErrUncertain = errors.New("jetq: enqueue outcome unknown")
 
 // ErrNotFound is returned by [Client.Cancel] when no pending delayed job has the given id.
 var ErrNotFound = errors.New("jetq: delayed job not found")

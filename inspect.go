@@ -2,7 +2,6 @@ package jetq
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"slices"
 	"strconv"
@@ -113,9 +112,10 @@ type DeadLetterQuery struct {
 
 // DeadLetters returns dead-lettered jobs, newest first.
 //
-// Without a queue filter it reads one message per result. With a queue filter
-// it reads that queue's dead letters in batches up to the cursor, so its cost
-// grows with the number of dead letters kept for that queue.
+// Without a queue filter it reads the newest Limit entries below the cursor in
+// one batch. With a queue filter it reads that queue's dead letters in batches
+// up to the cursor, so its cost grows with the number of dead letters kept for
+// that queue.
 func (c *Client) DeadLetters(ctx context.Context, query DeadLetterQuery) ([]DeadLetter, error) {
 	if query.Limit <= 0 {
 		query.Limit = 50
@@ -130,22 +130,72 @@ func (c *Client) DeadLetters(ctx context.Context, query DeadLetterQuery) ([]Dead
 	if err != nil {
 		return nil, fmt.Errorf("jetq: dead letters: %w", err)
 	}
-	last := info.State.LastSeq
+	first, last := info.State.FirstSeq, info.State.LastSeq
 	if query.Before > 0 && query.Before-1 < last {
 		last = query.Before - 1
 	}
 	var out []DeadLetter
-	for seq := last; seq >= info.State.FirstSeq && seq > 0 && len(out) < query.Limit; seq-- {
-		msg, err := c.dead.GetMsg(ctx, seq)
-		if errors.Is(err, jetstream.ErrMsgNotFound) {
-			continue
+	// Read the window of sequences just below the cursor; deleted entries leave
+	// gaps, so step further back until enough entries are found.
+	for end := last; end > 0 && end >= first && len(out) < query.Limit; {
+		start := first
+		if need := uint64(query.Limit - len(out)); end-first >= need {
+			start = end - need + 1
 		}
+		batch, err := c.readDeadLetters(ctx, start, end)
 		if err != nil {
-			return nil, fmt.Errorf("jetq: dead letter %d: %w", seq, err)
+			return nil, fmt.Errorf("jetq: dead letters: %w", err)
 		}
-		out = append(out, deadLetter(msg.Sequence, msg.Header, msg.Data))
+		for i := len(batch) - 1; i >= 0 && len(out) < query.Limit; i-- {
+			out = append(out, batch[i])
+		}
+		end = start - 1
 	}
 	return out, nil
+}
+
+// readDeadLetters reads the dead letters with sequences from start to end in
+// one pass of an ordered consumer, oldest first.
+func (c *Client) readDeadLetters(ctx context.Context, start, end uint64) ([]DeadLetter, error) {
+	consumer, err := c.js.OrderedConsumer(ctx, c.cfg.deadName, jetstream.OrderedConsumerConfig{
+		FilterSubjects:    []string{c.deadSubject(">")},
+		DeliverPolicy:     jetstream.DeliverByStartSequencePolicy,
+		OptStartSeq:       start,
+		InactiveThreshold: 30 * time.Second,
+	})
+	if err != nil {
+		return nil, err
+	}
+	info, err := consumer.Info(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var out []DeadLetter
+	if info.NumPending == 0 {
+		return out, nil
+	}
+	messages, err := consumer.Messages(jetstream.PullMaxMessages(int(min(end-start+1, 256))))
+	if err != nil {
+		return nil, err
+	}
+	defer messages.Stop()
+	for {
+		msg, err := messages.Next(jetstream.NextContext(ctx))
+		if err != nil {
+			return nil, err
+		}
+		meta, err := msg.Metadata()
+		if err != nil {
+			return nil, err
+		}
+		if meta.Sequence.Stream > end {
+			return out, nil
+		}
+		out = append(out, deadLetter(meta.Sequence.Stream, msg.Headers(), msg.Data()))
+		if meta.Sequence.Stream == end || meta.NumPending == 0 {
+			return out, nil
+		}
+	}
 }
 
 // queueDeadLetters reads one queue's dead letters below the cursor through an
