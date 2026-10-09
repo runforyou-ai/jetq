@@ -203,9 +203,13 @@ func TestRetryDoesNotReplaceDelayedJobWithSameID(t *testing.T) {
 	if _, err := c.Enqueue(ctx, sendEmail{To: "delayed"}, jetq.JobID("shared"), jetq.Delay(2*time.Second)); err != nil {
 		t.Fatal(err)
 	}
+	released := time.Now()
 	close(release)
 	if got := wait(t, ran, 5*time.Second); got != "retrying" {
 		t.Fatalf("ran %q", got)
+	}
+	if gap := time.Since(released); gap < 900*time.Millisecond {
+		t.Fatalf("retried after %s, before its delay", gap)
 	}
 	if got := wait(t, ran, 5*time.Second); got != "delayed" {
 		t.Fatalf("ran %q", got)

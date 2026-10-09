@@ -22,9 +22,11 @@
   not stored. A context that is already done fails `Enqueue` before anything
   is published. `Unique` keys starting with `jetq-` are reserved.
 - `Enqueue` returns `ErrJobIDInUse` instead of replacing a pending delayed job
-  with the same `JobID`; retries and snoozes never replace one either.
+  with the same `JobID`; retries and snoozes never replace one either and are
+  redelivered after their delay instead, which counts as an attempt.
 - `DeadLetters` without a queue filter reads a page through one ordered
-  consumer instead of one request per entry.
+  consumer instead of one request per entry; reads fail when no entry arrives
+  within 5 seconds instead of waiting.
 - Dead-letter copies are deduplicated per delivered message; `OnFailure`
   logs payloads that do not decode; keep-alives are sent at least every 5
   seconds; workers recreate their consumer after fetch failures.
