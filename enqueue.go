@@ -86,6 +86,25 @@ func WithHeader(key, value string) EnqueueOption {
 	}
 }
 
+// EnqueueNamed enqueues a JSON payload under an explicit, stable job name.
+// Payload types need no methods. A json.RawMessage is validated and stored byte
+// for byte; other values are encoded as JSON. Errors and options have the same
+// semantics as Enqueue. A nil payload or empty json.RawMessage becomes null.
+// A []byte follows encoding/json rules and becomes a base64 JSON string.
+func (c *Client) EnqueueNamed(ctx context.Context, name string, payload any, opts ...EnqueueOption) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if name == "" {
+		return "", errors.New("jetq: job name is empty")
+	}
+	data, err := encodePayload(name, payload)
+	if err != nil {
+		return "", err
+	}
+	return c.Enqueue(ctx, RawJob{Name: name, Payload: data}, opts...)
+}
+
 // Enqueue encodes job as JSON and adds it to its queue, returning the job id.
 //
 // Call it after the surrounding database transaction has committed; jetq does
@@ -303,6 +322,18 @@ func encodeJob(job Job) ([]byte, error) {
 	data, err := json.Marshal(job)
 	if err != nil {
 		return nil, fmt.Errorf("jetq: encode job %s: %w", job.JobName(), err)
+	}
+	return data, nil
+}
+
+// encodePayload preserves raw JSON and encodes ordinary input values.
+func encodePayload(name string, payload any) ([]byte, error) {
+	if raw, ok := payload.(json.RawMessage); ok {
+		return encodeJob(RawJob{Name: name, Payload: raw})
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("jetq: encode job %s: %w", name, err)
 	}
 	return data, nil
 }

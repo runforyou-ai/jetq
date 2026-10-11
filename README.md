@@ -6,10 +6,9 @@
 [中文](README.zh-CN.md)
 
 jetq is a background job queue for Go built on [NATS JetStream](https://docs.nats.io/nats-concepts/jetstream).
-If you know Laravel queues, you already know jetq: jobs are structs, handlers are functions,
-and retries, backoff, delays, unique jobs, failed-job handling and cron schedules work the way you expect.
+Jobs carry explicitly named JSON payloads. Handlers are ordinary Go functions; the queue manages retries, backoff, delays, uniqueness, failure callbacks and recurring schedules.
 
-- **Typed jobs.** A job is a struct with a `JobName()` method; handlers receive the decoded struct.
+- **Typed handlers.** Payloads are ordinary structs; `EnqueueNamed` and `HandleNamed` share an explicit job name.
 - **Retries that make sense.** Per-queue attempt limits and backoff, `Permanent` errors, `RetryAfter`, and `Snooze` for "not now" without burning an attempt.
 - **Delayed and recurring jobs on the server.** Delays and cron schedules use JetStream message scheduling, so there is no scheduler process, polling or leader election in your app.
 - **Long jobs.** Running handlers keep their message alive; a crashed worker's job is redelivered after `AckWait`. `Queue.Timeout` and `jetq.Timeout(d)` bound a single attempt.
@@ -24,6 +23,8 @@ Requires nats-server **2.14+** (2.15 recommended) and Go 1.27+.
 go get github.com/runforyou-ai/jetq
 ```
 
+Version 0.4 removes `Cron` and `Schedule.In`; see [migration instructions](CHANGELOG.md#v040) before upgrading.
+
 ## Usage
 
 ```go
@@ -31,12 +32,10 @@ type WelcomeEmail struct {
 	UserID int64 `json:"user_id"`
 }
 
-func (WelcomeEmail) JobName() string { return "welcome-email" }
-
 q, err := jetq.New(ctx, js) // js is a jetstream.JetStream; creates the streams if needed
 
 // Enqueue after your database transaction has committed.
-id, err := q.Enqueue(ctx, WelcomeEmail{UserID: 42},
+id, err := q.EnqueueNamed(ctx, "welcome-email", WelcomeEmail{UserID: 42},
 	jetq.OnQueue("mail"),
 	jetq.Delay(10*time.Minute),   // or jetq.At(t)
 	jetq.UniqueUntilDone("welcome-42"), // ErrDuplicate until that job settles; jetq.Unique(key) uses a time window
@@ -49,8 +48,8 @@ _ = q.Cancel(ctx, id)            // cancel a pending delayed job
 
 // Recurring jobs: every instance passes the same full set at startup.
 err = q.SyncSchedules(ctx,
-	jetq.Cron("daily-report", "0 2 * * *", DailyReport{}).In("Asia/Shanghai"),
-	jetq.Cron("sweep", "@every 30s", Sweep{}, jetq.OnQueue("maintenance")),
+	jetq.Schedule{Key: "daily-report", Cron: "0 2 * * *", Name: "daily-report", Payload: DailyReport{}, Timezone: "Asia/Shanghai"},
+	jetq.Schedule{Key: "sweep", Cron: "@every 30s", Name: "sweep", Payload: Sweep{}, Queue: "maintenance"},
 )
 
 // Workers.
@@ -58,11 +57,11 @@ w := q.NewWorker(
 	jetq.Queue{Name: "default"},
 	jetq.Queue{Name: "mail", Concurrency: 8, MaxAttempts: 5, Backoff: jetq.Exponential(10*time.Second, time.Hour), Timeout: 5 * time.Minute},
 )
-jetq.Handle(w, func(ctx context.Context, job WelcomeEmail) error {
+jetq.HandleNamed(w, "welcome-email", func(ctx context.Context, job WelcomeEmail) error {
 	info, _ := jetq.JobInfo(ctx) // id, attempt, queue, headers...
 	return send(ctx, job.UserID)
 }, jetq.OnFailure(func(ctx context.Context, job WelcomeEmail, err error) {
-	// like Laravel's failed()
+	// Record the terminal failure.
 }))
 w.Use(loggingMiddleware)
 err = w.Run(ctx) // blocks; on cancel, waits for running jobs
@@ -71,8 +70,14 @@ err = w.Run(ctx) // blocks; on cancel, waits for running jobs
 ### Runtime job names
 
 When job names are only known at runtime (for example when bridging an existing task system),
-enqueue `jetq.RawJob{Name: name, Payload: json}` and register `w.HandleRaw(name, fn, jetq.OnRawFailure(...))`.
+use `EnqueueNamed(ctx, name, payload)` and `HandleNamed(w, name, fn, OnFailure(...))`. Ordinary structs need no methods. For byte-for-byte JSON handlers, pass `json.RawMessage` and register `w.HandleRaw(name, fn, jetq.OnRawFailure(...))`.
 The payload must be valid JSON and is delivered byte for byte.
+
+### Type-owned names
+
+`Enqueue` and `Handle` also accept types implementing `JobName() string`. Use this convenience when a type owns its stable protocol name. Explicit names need no methods.
+
+`json.RawMessage` is validated and preserved byte for byte; an empty raw message or nil payload is encoded as `null`. Other values follow `encoding/json`, including base64 JSON strings for `[]byte`. Decoding `null` into a struct yields its zero value; handlers validate required business fields.
 
 ### Inspecting queues
 
@@ -106,23 +111,6 @@ using up an attempt; handlers that ignore cancellation are abandoned 10 seconds 
 under a second are served by redelivery, and delayed jobs fire no sooner than about 250ms.
 
 Delivery is **at least once**: make handlers idempotent.
-
-## Laravel cheat sheet
-
-| Laravel | jetq |
-|---|---|
-| `implements ShouldQueue` | `JobName() string` |
-| `handle()` | `jetq.Handle(w, fn)` |
-| `Job::dispatch()->onQueue('mail')->delay(...)` | `q.Enqueue(ctx, job, jetq.OnQueue("mail"), jetq.Delay(d))` |
-| `$tries`, `backoff()` | `Queue.MaxAttempts`, `Queue.Backoff`, `jetq.MaxAttempts(n)` |
-| `$timeout` | `Queue.Timeout`, `jetq.Timeout(d)` |
-| `$this->release($delay)` | `return jetq.Snooze(d)` |
-| `$this->fail()` | `return jetq.Permanent(err)` |
-| `failed()` / `failed_jobs` | `jetq.OnFailure`, `w.OnFailed`, dead-letter stream |
-| `ShouldBeUnique` | `jetq.UniqueUntilDone(key)` (until the job settles) or `jetq.Unique(key)` (within the duplicate window) |
-| `$schedule->job(...)->cron(...)->timezone(...)` | `jetq.Cron(key, spec, job).In(tz)` + `q.SyncSchedules` |
-| `queue:work` | `w.Run(ctx)` |
-| `after_commit` | call `Enqueue` after commit |
 
 ## Deployment
 

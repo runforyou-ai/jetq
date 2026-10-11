@@ -75,7 +75,7 @@ func TestStatsAndDeadLetters(t *testing.T) {
 	if _, err := c.Enqueue(ctx, sendEmail{To: "later"}, jetq.Delay(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.SyncSchedules(ctx, jetq.Cron("nightly", "@daily", report{})); err != nil {
+	if err := c.SyncSchedules(ctx, jetq.Schedule{Key: "nightly", Cron: "@daily", Name: "report", Payload: report{}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -150,7 +150,7 @@ func TestStatsCountsReadyAndInFlight(t *testing.T) {
 func TestInspectionIsConcurrencySafe(t *testing.T) {
 	c := newClient(t)
 	ctx := context.Background()
-	if err := c.SyncSchedules(ctx, jetq.Cron("nightly", "@daily", report{})); err != nil {
+	if err := c.SyncSchedules(ctx, jetq.Schedule{Key: "nightly", Cron: "@daily", Name: "report", Payload: report{}}); err != nil {
 		t.Fatal(err)
 	}
 	id, err := c.Enqueue(ctx, sendEmail{}, jetq.Delay(time.Hour))
@@ -170,7 +170,7 @@ func TestInspectionIsConcurrencySafe(t *testing.T) {
 				if _, err := c.DeadLetters(ctx, jetq.DeadLetterQuery{Queue: "default"}); err != nil {
 					t.Error(err)
 				}
-				if err := c.SyncSchedules(ctx, jetq.Cron("nightly", "@daily", report{})); err != nil {
+				if err := c.SyncSchedules(ctx, jetq.Schedule{Key: "nightly", Cron: "@daily", Name: "report", Payload: report{}}); err != nil {
 					t.Error(err)
 				}
 			}
