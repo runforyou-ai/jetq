@@ -15,30 +15,24 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 )
 
-// Schedule is a recurring job fired by the NATS server. Create it with [Cron]
-// and install the full set with [Client.SyncSchedules].
+// Schedule describes a recurring job fired by the NATS server.
+// Every instance installs the same full set with Client.SyncSchedules.
+// Names are stable protocol identifiers independent of Go payload types.
 type Schedule struct {
-	key      string
-	spec     string
-	timeZone string
-	job      Job
-	opts     []EnqueueOption
-}
-
-// Cron declares a recurring job. key identifies the schedule and must be
-// unique; spec is a standard five-field cron expression ("0 2 * * *"), a
-// six-field expression with leading seconds, or a descriptor such as
-// "@hourly", "@daily" or "@every 5m". Only [OnQueue], [MaxAttempts],
-// [Timeout] and [WithHeader] apply to scheduled jobs.
-func Cron(key, spec string, job Job, opts ...EnqueueOption) Schedule {
-	return Schedule{key: key, spec: spec, job: job, opts: opts}
-}
-
-// In evaluates the cron expression in the named IANA time zone (default UTC).
-// It does not apply to "@every" schedules. Requires nats-server 2.14 or later.
-func (s Schedule) In(timeZone string) Schedule {
-	s.timeZone = timeZone
-	return s
+	Key string
+	// Cron is a five- or six-field cron expression or a descriptor such as @hourly or @every 5m.
+	Cron string
+	// Timezone is an IANA time zone, default UTC. It does not apply to @every.
+	Timezone string
+	Name     string
+	Payload  any
+	// Queue defaults to DefaultQueue.
+	Queue string
+	// MaxAttempts overrides the worker queue limit when positive.
+	MaxAttempts int
+	// Timeout overrides the queue timeout when non-nil; zero means no limit.
+	Timeout *time.Duration
+	Header  nats.Header
 }
 
 // SyncSchedules makes the server-side schedules match schedules exactly:
@@ -54,7 +48,7 @@ func (c *Client) SyncSchedules(ctx context.Context, schedules ...Schedule) error
 			return err
 		}
 		if _, exists := desired[msg.Subject]; exists {
-			return fmt.Errorf("jetq: duplicate schedule key %q", s.key)
+			return fmt.Errorf("jetq: duplicate schedule key %q", s.Key)
 		}
 		desired[msg.Subject] = msg
 	}
@@ -91,58 +85,61 @@ func (c *Client) SyncSchedules(ctx context.Context, schedules ...Schedule) error
 }
 
 func (c *Client) scheduleMsg(s Schedule) (*nats.Msg, error) {
-	if err := validName("schedule", s.key); err != nil {
+	if err := validName("schedule", s.Key); err != nil {
 		return nil, err
 	}
-	o := enqueueOptions{queue: DefaultQueue}
-	for _, opt := range s.opts {
-		opt(&o)
+	queue := s.Queue
+	if queue == "" {
+		queue = DefaultQueue
 	}
-	if o.unique != "" || o.lock != "" || o.delay != 0 || !o.at.IsZero() || o.id != "" {
-		return nil, fmt.Errorf("jetq: schedule %q: Unique, UniqueUntilDone, Delay, At and JobID do not apply to schedules", s.key)
+	if s.MaxAttempts < 0 {
+		return nil, fmt.Errorf("jetq: schedule %q: max attempts must not be negative", s.Key)
 	}
-	if err := validName("queue", o.queue); err != nil {
+	if s.Timeout != nil && *s.Timeout < 0 {
+		return nil, fmt.Errorf("jetq: schedule %q: timeout must not be negative", s.Key)
+	}
+	if err := validName("queue", queue); err != nil {
 		return nil, err
 	}
-	spec, err := normalizeCron(s.spec)
+	spec, err := normalizeCron(s.Cron)
 	if err != nil {
-		return nil, fmt.Errorf("jetq: schedule %q: %w", s.key, err)
+		return nil, fmt.Errorf("jetq: schedule %q: %w", s.Key, err)
 	}
-	if s.timeZone != "" {
+	if s.Timezone != "" {
 		if strings.HasPrefix(spec, "@every") {
-			return nil, fmt.Errorf("jetq: schedule %q: time zones do not apply to @every", s.key)
+			return nil, fmt.Errorf("jetq: schedule %q: time zones do not apply to @every", s.Key)
 		}
-		if _, err := time.LoadLocation(s.timeZone); err != nil {
-			return nil, fmt.Errorf("jetq: schedule %q: %w", s.key, err)
+		if _, err := time.LoadLocation(s.Timezone); err != nil {
+			return nil, fmt.Errorf("jetq: schedule %q: %w", s.Key, err)
 		}
 	}
-	name := s.job.JobName()
+	name := s.Name
 	if name == "" {
-		return nil, fmt.Errorf("jetq: schedule %q: job name is empty", s.key)
+		return nil, fmt.Errorf("jetq: schedule %q: job name is empty", s.Key)
 	}
-	data, err := encodeJob(s.job)
+	data, err := encodePayload(name, s.Payload)
 	if err != nil {
-		return nil, fmt.Errorf("jetq: schedule %q: %w", s.key, err)
+		return nil, fmt.Errorf("jetq: schedule %q: %w", s.Key, err)
 	}
 
-	msg := &nats.Msg{Subject: c.cronSubject(s.key), Data: data, Header: nats.Header{}}
-	for key, values := range o.header {
+	msg := &nats.Msg{Subject: c.cronSubject(s.Key), Data: data, Header: nats.Header{}}
+	for key, values := range s.Header {
 		if reservedHeader(key) {
 			return nil, fmt.Errorf("jetq: header %q is reserved", key)
 		}
 		msg.Header[key] = values
 	}
 	msg.Header.Set(HeaderJob, name)
-	if o.maxAttempts > 0 {
-		msg.Header.Set(HeaderMaxAttempts, strconv.Itoa(o.maxAttempts))
+	if s.MaxAttempts > 0 {
+		msg.Header.Set(HeaderMaxAttempts, strconv.Itoa(s.MaxAttempts))
 	}
-	if o.timeout != nil {
-		msg.Header.Set(HeaderTimeout, o.timeout.String())
+	if s.Timeout != nil {
+		msg.Header.Set(HeaderTimeout, s.Timeout.String())
 	}
 	msg.Header.Set(headerSchedule, spec)
-	msg.Header.Set(headerScheduleTarget, c.queueSubject(o.queue))
-	if s.timeZone != "" {
-		msg.Header.Set(headerScheduleTimeZone, s.timeZone)
+	msg.Header.Set(headerScheduleTarget, c.queueSubject(queue))
+	if s.Timezone != "" {
+		msg.Header.Set(headerScheduleTimeZone, s.Timezone)
 	}
 	return msg, nil
 }

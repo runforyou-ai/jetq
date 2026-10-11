@@ -125,12 +125,12 @@ func (w *Worker) mustNotBeStarted() {
 }
 
 // HandleOption configures a handler registered with [Handle].
-type HandleOption[T Job] func(*handler)
+type HandleOption[T any] func(*handler)
 
 // OnFailure registers a typed callback for when a job of this type is
-// dead-lettered, like Laravel's failed() method. If the payload does not
+// dead-lettered. If the payload does not
 // decode into T, the callback is skipped and a warning is logged.
-func OnFailure[T Job](fn func(ctx context.Context, job T, err error)) HandleOption[T] {
+func OnFailure[T any](fn func(ctx context.Context, job T, err error)) HandleOption[T] {
 	return func(h *handler) {
 		h.failed = func(ctx context.Context, payload []byte, err error) error {
 			var job T
@@ -148,6 +148,17 @@ func OnFailure[T Job](fn func(ctx context.Context, job T, err error)) HandleOpti
 func Handle[T Job](w *Worker, fn func(ctx context.Context, job T) error, opts ...HandleOption[T]) {
 	var zero T
 	name := zero.JobName()
+	HandleNamed(w, name, fn, opts...)
+}
+
+// HandleNamed registers a typed handler under an explicit, stable job name.
+// T may be any JSON-decodable type and needs no methods. Invalid payloads fail
+// permanently. It panics for an empty or duplicate name, a nil handler, or a
+// worker that has already started.
+func HandleNamed[T any](w *Worker, name string, fn func(context.Context, T) error, opts ...HandleOption[T]) {
+	if fn == nil {
+		panic("jetq: handler is nil")
+	}
 	h := &handler{run: func(ctx context.Context, payload []byte) error {
 		var job T
 		if err := json.Unmarshal(payload, &job); err != nil {

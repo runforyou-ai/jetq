@@ -2,7 +2,7 @@
 
 ## Goals
 
-- A job queue with Laravel-like ergonomics on top of NATS JetStream.
+- A Go job queue with explicit names, typed handlers and NATS JetStream storage.
 - Let the NATS server do the hard parts: persistence, redelivery, delays and
   cron.
 - Keep the library database-agnostic. A transactional outbox is an optional

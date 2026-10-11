@@ -303,7 +303,7 @@ func TestSchedules(t *testing.T) {
 	})
 	start(t, w)
 
-	schedule := jetq.Cron("daily", "@every 1s", report{Day: "today"}, jetq.OnQueue("reports"))
+	schedule := jetq.Schedule{Key: "daily", Cron: "@every 1s", Name: "report", Payload: report{Day: "today"}, Queue: "reports"}
 	if err := c.SyncSchedules(ctx, schedule); err != nil {
 		t.Fatal(err)
 	}
@@ -351,25 +351,24 @@ func TestScheduleValidation(t *testing.T) {
 	c := newClient(t)
 	ctx := context.Background()
 	cases := []jetq.Schedule{
-		jetq.Cron("bad key", "@hourly", report{}),
-		jetq.Cron("k", "* * *", report{}),
-		jetq.Cron("k", "@at 2030-01-01T00:00:00Z", report{}),
-		jetq.Cron("k", "@hourly", report{}, jetq.Delay(time.Second)),
-		jetq.Cron("k", "0 2 * * *", report{}).In("Mars/Olympus"),
-		jetq.Cron("k", "@every 1m", report{}).In("Asia/Shanghai"),
-		jetq.Cron("k", "@every 500ms", report{}),
-		jetq.Cron("k", "@fortnightly", report{}),
-		jetq.Cron("k", "@daily", report{}, jetq.JobID("fixed")),
+		{Key: "bad key", Cron: "@hourly", Name: "report", Payload: report{}},
+		{Key: "k", Cron: "* * *", Name: "report", Payload: report{}},
+		{Key: "k", Cron: "@at 2030-01-01T00:00:00Z", Name: "report", Payload: report{}},
+
+		{Key: "k", Cron: "0 2 * * *", Name: "report", Payload: report{}, Timezone: "Mars/Olympus"},
+		{Key: "k", Cron: "@every 1m", Name: "report", Payload: report{}, Timezone: "Asia/Shanghai"},
+		{Key: "k", Cron: "@every 500ms", Name: "report", Payload: report{}},
+		{Key: "k", Cron: "@fortnightly", Name: "report", Payload: report{}},
 	}
 	for _, s := range cases {
 		if err := c.SyncSchedules(ctx, s); err == nil {
 			t.Errorf("expected error for %+v", s)
 		}
 	}
-	if err := c.SyncSchedules(ctx, jetq.Cron("a", "@hourly", report{}), jetq.Cron("a", "@daily", report{})); err == nil {
+	if err := c.SyncSchedules(ctx, jetq.Schedule{Key: "a", Cron: "@hourly", Name: "report", Payload: report{}}, jetq.Schedule{Key: "a", Cron: "@daily", Name: "report", Payload: report{}}); err == nil {
 		t.Error("expected duplicate key error")
 	}
-	if err := c.SyncSchedules(ctx, jetq.Cron("nightly", "0 2 * * *", report{}).In("Asia/Shanghai")); err != nil {
+	if err := c.SyncSchedules(ctx, jetq.Schedule{Key: "nightly", Cron: "0 2 * * *", Name: "report", Payload: report{}, Timezone: "Asia/Shanghai"}); err != nil {
 		t.Errorf("five-field cron: %v", err)
 	}
 }
@@ -798,9 +797,6 @@ func TestUniqueUntilDone(t *testing.T) {
 	}
 	if _, err := c.Enqueue(ctx, sendEmail{To: "ok"}, jetq.UniqueUntilDone("k3"), jetq.Delay(time.Hour)); err != nil {
 		t.Fatalf("enqueue after cancel = %v", err)
-	}
-	if err := c.SyncSchedules(ctx, jetq.Cron("u", "@daily", report{}, jetq.UniqueUntilDone("x"))); err == nil {
-		t.Fatal("expected schedule validation error")
 	}
 }
 

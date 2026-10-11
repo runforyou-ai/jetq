@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.4.0
+
+- Add `EnqueueNamed` and `HandleNamed` for explicit, stable job names and ordinary JSON payload types. `OnFailure` accepts ordinary types too.
+- Configure recurring jobs with exported `Schedule` fields: `Key`, `Cron`, `Timezone`, `Name`, `Payload`, `Queue`, `MaxAttempts`, `Timeout` and `Header`. One-off enqueue options cannot be passed to schedules.
+- Document the package independently, with named payloads as the primary examples.
+
+### Migration
+
+Replace `Cron(key, spec, job, ...).In(zone)` with `Schedule{Key: key, Cron: spec, Name: name, Payload: job, Timezone: zone}` and set queue, attempt, timeout and header fields directly. `Enqueue` and `Handle` remain available for types implementing `JobName`. Existing stored jobs and schedules use the same wire format.
+
 ## v0.3.0
 
 - Jobs waiting for a retry of a second or more are put back as delayed jobs
