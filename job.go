@@ -21,7 +21,7 @@ type Info struct {
 	// ID is assigned at enqueue time. Jobs fired by a recurring schedule get
 	// "<schedule key>-<stream sequence>".
 	ID string
-	// Name is the job name returned by [Job.JobName].
+	// Name is the stable job name supplied explicitly or returned by [Job.JobName].
 	Name string
 	// Queue is the queue the job was taken from.
 	Queue string

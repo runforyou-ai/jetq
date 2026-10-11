@@ -19,20 +19,25 @@ import (
 // Every instance installs the same full set with Client.SyncSchedules.
 // Names are stable protocol identifiers independent of Go payload types.
 type Schedule struct {
+	// Key uniquely identifies this schedule within the client namespace.
 	Key string
 	// Cron is a five- or six-field cron expression or a descriptor such as @hourly or @every 5m.
 	Cron string
 	// Timezone is an IANA time zone, default UTC. It does not apply to @every.
 	Timezone string
-	Name     string
-	Payload  any
+	// Name is the stable job name used to select the handler.
+	Name string
+	// Payload follows EnqueueNamed JSON rules, including null for nil.
+	Payload any
 	// Queue defaults to DefaultQueue.
 	Queue string
-	// MaxAttempts overrides the worker queue limit when positive.
+	// MaxAttempts overrides the worker queue limit when positive; negative values are rejected.
 	MaxAttempts int
 	// Timeout overrides the queue timeout when non-nil; zero means no limit.
+	// Negative values are rejected.
 	Timeout *time.Duration
-	Header  nats.Header
+	// Header carries application metadata. Jetq- and Nats- prefixes are reserved.
+	Header nats.Header
 }
 
 // SyncSchedules makes the server-side schedules match schedules exactly:

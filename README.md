@@ -23,6 +23,8 @@ Requires nats-server **2.14+** (2.15 recommended) and Go 1.27+.
 go get github.com/runforyou-ai/jetq
 ```
 
+Version 0.4 removes `Cron` and `Schedule.In`; see [migration instructions](CHANGELOG.md#v040) before upgrading.
+
 ## Usage
 
 ```go
@@ -70,6 +72,12 @@ err = w.Run(ctx) // blocks; on cancel, waits for running jobs
 When job names are only known at runtime (for example when bridging an existing task system),
 use `EnqueueNamed(ctx, name, payload)` and `HandleNamed(w, name, fn, OnFailure(...))`. Ordinary structs need no methods. For byte-for-byte JSON handlers, pass `json.RawMessage` and register `w.HandleRaw(name, fn, jetq.OnRawFailure(...))`.
 The payload must be valid JSON and is delivered byte for byte.
+
+### Type-owned names
+
+`Enqueue` and `Handle` also accept types implementing `JobName() string`. Use this convenience when a type owns its stable protocol name. Explicit names need no methods.
+
+`json.RawMessage` is validated and preserved byte for byte; an empty raw message or nil payload is encoded as `null`. Other values follow `encoding/json`, including base64 JSON strings for `[]byte`. Decoding `null` into a struct yields its zero value; handlers validate required business fields.
 
 ### Inspecting queues
 
@@ -119,7 +127,3 @@ See [docs/design.md](docs/design.md) for streams, subjects, delivery semantics a
 ## License
 
 [MIT](LICENSE)
-
-### Type-owned names
-
-`Enqueue` and `Handle` also accept types implementing `JobName() string`. Use this convenience when a type owns its stable protocol name. Explicit names need no methods.

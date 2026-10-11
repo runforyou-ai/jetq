@@ -36,7 +36,7 @@ The body is the job encoded as JSON. Headers:
 
 | Header | Meaning |
 |---|---|
-| `Jetq-Job` | Job name (`JobName()`), used to find the handler. |
+| `Jetq-Job` | Stable job name supplied explicitly or by `JobName()`, used to find the handler. |
 | `Jetq-Id` | Job id: a NUID assigned at enqueue time, or the id given with `JobID`. |
 | `Jetq-Enqueued-At` | RFC 3339 enqueue time. |
 | `Jetq-Max-Attempts` | Optional per-job attempt limit. |

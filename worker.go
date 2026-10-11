@@ -124,12 +124,12 @@ func (w *Worker) mustNotBeStarted() {
 	}
 }
 
-// HandleOption configures a handler registered with [Handle].
+// HandleOption configures a handler registered with [Handle] or [HandleNamed].
 type HandleOption[T any] func(*handler)
 
 // OnFailure registers a typed callback for when a job of this type is
-// dead-lettered. If the payload does not
-// decode into T, the callback is skipped and a warning is logged.
+// dead-lettered. If the payload does not decode into T, the callback is
+// skipped and a warning is logged.
 func OnFailure[T any](fn func(ctx context.Context, job T, err error)) HandleOption[T] {
 	return func(h *handler) {
 		h.failed = func(ctx context.Context, payload []byte, err error) error {

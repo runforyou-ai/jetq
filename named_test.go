@@ -129,3 +129,43 @@ func TestNamedScheduleOptions(t *testing.T) {
 		}
 	}
 }
+
+func TestNamedJSONEncoding(t *testing.T) {
+	c := newClient(t)
+	w := c.NewWorker(jetq.Queue{Name: "default"})
+	got := make(chan string, 4)
+	w.HandleRaw("json", func(_ context.Context, raw json.RawMessage) error { got <- string(raw); return nil })
+	start(t, w)
+	for _, tc := range []struct {
+		input any
+		want  string
+	}{
+		{nil, "null"}, {json.RawMessage(nil), "null"}, {[]byte("hi"), `"aGk="`},
+	} {
+		if _, err := c.EnqueueNamed(t.Context(), "json", tc.input); err != nil {
+			t.Fatal(err)
+		}
+		if actual := wait(t, got, 5*time.Second); actual != tc.want {
+			t.Fatalf("payload = %s, want %s", actual, tc.want)
+		}
+	}
+}
+
+func TestNamedDelayedUniqueOptions(t *testing.T) {
+	c := newClient(t)
+	options := []jetq.EnqueueOption{jetq.JobID("named-id"), jetq.OnQueue("mail"), jetq.Delay(time.Hour), jetq.UniqueUntilDone("named-key"), jetq.WithHeader("Traceparent", "named-trace")}
+	id, err := c.EnqueueNamed(t.Context(), "plain", plainInput{Value: "later"}, options...)
+	if err != nil || id != "named-id" {
+		t.Fatalf("enqueue: %s %v", id, err)
+	}
+	if _, err := c.EnqueueNamed(t.Context(), "plain", plainInput{}, jetq.UniqueUntilDone("named-key")); !errors.Is(err, jetq.ErrDuplicate) {
+		t.Fatalf("unique lock: %v", err)
+	}
+	stats, err := c.Stats(t.Context())
+	if err != nil || stats.Delayed != 1 {
+		t.Fatalf("delayed job: %+v %v", stats, err)
+	}
+	if err := c.Cancel(t.Context(), id); err != nil {
+		t.Fatal(err)
+	}
+}

@@ -89,10 +89,14 @@ func WithHeader(key, value string) EnqueueOption {
 // EnqueueNamed enqueues a JSON payload under an explicit, stable job name.
 // Payload types need no methods. A json.RawMessage is validated and stored byte
 // for byte; other values are encoded as JSON. Errors and options have the same
-// semantics as Enqueue.
+// semantics as Enqueue. A nil payload or empty json.RawMessage becomes null.
+// A []byte follows encoding/json rules and becomes a base64 JSON string.
 func (c *Client) EnqueueNamed(ctx context.Context, name string, payload any, opts ...EnqueueOption) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
+	}
+	if name == "" {
+		return "", errors.New("jetq: job name is empty")
 	}
 	data, err := encodePayload(name, payload)
 	if err != nil {

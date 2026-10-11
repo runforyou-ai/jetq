@@ -19,6 +19,8 @@ jetq 是基于 [NATS JetStream](https://docs.nats.io/nats-concepts/jetstream) �
 go get github.com/runforyou-ai/jetq
 ```
 
+0.4 版本删除 `Cron` 和 `Schedule.In`；升级前请阅读[迁移说明](CHANGELOG.md#v040)。
+
 ## 用法
 
 ```go
@@ -63,6 +65,12 @@ err = w.Run(ctx) // 阻塞；取消后等待正在执行的任务
 
 用 `EnqueueNamed(ctx, name, payload)` 投递普通输入，用 `HandleNamed(w, name, fn, OnFailure(...))` 注册强类型处理函数。需要按原字节读取时，投递 `json.RawMessage` 并用 `w.HandleRaw(name, fn, jetq.OnRawFailure(...))` 注册；载荷必须是合法 JSON。
 
+### 类型声明任务名称
+
+`Enqueue` 与 `Handle` 也支持实现 `JobName() string` 的类型，适合由输入类型统一声明稳定协议名称的场景。`EnqueueNamed` 与 `HandleNamed` 直接接收名称，普通输入类型无需实现方法。
+
+`json.RawMessage` 校验后按原字节传递，空值和 nil 输入编码为 `null`。其他值遵循 `encoding/json`，包括将 `[]byte` 编码为 base64 JSON 字符串。`null` 解码到结构体时得到零值，业务必填字段由处理函数校验。
+
 ### 查看队列
 
 `q.Stats(ctx)` 返回每个队列尚未投递（`Ready`）、已投递未结算（`InFlight`，主要是执行中）和死信的任务数，以及待执行的延迟任务数（含等待重试与推迟的任务）和已安装的定时任务数；`q.DeadLetters(ctx, jetq.DeadLetterQuery{...})` 按时间倒序分页读取死信及最后一次错误。
@@ -101,7 +109,3 @@ stream 与主题、投递语义和路线图见 [docs/design.md](docs/design.md)�
 ## 许可证
 
 [MIT](LICENSE)
-
-### 类型声明任务名称
-
-`Enqueue` 与 `Handle` 也支持实现 `JobName() string` 的类型，适合由输入类型统一声明稳定协议名称的场景。`EnqueueNamed` 与 `HandleNamed` 直接接收名称，普通输入类型无需实现方法。
