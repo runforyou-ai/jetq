@@ -135,6 +135,9 @@ func (c *Client) Enqueue(ctx context.Context, job Job, opts ...EnqueueOption) (s
 	if o.messageID != "" && (o.id == "" || o.unique != "" || o.delay != 0 || strings.ContainsAny(o.messageID, "\r\n")) {
 		return "", errors.New("jetq: MsgID requires JobID, excludes Unique and Delay, and must not contain newlines")
 	}
+	if o.messageID != "" && o.lock != "" && c.cfg.uniqueTTL > 0 && c.cfg.uniqueTTL < c.cfg.duplicates {
+		return "", errors.New("jetq: MsgID with UniqueUntilDone requires state TTL at least the duplicate window")
+	}
 	name := job.JobName()
 	if name == "" {
 		return "", errors.New("jetq: job name is empty")
@@ -167,6 +170,13 @@ func (c *Client) Enqueue(ctx context.Context, job Job, opts ...EnqueueOption) (s
 			return id, err
 		}
 		if cancelled {
+			return id, nil
+		}
+		settled, err := c.publicationSettled(ctx, o.messageID, id)
+		if err != nil {
+			return id, err
+		}
+		if settled {
 			return id, nil
 		}
 	}
@@ -210,6 +220,13 @@ func (c *Client) Enqueue(ctx context.Context, job Job, opts ...EnqueueOption) (s
 		msg.Header.Set(HeaderUniqueLock, lock)
 	}
 	lock := msg.Header.Get(HeaderUniqueLock)
+	if o.messageID != "" && createdLock {
+		settled, checkErr := c.publicationSettled(ctx, o.messageID, id)
+		if checkErr != nil || settled {
+			c.unlockRevision(ctx, lock, id, revision)
+			return id, checkErr
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		// Nothing was published.
 		if lock != "" && createdLock {
@@ -425,6 +442,11 @@ func (c *Client) Cancel(ctx context.Context, id string) error {
 	if _, err := state.Put(ctx, cancelKey(id), []byte(enqueueIdentity(scheduled.Header))); err != nil {
 		return fmt.Errorf("jetq: cancel %s: %w", id, err)
 	}
+	if publication := scheduled.Header.Get(headerPublicationID); publication != "" && scheduled.Header.Get(HeaderUniqueLock) != "" {
+		if err := c.settlePublication(ctx, publication, id); err != nil {
+			return fmt.Errorf("jetq: cancel %s: %w", id, err)
+		}
+	}
 	// Delete exactly the message read above; if the schedule fired meanwhile,
 	// the delete fails and the copy runs or is skipped, releasing its own lock.
 	if err := c.stream.DeleteMsg(ctx, scheduled.Sequence); err != nil {
@@ -584,4 +606,26 @@ func (c *Client) unlockRevision(ctx context.Context, lock, id string, expected u
 	if err != nil {
 		c.cfg.logger.WarnContext(ctx, "jetq unique lock release failed", "id", id, "error", err)
 	}
+}
+
+// publicationSettled reads the completion receipt through the state leader.
+func (c *Client) publicationSettled(ctx context.Context, publication, id string) (bool, error) {
+	state, err := c.stateBucket(ctx, false)
+	if err != nil || state == nil {
+		return false, err
+	}
+	value, _, found, err := c.leaderGet(ctx, state, "settled."+lockKey(publication))
+	return found && string(value) == id, err
+}
+
+// settlePublication persists completion before a stable publication releases its unique lock.
+func (c *Client) settlePublication(ctx context.Context, publication, id string) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), unlockTimeout)
+	defer cancel()
+	state, err := c.stateBucket(ctx, true)
+	if err != nil {
+		return err
+	}
+	_, err = state.Put(ctx, "settled."+lockKey(publication), []byte(id))
+	return err
 }

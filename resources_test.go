@@ -92,28 +92,35 @@ func TestMsgIDResumesUncertainEnqueue(t *testing.T) {
 }
 
 func TestMsgIDSettledJobDoesNotReacquireUniqueLock(t *testing.T) {
-	c, f := newFlakyClient(t)
-	ctx := context.Background()
-	opts := []jetq.EnqueueOption{jetq.JobID("settled"), jetq.MsgID("settled-publish"), jetq.UniqueUntilDone("mail")}
-	if _, err := c.Enqueue(ctx, sendEmail{To: "first"}, opts...); err != nil {
-		t.Fatal(err)
-	}
-	ran, _ := runCount(t, c)
-	wait(t, ran, 5*time.Second)
-	bucket, err := f.KeyValue(ctx, "JETQ_STATE")
-	if err != nil {
-		t.Fatal(err)
-	}
-	key := fmt.Sprintf("%x", sha256.Sum256([]byte("mail")))
-	eventually(t, func() bool { _, err := bucket.Get(ctx, key); return errors.Is(err, jetstream.ErrKeyNotFound) })
-	if _, err := c.Enqueue(ctx, sendEmail{To: "first"}, opts...); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := c.Enqueue(ctx, sendEmail{To: "second"}, jetq.UniqueUntilDone("mail")); err != nil {
-		t.Fatal(err)
-	}
-	if to := wait(t, ran, 5*time.Second); to != "second" {
-		t.Fatalf("unexpected job %q", to)
+	for _, lostAck := range []bool{false, true} {
+		t.Run(fmt.Sprintf("lostAck=%t", lostAck), func(t *testing.T) {
+			c, f := newFlakyClient(t)
+			ctx := context.Background()
+			opts := []jetq.EnqueueOption{jetq.JobID("settled"), jetq.MsgID("settled-publish"), jetq.UniqueUntilDone("mail")}
+			if _, err := c.Enqueue(ctx, sendEmail{To: "first"}, opts...); err != nil {
+				t.Fatal(err)
+			}
+			ran, _ := runCount(t, c)
+			wait(t, ran, 5*time.Second)
+			bucket, err := f.KeyValue(ctx, "JETQ_STATE")
+			if err != nil {
+				t.Fatal(err)
+			}
+			key := fmt.Sprintf("%x", sha256.Sum256([]byte("mail")))
+			eventually(t, func() bool { _, err := bucket.Get(ctx, key); return errors.Is(err, jetstream.ErrKeyNotFound) })
+			if lostAck {
+				f.fail(true)
+			}
+			if _, err := c.Enqueue(ctx, sendEmail{To: "first"}, opts...); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := c.Enqueue(ctx, sendEmail{To: "second"}, jetq.UniqueUntilDone("mail")); err != nil {
+				t.Fatal(err)
+			}
+			if to := wait(t, ran, 5*time.Second); to != "second" {
+				t.Fatalf("unexpected job %q", to)
+			}
+		})
 	}
 }
 
