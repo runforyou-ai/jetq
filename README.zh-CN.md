@@ -65,7 +65,7 @@ err = w.Run(ctx) // 阻塞；取消后等待正在执行的任务
 
 `jetq.ResourceConfigs(options...)` 返回任务流、死信流与状态桶定义，不写入 NATS。部署工具完成初始化后，应用进程通过 `jetq.Attach(ctx, js, options...)` 读取资源。Attach 校验主题、队列语义和最低保留期限，并保留副本、存储、放置与容量策略。`New` 继续提供自动创建或更新资源的便利入口。
 
-outbox 重试必须使用相同载荷、绝对执行时间、`jetq.JobID(id)` 与 `jetq.MsgID(publicationID)`。MsgID 使用 JetStream 去重，并允许同一任务恢复其持有的 UniqueUntilDone 锁；它要求显式 JobID，不能与 Unique 组合。收到 ErrUncertain 时保留 outbox 登记，仅在确认发布成功后删除。去重受流的 duplicate window 限制，更晚的重复执行由任务处理器保证业务幂等。
+outbox 重试必须使用相同载荷、绝对执行时间、`jetq.JobID(id)` 与 `jetq.MsgID(publicationID)`。MsgID 使用 JetStream 去重，并允许同一任务恢复其持有的 UniqueUntilDone 锁；它要求显式 JobID，不能与 Unique 或相对 Delay 组合，固定排期使用 At。重复调用确认同一次发布，任务可能已执行完或被取消；取消标记在状态桶 TTL 内对同一发布持续生效，包括超过去重窗口后的重试。收到 ErrUncertain 时保留 outbox 登记，仅在确认发布成功后删除。去重受流的 duplicate window 限制，更晚的重复执行由任务处理器保证业务幂等。
 
 
 ### 运行时指定任务名

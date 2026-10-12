@@ -57,11 +57,11 @@ func Attach(ctx context.Context, js jetstream.JetStream, opts ...Option) (*Clien
 		a, b := slices.Clone(got.Subjects), slices.Clone(want.Subjects)
 		slices.Sort(a)
 		slices.Sort(b)
-		if !slices.Equal(a, b) || got.Retention != want.Retention || got.Sealed || got.DenyPurge {
+		if !slices.Equal(a, b) || got.Retention != want.Retention || got.Sealed || got.DenyPurge || got.DenyDelete || got.NoAck || got.Mirror != nil || len(got.Sources) > 0 || got.SubjectTransform != nil {
 			return nil, fmt.Errorf("jetq: incompatible stream %s", want.Name)
 		}
 		if want.Name == cfg.streamName {
-			if !got.AllowMsgSchedules || !got.AllowRollup || got.Duplicates < cfg.duplicates {
+			if got.MaxAge != 0 || !got.AllowMsgSchedules || !got.AllowRollup || got.Duplicates < cfg.duplicates {
 				return nil, fmt.Errorf("jetq: incompatible scheduling or deduplication on %s", want.Name)
 			}
 			cfg.duplicates = got.Duplicates

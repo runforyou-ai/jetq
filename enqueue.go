@@ -132,8 +132,8 @@ func (c *Client) Enqueue(ctx context.Context, job Job, opts ...EnqueueOption) (s
 	if err := validName("queue", o.queue); err != nil {
 		return "", err
 	}
-	if o.messageID != "" && (o.id == "" || o.unique != "" || strings.ContainsAny(o.messageID, "\r\n")) {
-		return "", errors.New("jetq: MsgID requires JobID, excludes Unique and must not contain newlines")
+	if o.messageID != "" && (o.id == "" || o.unique != "" || o.delay != 0 || strings.ContainsAny(o.messageID, "\r\n")) {
+		return "", errors.New("jetq: MsgID requires JobID, excludes Unique and Delay, and must not contain newlines")
 	}
 	name := job.JobName()
 	if name == "" {
@@ -160,6 +160,16 @@ func (c *Client) Enqueue(ctx context.Context, job Job, opts ...EnqueueOption) (s
 	msg.Header.Set(HeaderJob, name)
 	msg.Header.Set(HeaderID, id)
 	msg.Header.Set(HeaderEnqueuedAt, time.Now().UTC().Format(time.RFC3339Nano))
+	if o.messageID != "" {
+		msg.Header.Set(headerPublicationID, o.messageID)
+		cancelled, err := c.cancelled(ctx, msg.Header, id, false)
+		if err != nil {
+			return id, err
+		}
+		if cancelled {
+			return id, nil
+		}
+	}
 	if o.maxAttempts > 0 {
 		msg.Header.Set(HeaderMaxAttempts, strconv.Itoa(o.maxAttempts))
 	}
@@ -186,10 +196,11 @@ func (c *Client) Enqueue(ctx context.Context, job Job, opts ...EnqueueOption) (s
 		return "", fmt.Errorf("jetq: unique key %q: the prefix jetq- is reserved", o.unique)
 	}
 	var revision uint64
+	createdLock := false
 	if o.lock != "" {
 		lock := lockKey(o.lock)
 		var taken bool
-		taken, revision, err = c.lockJob(ctx, lock, id, o.id == "", o.messageID != "")
+		taken, revision, createdLock, err = c.lockJob(ctx, lock, id, o.id == "", o.messageID != "")
 		if err != nil {
 			return "", fmt.Errorf("jetq: lock unique job %s: %w", name, err)
 		}
@@ -201,8 +212,8 @@ func (c *Client) Enqueue(ctx context.Context, job Job, opts ...EnqueueOption) (s
 	lock := msg.Header.Get(HeaderUniqueLock)
 	if err := ctx.Err(); err != nil {
 		// Nothing was published.
-		if lock != "" {
-			c.unlock(ctx, lock, id)
+		if lock != "" && createdLock {
+			c.unlockRevision(ctx, lock, id, revision)
 		}
 		return "", err
 	}
@@ -220,12 +231,15 @@ func (c *Client) Enqueue(ctx context.Context, job Job, opts ...EnqueueOption) (s
 		pubOpts = append(pubOpts, jetstream.WithMsgID(msgID))
 	}
 	started := time.Now()
-	err = c.publishJob(ctx, msg, pubOpts, resolvable)
+	duplicate, err := c.publishJob(ctx, msg, pubOpts, resolvable)
+	if duplicate && o.messageID != "" && createdLock {
+		c.unlockRevision(ctx, lock, id, revision)
+	}
 	// The second publish is deduplicated only within the stream's duplicate
 	// window; keep a margin for the time the publishes take.
 	if err != nil && resolvable && !notStored(err) && time.Since(started)+resolveTimeout < c.cfg.duplicates/2 {
 		resolveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), resolveTimeout)
-		resolved := c.publishJob(resolveCtx, msg, pubOpts, true)
+		_, resolved := c.publishJob(resolveCtx, msg, pubOpts, true)
 		cancel()
 		// A rejection of the second publish says nothing about the first.
 		if resolved == nil {
@@ -236,14 +250,14 @@ func (c *Client) Enqueue(ctx context.Context, job Job, opts ...EnqueueOption) (s
 	case err == nil:
 		return id, nil
 	case errors.Is(err, ErrDuplicate):
-		if lock != "" {
-			c.unlock(ctx, lock, id)
+		if lock != "" && createdLock {
+			c.unlockRevision(ctx, lock, id, revision)
 		}
 		return "", err
 	case notStored(err):
 		// The job was certainly not stored: free its key.
-		if lock != "" {
-			c.unlock(ctx, lock, id)
+		if lock != "" && createdLock {
+			c.unlockRevision(ctx, lock, id, revision)
 		}
 		return "", fmt.Errorf("jetq: enqueue %s: %w", name, err)
 	case errors.Is(err, ErrUncertain):
@@ -262,31 +276,34 @@ const resolveTimeout = 5 * time.Second
 // another job holds it, and the revision of the new lock. When Create fails
 // otherwise, a lock it may have written is removed if the id is unique to
 // this call.
-func (c *Client) lockJob(ctx context.Context, lock, id string, generatedID, resume bool) (taken bool, revision uint64, err error) {
+func (c *Client) lockJob(ctx context.Context, lock, id string, generatedID, resume bool) (taken bool, revision uint64, created bool, err error) {
 	locks, err := c.stateBucket(ctx, true)
 	if err != nil {
-		return false, 0, err
+		return false, 0, false, err
 	}
 	revision, err = locks.Create(ctx, lock, []byte(id))
 	switch {
 	case err == nil:
-		return false, revision, nil
+		return false, revision, true, nil
 	case errors.Is(err, jetstream.ErrKeyExists):
 		if resume {
-			entry, getErr := locks.Get(ctx, lock)
+			value, rev, found, getErr := c.leaderGet(ctx, locks, lock)
 			if getErr != nil {
-				return false, 0, getErr
+				return false, 0, false, getErr
 			}
-			if string(entry.Value()) == id {
-				return false, entry.Revision(), nil
+			if !found {
+				return false, 0, false, fmt.Errorf("%w: unique lock changed while resuming", ErrUncertain)
+			}
+			if string(value) == id {
+				return false, rev, false, nil
 			}
 		}
-		return true, 0, nil
+		return true, 0, false, nil
 	}
 	if generatedID {
 		c.unlock(ctx, lock, id)
 	}
-	return false, 0, err
+	return false, 0, false, err
 }
 
 // publishJob publishes a job once. It returns nil when the job is stored,
@@ -294,35 +311,46 @@ func (c *Client) lockJob(ctx context.Context, lock, id string, generatedID, resu
 // when another pending delayed job has the id, or the publish error. With
 // ownMsgID the message id belongs to this job alone, so a duplicate means the
 // job is stored already.
-func (c *Client) publishJob(ctx context.Context, msg *nats.Msg, pubOpts []jetstream.PublishOpt, ownMsgID bool) error {
+func (c *Client) publishJob(ctx context.Context, msg *nats.Msg, pubOpts []jetstream.PublishOpt, ownMsgID bool) (bool, error) {
 	ack, err := c.js.PublishMsg(ctx, msg, pubOpts...)
 	switch {
 	case err == nil && ack.Duplicate && !ownMsgID:
-		return ErrDuplicate
+		return true, ErrDuplicate
 	case err == nil:
-		return nil
+		return ack.Duplicate, nil
 	}
 	err = classify(err)
 	if !errors.Is(err, ErrJobIDInUse) || !ownMsgID {
-		return err
+		return false, err
 	}
 	// A delayed job with this id is pending: it may be this job, published by
 	// an earlier attempt, or already put back for a retry by a worker.
 	pending, getErr := c.stream.GetLastMsgForSubject(ctx, msg.Subject)
 	switch {
 	case getErr != nil:
-		return fmt.Errorf("%w: read pending delayed job: %w", ErrUncertain, getErr)
-	case sameJob(pending.Header, msg.Header) || (msg.Header.Get("Nats-Msg-Id") != "" && pending.Header.Get("Nats-Msg-Id") == msg.Header.Get("Nats-Msg-Id")):
-		return nil
+		return false, fmt.Errorf("%w: read pending delayed job: %w", ErrUncertain, getErr)
+	case sameJob(pending.Header, msg.Header):
+		return false, nil
 	default:
-		return err
+		return false, err
 	}
 }
 
+// headerPublicationID identifies the same explicit publication across retries and worker requeues.
+const headerPublicationID = "Jetq-Publication-Id"
+
+// enqueueIdentity returns the immutable identity used by cancellation and delayed-job recovery.
+func enqueueIdentity(h nats.Header) string {
+	if id := h.Get(headerPublicationID); id != "" {
+		return "publication:" + id
+	}
+	return h.Get(HeaderEnqueuedAt)
+}
+
 // sameJob reports whether two messages carry the same enqueued job: the same
-// id and the same enqueue time.
+// id and the same publication identity (or enqueue time without MsgID).
 func sameJob(a, b nats.Header) bool {
-	return a.Get(HeaderID) == b.Get(HeaderID) && a.Get(HeaderEnqueuedAt) == b.Get(HeaderEnqueuedAt)
+	return a.Get(HeaderID) == b.Get(HeaderID) && enqueueIdentity(a) == enqueueIdentity(b)
 }
 
 // encodeJob encodes job as JSON; a [RawJob] payload is used byte for byte.
@@ -388,13 +416,13 @@ func (c *Client) Cancel(ctx context.Context, id string) error {
 	// Record the cancellation before deleting: the scheduler may be publishing
 	// a copy right now, and workers skip a recorded copy. The marker is never
 	// withdrawn, so a concurrent Cancel cannot undo it; it expires with the
-	// bucket TTL and holds the enqueue time, so a later job reusing the id is
+	// bucket TTL and holds the publication identity, so a later job reusing the id is
 	// not affected.
 	state, err := c.stateBucket(ctx, true)
 	if err != nil {
 		return fmt.Errorf("jetq: cancel %s: %w", id, err)
 	}
-	if _, err := state.Put(ctx, cancelKey(id), []byte(scheduled.Header.Get(HeaderEnqueuedAt))); err != nil {
+	if _, err := state.Put(ctx, cancelKey(id), []byte(enqueueIdentity(scheduled.Header))); err != nil {
 		return fmt.Errorf("jetq: cancel %s: %w", id, err)
 	}
 	// Delete exactly the message read above; if the schedule fired meanwhile,
@@ -447,12 +475,12 @@ func cancelKey(id string) string { return "cancel." + id }
 // cancelled reports whether a job fired from a delayed schedule was cancelled.
 // It returns an error when that cannot be determined; the job must then not
 // run yet. The marker is left in place, so a redelivered copy is skipped too,
-// and expires with the bucket TTL; it holds the enqueue time, so a later job
+// and expires with the bucket TTL; it holds the publication identity, so a later job
 // that reuses the id is not affected.
 func (c *Client) cancelled(ctx context.Context, header nats.Header, id string, redelivered bool) (bool, error) {
 	// A redelivery may be the original of a job whose put-back copy was
 	// cancelled after the ack of that delivery was lost.
-	if !c.wasDelayed(header) && !redelivered {
+	if !c.wasDelayed(header) && !redelivered && header.Get(headerPublicationID) == "" {
 		return false, nil
 	}
 	state, err := c.stateBucket(ctx, false)
@@ -463,7 +491,7 @@ func (c *Client) cancelled(ctx context.Context, header nats.Header, id string, r
 	if err != nil || !found {
 		return false, err
 	}
-	return string(value) == header.Get(HeaderEnqueuedAt), nil
+	return string(value) == enqueueIdentity(header), nil
 }
 
 // wasDelayed reports whether a job message was fired from a delayed job, or
@@ -531,6 +559,11 @@ func lockKey(key string) string {
 // unlock releases a UniqueUntilDone lock if it is still held by job id;
 // failures are logged and the lock then expires with its TTL.
 func (c *Client) unlock(ctx context.Context, lock, id string) {
+	c.unlockRevision(ctx, lock, id, 0)
+}
+
+// unlockRevision releases the matching lock, optionally requiring its original revision.
+func (c *Client) unlockRevision(ctx context.Context, lock, id string, expected uint64) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), unlockTimeout)
 	defer cancel()
 	locks, err := c.stateBucket(ctx, false)
@@ -542,7 +575,7 @@ func (c *Client) unlock(ctx context.Context, lock, id string) {
 		return
 	}
 	value, revision, found, err := c.leaderGet(ctx, locks, lock)
-	if err == nil && (!found || string(value) != id) {
+	if err == nil && (!found || string(value) != id || (expected != 0 && revision != expected)) {
 		return
 	}
 	if err == nil {
