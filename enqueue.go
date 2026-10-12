@@ -29,6 +29,7 @@ type enqueueOptions struct {
 	timeout     *time.Duration
 	header      nats.Header
 	id          string
+	messageID   string
 }
 
 // OnQueue puts the job on the named queue (default [DefaultQueue]).
@@ -49,6 +50,11 @@ func At(t time.Time) EnqueueOption { return func(o *enqueueOptions) { o.at = t }
 // reusing the id of one of those runs as a separate job, and [Client.Cancel]
 // can only reach the delayed one.
 func JobID(id string) EnqueueOption { return func(o *enqueueOptions) { o.id = id } }
+
+// MsgID identifies a publish attempt across retries. Reusing it for the same
+// JobID resolves uncertain publishes within the stream duplicate window.
+// Use a different ID for each logical job; handlers must remain idempotent.
+func MsgID(id string) EnqueueOption { return func(o *enqueueOptions) { o.messageID = id } }
 
 // Unique deduplicates the job by key within the client's duplicate window:
 // a second enqueue with the same key returns [ErrDuplicate]. Keys starting
@@ -126,6 +132,9 @@ func (c *Client) Enqueue(ctx context.Context, job Job, opts ...EnqueueOption) (s
 	if err := validName("queue", o.queue); err != nil {
 		return "", err
 	}
+	if o.messageID != "" && (o.id == "" || o.unique != "" || strings.ContainsAny(o.messageID, "\r\n")) {
+		return "", errors.New("jetq: MsgID requires JobID, excludes Unique and must not contain newlines")
+	}
 	name := job.JobName()
 	if name == "" {
 		return "", errors.New("jetq: job name is empty")
@@ -180,7 +189,7 @@ func (c *Client) Enqueue(ctx context.Context, job Job, opts ...EnqueueOption) (s
 	if o.lock != "" {
 		lock := lockKey(o.lock)
 		var taken bool
-		taken, revision, err = c.lockJob(ctx, lock, id, o.id == "")
+		taken, revision, err = c.lockJob(ctx, lock, id, o.id == "", o.messageID != "")
 		if err != nil {
 			return "", fmt.Errorf("jetq: lock unique job %s: %w", name, err)
 		}
@@ -201,8 +210,10 @@ func (c *Client) Enqueue(ctx context.Context, job Job, opts ...EnqueueOption) (s
 	// A UniqueUntilDone job gets a message id of its own, so that a second
 	// publish tells whether a first one with an unknown outcome was stored.
 	msgID := o.unique
-	resolvable := o.lock != "" && o.unique == ""
-	if resolvable {
+	resolvable := o.messageID != "" || (o.lock != "" && o.unique == "")
+	if o.messageID != "" {
+		msgID = "jetq-publish-" + o.messageID
+	} else if resolvable {
 		msgID = "jetq-lock-" + strconv.FormatUint(revision, 10)
 	}
 	if msgID != "" {
@@ -251,7 +262,7 @@ const resolveTimeout = 5 * time.Second
 // another job holds it, and the revision of the new lock. When Create fails
 // otherwise, a lock it may have written is removed if the id is unique to
 // this call.
-func (c *Client) lockJob(ctx context.Context, lock, id string, generatedID bool) (taken bool, revision uint64, err error) {
+func (c *Client) lockJob(ctx context.Context, lock, id string, generatedID, resume bool) (taken bool, revision uint64, err error) {
 	locks, err := c.stateBucket(ctx, true)
 	if err != nil {
 		return false, 0, err
@@ -261,6 +272,15 @@ func (c *Client) lockJob(ctx context.Context, lock, id string, generatedID bool)
 	case err == nil:
 		return false, revision, nil
 	case errors.Is(err, jetstream.ErrKeyExists):
+		if resume {
+			entry, getErr := locks.Get(ctx, lock)
+			if getErr != nil {
+				return false, 0, getErr
+			}
+			if string(entry.Value()) == id {
+				return false, entry.Revision(), nil
+			}
+		}
 		return true, 0, nil
 	}
 	if generatedID {
@@ -292,7 +312,7 @@ func (c *Client) publishJob(ctx context.Context, msg *nats.Msg, pubOpts []jetstr
 	switch {
 	case getErr != nil:
 		return fmt.Errorf("%w: read pending delayed job: %w", ErrUncertain, getErr)
-	case sameJob(pending.Header, msg.Header):
+	case sameJob(pending.Header, msg.Header) || (msg.Header.Get("Nats-Msg-Id") != "" && pending.Header.Get("Nats-Msg-Id") == msg.Header.Get("Nats-Msg-Id")):
 		return nil
 	default:
 		return err
