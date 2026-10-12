@@ -173,7 +173,7 @@ func TestMsgIDPreservesActiveLockAfterConflict(t *testing.T) {
 	if _, err := c.Enqueue(ctx, sendEmail{}, opts...); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.Enqueue(ctx, sendEmail{}, append(opts, jetq.MsgID("different"))...); !errors.Is(err, jetq.ErrJobIDInUse) {
+	if _, err := c.Enqueue(ctx, sendEmail{}, append(opts, jetq.MsgID("different"))...); !errors.Is(err, jetq.ErrDuplicate) {
 		t.Fatalf("conflict: %v", err)
 	}
 	if _, err := c.Enqueue(ctx, sendEmail{}, jetq.UniqueUntilDone("mail")); !errors.Is(err, jetq.ErrDuplicate) {
@@ -281,5 +281,49 @@ func TestMsgIDRetriesFailedLockDeletion(t *testing.T) {
 	}
 	if _, err := c.Enqueue(ctx, sendEmail{To: "new"}, jetq.UniqueUntilDone("mail"), jetq.At(time.Now().Add(time.Hour))); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestMsgIDDifferentPublicationCannotResumeActiveLock(t *testing.T) {
+	c, _ := newFlakyClient(t)
+	ctx := context.Background()
+	if _, err := c.Enqueue(ctx, sendEmail{To: "first"}, jetq.JobID("same"), jetq.MsgID("first"), jetq.UniqueUntilDone("mail")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Enqueue(ctx, sendEmail{To: "second"}, jetq.JobID("same"), jetq.MsgID("second"), jetq.UniqueUntilDone("mail")); !errors.Is(err, jetq.ErrDuplicate) {
+		t.Fatalf("different publication resumed active lock: %v", err)
+	}
+	ran, _ := runCount(t, c)
+	if to := wait(t, ran, 5*time.Second); to != "first" {
+		t.Fatalf("unexpected job %q", to)
+	}
+	expectNothing(t, ran, 100*time.Millisecond)
+}
+
+func TestMsgIDCancellationSurvivesReusedJobID(t *testing.T) {
+	s := jetqtest.Start(t)
+	ctx := context.Background()
+	c, err := jetq.New(ctx, s.JetStream, jetq.WithMemoryStorage(), jetq.WithDuplicateWindow(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, publication := range []string{"first", "second"} {
+		if _, err := c.Enqueue(ctx, sendEmail{}, jetq.JobID("same"), jetq.MsgID(publication), jetq.At(time.Now().Add(time.Hour))); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Cancel(ctx, "same"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(1100 * time.Millisecond)
+	if _, err := c.Enqueue(ctx, sendEmail{}, jetq.JobID("same"), jetq.MsgID("first")); err != nil {
+		t.Fatal(err)
+	}
+	stream, err := s.JetStream.Stream(ctx, c.StreamName())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stream.CachedInfo().State.Msgs != 0 {
+		t.Fatal("old cancelled publication was resurrected")
 	}
 }

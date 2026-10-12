@@ -153,6 +153,7 @@ func (c *Client) Enqueue(ctx context.Context, job Job, opts ...EnqueueOption) (s
 	} else if err := validName("job id", id); err != nil {
 		return "", err
 	}
+	owner := lockOwner(id, o.messageID)
 	msg := &nats.Msg{Subject: c.queueSubject(o.queue), Data: data, Header: nats.Header{}}
 	for key, values := range o.header {
 		if reservedHeader(key) {
@@ -174,7 +175,7 @@ func (c *Client) Enqueue(ctx context.Context, job Job, opts ...EnqueueOption) (s
 			return id, err
 		}
 		if cancelled || settled {
-			if settled && revision != 0 && o.lock != "" && !c.unlockRevision(ctx, lockKey(o.lock), id, revision) {
+			if settled && revision != 0 && o.lock != "" && !c.unlockRevision(ctx, lockKey(o.lock), owner, revision) {
 				return id, fmt.Errorf("%w: release settled publication lock", ErrUncertain)
 			}
 			return id, nil
@@ -210,7 +211,7 @@ func (c *Client) Enqueue(ctx context.Context, job Job, opts ...EnqueueOption) (s
 	if o.lock != "" {
 		lock := lockKey(o.lock)
 		var taken bool
-		taken, revision, createdLock, err = c.lockJob(ctx, lock, id, o.id == "", o.messageID != "")
+		taken, revision, createdLock, err = c.lockJob(ctx, lock, owner, o.id == "", o.messageID != "")
 		if err != nil {
 			return "", fmt.Errorf("jetq: lock unique job %s: %w", name, err)
 		}
@@ -224,7 +225,7 @@ func (c *Client) Enqueue(ctx context.Context, job Job, opts ...EnqueueOption) (s
 	if o.messageID != "" && createdLock {
 		_, settled, checkErr := c.publicationSettled(ctx, o.messageID, id)
 		if checkErr != nil || settled {
-			if !c.unlockRevision(ctx, lock, id, revision) {
+			if !c.unlockRevision(ctx, lock, owner, revision) {
 				return id, fmt.Errorf("%w: release settled publication lock", ErrUncertain)
 			}
 			return id, checkErr
@@ -233,7 +234,7 @@ func (c *Client) Enqueue(ctx context.Context, job Job, opts ...EnqueueOption) (s
 	if err := ctx.Err(); err != nil {
 		// Nothing was published.
 		if lock != "" && createdLock {
-			c.unlockRevision(ctx, lock, id, revision)
+			c.unlockRevision(ctx, lock, owner, revision)
 		}
 		return "", err
 	}
@@ -253,7 +254,7 @@ func (c *Client) Enqueue(ctx context.Context, job Job, opts ...EnqueueOption) (s
 	started := time.Now()
 	duplicate, err := c.publishJob(ctx, msg, pubOpts, resolvable)
 	if duplicate && o.messageID != "" && createdLock {
-		c.unlockRevision(ctx, lock, id, revision)
+		c.unlockRevision(ctx, lock, owner, revision)
 	}
 	// The second publish is deduplicated only within the stream's duplicate
 	// window; keep a margin for the time the publishes take.
@@ -271,13 +272,13 @@ func (c *Client) Enqueue(ctx context.Context, job Job, opts ...EnqueueOption) (s
 		return id, nil
 	case errors.Is(err, ErrDuplicate):
 		if lock != "" && createdLock {
-			c.unlockRevision(ctx, lock, id, revision)
+			c.unlockRevision(ctx, lock, owner, revision)
 		}
 		return "", err
 	case notStored(err):
 		// The job was certainly not stored: free its key.
 		if lock != "" && createdLock {
-			c.unlockRevision(ctx, lock, id, revision)
+			c.unlockRevision(ctx, lock, owner, revision)
 		}
 		return "", fmt.Errorf("jetq: enqueue %s: %w", name, err)
 	case errors.Is(err, ErrUncertain):
@@ -445,7 +446,7 @@ func (c *Client) Cancel(ctx context.Context, id string) error {
 	if err != nil {
 		return fmt.Errorf("jetq: cancel %s: %w", id, err)
 	}
-	if _, err := state.Put(ctx, cancelKey(id), []byte(enqueueIdentity(scheduled.Header))); err != nil {
+	if _, err := state.Put(ctx, cancelKey(id, scheduled.Header), []byte(enqueueIdentity(scheduled.Header))); err != nil {
 		return fmt.Errorf("jetq: cancel %s: %w", id, err)
 	}
 	if publication := scheduled.Header.Get(headerPublicationID); publication != "" && scheduled.Header.Get(HeaderUniqueLock) != "" {
@@ -463,7 +464,7 @@ func (c *Client) Cancel(ctx context.Context, id string) error {
 	}
 	if lock := scheduled.Header.Get(HeaderUniqueLock); lock != "" {
 		revision, _ := strconv.ParseUint(scheduled.Header.Get(headerLockRevision), 10, 64)
-		if !c.unlockRevision(ctx, lock, id, revision) {
+		if !c.unlockRevision(ctx, lock, lockOwner(id, scheduled.Header.Get(headerPublicationID)), revision) {
 			return fmt.Errorf("%w: release cancelled publication lock", ErrUncertain)
 		}
 	}
@@ -501,7 +502,12 @@ func classify(err error) error {
 const unlockTimeout = 5 * time.Second
 
 // cancelKey is the state key marking delayed job id as cancelled.
-func cancelKey(id string) string { return "cancel." + id }
+func cancelKey(id string, header nats.Header) string {
+	if publication := header.Get(headerPublicationID); publication != "" {
+		return "cancel.publish." + lockKey(publication)
+	}
+	return "cancel." + id
+}
 
 // cancelled reports whether a job fired from a delayed schedule was cancelled.
 // It returns an error when that cannot be determined; the job must then not
@@ -518,7 +524,7 @@ func (c *Client) cancelled(ctx context.Context, header nats.Header, id string, r
 	if err != nil || state == nil {
 		return false, err
 	}
-	value, _, found, err := c.leaderGet(ctx, state, cancelKey(id))
+	value, _, found, err := c.leaderGet(ctx, state, cancelKey(id, header))
 	if err != nil || !found {
 		return false, err
 	}
@@ -579,6 +585,14 @@ func (c *Client) stateLeaderStream(ctx context.Context, bucket string) (jetstrea
 		c.stateLeader = stream
 	}
 	return c.stateLeader, nil
+}
+
+// lockOwner distinguishes retrying one publication from reusing a job ID for another job.
+func lockOwner(id, publication string) string {
+	if publication == "" {
+		return id
+	}
+	return id + "\n" + publication
 }
 
 // lockKey maps a unique key to a valid key-value key.

@@ -834,7 +834,7 @@ func (w *Worker) releaseLock(ctx context.Context, msg jetstream.Msg, info Info) 
 			}
 		}
 		revision, _ := strconv.ParseUint(msg.Headers().Get(headerLockRevision), 10, 64)
-		return w.client.unlockRevision(ctx, lock, info.ID, revision)
+		return w.client.unlockRevision(ctx, lock, lockOwner(info.ID, msg.Headers().Get(headerPublicationID)), revision)
 	}
 	return true
 }
