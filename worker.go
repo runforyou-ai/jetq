@@ -833,7 +833,7 @@ func (w *Worker) releaseLock(ctx context.Context, msg jetstream.Msg, info Info) 
 				return false
 			}
 		}
-		w.client.unlock(ctx, lock, info.ID)
+		return w.client.unlock(ctx, lock, info.ID)
 	}
 	return true
 }

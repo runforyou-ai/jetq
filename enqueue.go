@@ -170,6 +170,9 @@ func (c *Client) Enqueue(ctx context.Context, job Job, opts ...EnqueueOption) (s
 			return id, err
 		}
 		if cancelled {
+			if o.lock != "" && !c.unlock(ctx, lockKey(o.lock), id) {
+				return id, fmt.Errorf("%w: release cancelled publication lock", ErrUncertain)
+			}
 			return id, nil
 		}
 		settled, err := c.publicationSettled(ctx, o.messageID, id)
@@ -177,6 +180,9 @@ func (c *Client) Enqueue(ctx context.Context, job Job, opts ...EnqueueOption) (s
 			return id, err
 		}
 		if settled {
+			if o.lock != "" && !c.unlock(ctx, lockKey(o.lock), id) {
+				return id, fmt.Errorf("%w: release settled publication lock", ErrUncertain)
+			}
 			return id, nil
 		}
 	}
@@ -580,25 +586,25 @@ func lockKey(key string) string {
 
 // unlock releases a UniqueUntilDone lock if it is still held by job id;
 // failures are logged and the lock then expires with its TTL.
-func (c *Client) unlock(ctx context.Context, lock, id string) {
-	c.unlockRevision(ctx, lock, id, 0)
+func (c *Client) unlock(ctx context.Context, lock, id string) bool {
+	return c.unlockRevision(ctx, lock, id, 0)
 }
 
 // unlockRevision releases the matching lock, optionally requiring its original revision.
-func (c *Client) unlockRevision(ctx context.Context, lock, id string, expected uint64) {
+func (c *Client) unlockRevision(ctx context.Context, lock, id string, expected uint64) bool {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), unlockTimeout)
 	defer cancel()
 	locks, err := c.stateBucket(ctx, false)
 	if err != nil {
 		c.cfg.logger.WarnContext(ctx, "jetq unique lock release failed", "id", id, "error", err)
-		return
+		return false
 	}
 	if locks == nil {
-		return
+		return true
 	}
 	value, revision, found, err := c.leaderGet(ctx, locks, lock)
 	if err == nil && (!found || string(value) != id || (expected != 0 && revision != expected)) {
-		return
+		return true
 	}
 	if err == nil {
 		err = locks.Delete(ctx, lock, jetstream.LastRevision(revision))
@@ -606,6 +612,7 @@ func (c *Client) unlockRevision(ctx context.Context, lock, id string, expected u
 	if err != nil {
 		c.cfg.logger.WarnContext(ctx, "jetq unique lock release failed", "id", id, "error", err)
 	}
+	return err == nil
 }
 
 // publicationSettled reads the completion receipt through the state leader.

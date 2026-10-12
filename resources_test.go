@@ -108,6 +108,10 @@ func TestMsgIDSettledJobDoesNotReacquireUniqueLock(t *testing.T) {
 			}
 			key := fmt.Sprintf("%x", sha256.Sum256([]byte("mail")))
 			eventually(t, func() bool { _, err := bucket.Get(ctx, key); return errors.Is(err, jetstream.ErrKeyNotFound) })
+			// Recreate the lock left behind when settlement receipt succeeds but deletion fails.
+			if _, err := bucket.Create(ctx, key, []byte("settled")); err != nil {
+				t.Fatal(err)
+			}
 			if lostAck {
 				f.fail(true)
 			}
