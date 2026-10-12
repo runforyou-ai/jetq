@@ -169,18 +169,12 @@ func (c *Client) Enqueue(ctx context.Context, job Job, opts ...EnqueueOption) (s
 		if err != nil {
 			return id, err
 		}
-		if cancelled {
-			if o.lock != "" && !c.unlock(ctx, lockKey(o.lock), id) {
-				return id, fmt.Errorf("%w: release cancelled publication lock", ErrUncertain)
-			}
-			return id, nil
-		}
-		settled, err := c.publicationSettled(ctx, o.messageID, id)
+		revision, settled, err := c.publicationSettled(ctx, o.messageID, id)
 		if err != nil {
 			return id, err
 		}
-		if settled {
-			if o.lock != "" && !c.unlock(ctx, lockKey(o.lock), id) {
+		if cancelled || settled {
+			if settled && revision != 0 && o.lock != "" && !c.unlockRevision(ctx, lockKey(o.lock), id, revision) {
 				return id, fmt.Errorf("%w: release settled publication lock", ErrUncertain)
 			}
 			return id, nil
@@ -224,12 +218,15 @@ func (c *Client) Enqueue(ctx context.Context, job Job, opts ...EnqueueOption) (s
 			return "", ErrDuplicate
 		}
 		msg.Header.Set(HeaderUniqueLock, lock)
+		msg.Header.Set(headerLockRevision, strconv.FormatUint(revision, 10))
 	}
 	lock := msg.Header.Get(HeaderUniqueLock)
 	if o.messageID != "" && createdLock {
-		settled, checkErr := c.publicationSettled(ctx, o.messageID, id)
+		_, settled, checkErr := c.publicationSettled(ctx, o.messageID, id)
 		if checkErr != nil || settled {
-			c.unlockRevision(ctx, lock, id, revision)
+			if !c.unlockRevision(ctx, lock, id, revision) {
+				return id, fmt.Errorf("%w: release settled publication lock", ErrUncertain)
+			}
 			return id, checkErr
 		}
 	}
@@ -362,6 +359,9 @@ func (c *Client) publishJob(ctx context.Context, msg *nats.Msg, pubOpts []jetstr
 // headerPublicationID identifies the same explicit publication across retries and worker requeues.
 const headerPublicationID = "Jetq-Publication-Id"
 
+// headerLockRevision binds a message to the unique lock acquired for that job.
+const headerLockRevision = "Jetq-Lock-Revision"
+
 // enqueueIdentity returns the immutable identity used by cancellation and delayed-job recovery.
 func enqueueIdentity(h nats.Header) string {
 	if id := h.Get(headerPublicationID); id != "" {
@@ -449,7 +449,7 @@ func (c *Client) Cancel(ctx context.Context, id string) error {
 		return fmt.Errorf("jetq: cancel %s: %w", id, err)
 	}
 	if publication := scheduled.Header.Get(headerPublicationID); publication != "" && scheduled.Header.Get(HeaderUniqueLock) != "" {
-		if err := c.settlePublication(ctx, publication, id); err != nil {
+		if err := c.settlePublication(ctx, publication, id, scheduled.Header.Get(headerLockRevision)); err != nil {
 			return fmt.Errorf("jetq: cancel %s: %w", id, err)
 		}
 	}
@@ -462,7 +462,10 @@ func (c *Client) Cancel(ctx context.Context, id string) error {
 		return fmt.Errorf("jetq: cancel %s: %w", id, err)
 	}
 	if lock := scheduled.Header.Get(HeaderUniqueLock); lock != "" {
-		c.unlock(ctx, lock, id)
+		revision, _ := strconv.ParseUint(scheduled.Header.Get(headerLockRevision), 10, 64)
+		if !c.unlockRevision(ctx, lock, id, revision) {
+			return fmt.Errorf("%w: release cancelled publication lock", ErrUncertain)
+		}
 	}
 	return nil
 }
@@ -615,24 +618,48 @@ func (c *Client) unlockRevision(ctx context.Context, lock, id string, expected u
 	return err == nil
 }
 
+// publicationReceipt binds completion to the original unique lock revision.
+type publicationReceipt struct {
+	ID       string
+	Revision uint64
+}
+
 // publicationSettled reads the completion receipt through the state leader.
-func (c *Client) publicationSettled(ctx context.Context, publication, id string) (bool, error) {
+func (c *Client) publicationSettled(ctx context.Context, publication, id string) (uint64, bool, error) {
 	state, err := c.stateBucket(ctx, false)
 	if err != nil || state == nil {
-		return false, err
+		return 0, false, err
 	}
 	value, _, found, err := c.leaderGet(ctx, state, "settled."+lockKey(publication))
-	return found && string(value) == id, err
+	if err != nil || !found {
+		return 0, false, err
+	}
+	var receipt publicationReceipt
+	if err := json.Unmarshal(value, &receipt); err != nil {
+		return 0, false, err
+	}
+	return receipt.Revision, receipt.ID == id, nil
 }
 
 // settlePublication persists completion before a stable publication releases its unique lock.
-func (c *Client) settlePublication(ctx context.Context, publication, id string) error {
+func (c *Client) settlePublication(ctx context.Context, publication, id, lockRevision string) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), unlockTimeout)
 	defer cancel()
 	state, err := c.stateBucket(ctx, true)
 	if err != nil {
 		return err
 	}
-	_, err = state.Put(ctx, "settled."+lockKey(publication), []byte(id))
+	revision, err := strconv.ParseUint(lockRevision, 10, 64)
+	if err != nil || revision == 0 {
+		return errors.New("jetq: missing unique lock revision")
+	}
+	data, err := json.Marshal(publicationReceipt{ID: id, Revision: revision})
+	if err != nil {
+		return err
+	}
+	_, err = state.Create(ctx, "settled."+lockKey(publication), data)
+	if errors.Is(err, jetstream.ErrKeyExists) {
+		return nil
+	}
 	return err
 }

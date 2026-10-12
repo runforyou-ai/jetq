@@ -19,6 +19,7 @@ import (
 
 // flakyJS fails publishes to job subjects without an answer, following a plan.
 type flakyJS struct {
+	failDeletes atomic.Bool
 	jetstream.JetStream
 	mu sync.Mutex
 	// plan has one entry per publish to fail: true sends the message before
@@ -268,4 +269,33 @@ func joinPages(pages [][]string) string {
 		parts[i] = strings.Join(p, ",")
 	}
 	return strings.Join(parts, "|")
+}
+
+// flakyKV injects a lock deletion failure while retaining real JetStream state.
+type flakyKV struct {
+	jetstream.KeyValue
+	fail *atomic.Bool
+}
+
+func (k *flakyKV) Delete(ctx context.Context, key string, opts ...jetstream.KVDeleteOpt) error {
+	if k.fail.Load() {
+		return context.DeadlineExceeded
+	}
+	return k.KeyValue.Delete(ctx, key, opts...)
+}
+
+func (f *flakyJS) KeyValue(ctx context.Context, bucket string) (jetstream.KeyValue, error) {
+	kv, err := f.JetStream.KeyValue(ctx, bucket)
+	if err != nil {
+		return nil, err
+	}
+	return &flakyKV{KeyValue: kv, fail: &f.failDeletes}, nil
+}
+
+func (f *flakyJS) CreateKeyValue(ctx context.Context, cfg jetstream.KeyValueConfig) (jetstream.KeyValue, error) {
+	kv, err := f.JetStream.CreateKeyValue(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &flakyKV{KeyValue: kv, fail: &f.failDeletes}, nil
 }

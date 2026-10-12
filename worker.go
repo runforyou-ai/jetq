@@ -828,12 +828,13 @@ func (w *Worker) callback(ctx context.Context, info Info, fn func()) {
 func (w *Worker) releaseLock(ctx context.Context, msg jetstream.Msg, info Info) bool {
 	if lock := msg.Headers().Get(HeaderUniqueLock); lock != "" {
 		if publication := msg.Headers().Get(headerPublicationID); publication != "" {
-			if err := w.client.settlePublication(ctx, publication, info.ID); err != nil {
+			if err := w.client.settlePublication(ctx, publication, info.ID, msg.Headers().Get(headerLockRevision)); err != nil {
 				w.client.cfg.logger.WarnContext(ctx, "jetq publication settlement failed", "id", info.ID, "error", err)
 				return false
 			}
 		}
-		return w.client.unlock(ctx, lock, info.ID)
+		revision, _ := strconv.ParseUint(msg.Headers().Get(headerLockRevision), 10, 64)
+		return w.client.unlockRevision(ctx, lock, info.ID, revision)
 	}
 	return true
 }

@@ -108,10 +108,6 @@ func TestMsgIDSettledJobDoesNotReacquireUniqueLock(t *testing.T) {
 			}
 			key := fmt.Sprintf("%x", sha256.Sum256([]byte("mail")))
 			eventually(t, func() bool { _, err := bucket.Get(ctx, key); return errors.Is(err, jetstream.ErrKeyNotFound) })
-			// Recreate the lock left behind when settlement receipt succeeds but deletion fails.
-			if _, err := bucket.Create(ctx, key, []byte("settled")); err != nil {
-				t.Fatal(err)
-			}
 			if lostAck {
 				f.fail(true)
 			}
@@ -218,5 +214,72 @@ func TestAttachRejectsIncompatibleWorkStream(t *testing.T) {
 				t.Fatal("incompatible work stream accepted")
 			}
 		})
+	}
+}
+
+func TestMsgIDSettledRetryPreservesReusedJobIDLock(t *testing.T) {
+	for _, cancelled := range []bool{false, true} {
+		t.Run(fmt.Sprint(cancelled), func(t *testing.T) {
+			c, f := newFlakyClient(t)
+			ctx := context.Background()
+			old := []jetq.EnqueueOption{jetq.JobID("reused"), jetq.MsgID("old-publication"), jetq.UniqueUntilDone("mail")}
+			if cancelled {
+				old = append(old, jetq.At(time.Now().Add(time.Hour)))
+			}
+			if _, err := c.Enqueue(ctx, sendEmail{To: "old"}, old...); err != nil {
+				t.Fatal(err)
+			}
+			if cancelled {
+				if err := c.Cancel(ctx, "reused"); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				ran, _ := runCount(t, c)
+				wait(t, ran, 5*time.Second)
+			}
+			bucket, err := f.KeyValue(ctx, "JETQ_STATE")
+			if err != nil {
+				t.Fatal(err)
+			}
+			key := fmt.Sprintf("%x", sha256.Sum256([]byte("mail")))
+			eventually(t, func() bool { _, err := bucket.Get(ctx, key); return errors.Is(err, jetstream.ErrKeyNotFound) })
+			if _, err := c.Enqueue(ctx, sendEmail{To: "new"}, jetq.JobID("reused"), jetq.MsgID("new-publication"), jetq.UniqueUntilDone("mail"), jetq.At(time.Now().Add(time.Hour))); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := c.Enqueue(ctx, sendEmail{To: "old"}, old...); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := c.Enqueue(ctx, sendEmail{To: "third"}, jetq.UniqueUntilDone("mail")); !errors.Is(err, jetq.ErrDuplicate) {
+				t.Fatalf("active lock lost: %v", err)
+			}
+		})
+	}
+}
+
+func TestMsgIDRetriesFailedLockDeletion(t *testing.T) {
+	c, f := newFlakyClient(t)
+	ctx := context.Background()
+	opts := []jetq.EnqueueOption{jetq.JobID("settled"), jetq.MsgID("publication"), jetq.UniqueUntilDone("mail")}
+	if _, err := c.Enqueue(ctx, sendEmail{To: "old"}, opts...); err != nil {
+		t.Fatal(err)
+	}
+	f.failDeletes.Store(true)
+	ran, _ := runCount(t, c)
+	wait(t, ran, 5*time.Second)
+	bucket, err := f.KeyValue(ctx, "JETQ_STATE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := fmt.Sprintf("settled.%x", sha256.Sum256([]byte("publication")))
+	eventually(t, func() bool { _, err := bucket.Get(ctx, receipt); return err == nil })
+	if _, err := c.Enqueue(ctx, sendEmail{To: "old"}, opts...); !errors.Is(err, jetq.ErrUncertain) {
+		t.Fatalf("delete failure: %v", err)
+	}
+	f.failDeletes.Store(false)
+	if _, err := c.Enqueue(ctx, sendEmail{To: "old"}, opts...); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Enqueue(ctx, sendEmail{To: "new"}, jetq.UniqueUntilDone("mail"), jetq.At(time.Now().Add(time.Hour))); err != nil {
+		t.Fatal(err)
 	}
 }
