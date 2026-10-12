@@ -402,7 +402,10 @@ func (w *Worker) process(runCtx, jobCtx context.Context, q Queue, msg jetstream.
 	}
 	if cancelled {
 		// Cancelled while the schedule was firing: drop the copy unrun.
-		w.releaseLock(runCtx, msg, info)
+		if !w.releaseLock(runCtx, msg, info) {
+			_ = msg.NakWithDelay(cancelCheckRetry)
+			return
+		}
 		if ackErr := msg.Ack(); ackErr != nil {
 			logger.WarnContext(runCtx, "jetq ack failed", "queue", q.Name, "job", info.Name, "id", info.ID, "error", ackErr)
 		}
@@ -436,7 +439,10 @@ func (w *Worker) process(runCtx, jobCtx context.Context, q Queue, msg jetstream.
 		w.dropRequeued(settleCtx, d)
 		// Release the unique lock before acking: a lost ack then risks a
 		// duplicate run, never a key that stays locked.
-		w.releaseLock(settleCtx, msg, info)
+		if !w.releaseLock(settleCtx, msg, info) {
+			_ = msg.NakWithDelay(cancelCheckRetry)
+			return
+		}
 		if ackErr := msg.Ack(); ackErr != nil {
 			logger.WarnContext(settleCtx, "jetq ack failed", "queue", q.Name, "job", info.Name, "id", info.ID, "error", ackErr)
 		}
@@ -787,7 +793,10 @@ func (w *Worker) deadLetter(ctx context.Context, d delivery, cause error) {
 	w.dropRequeued(ctx, d)
 	// The job is settled as dead: free its unique key before the callbacks, so
 	// they can enqueue a replacement with the same key.
-	w.releaseLock(ctx, msg, info)
+	if !w.releaseLock(ctx, msg, info) {
+		_ = msg.NakWithDelay(cancelCheckRetry)
+		return
+	}
 	failCtx := context.WithValue(ctx, infoKey{}, info)
 	if h, ok := w.handlers[info.Name]; ok && h.failed != nil {
 		w.callback(failCtx, info, func() {
@@ -816,10 +825,18 @@ func (w *Worker) callback(ctx context.Context, info Info, fn func()) {
 }
 
 // releaseLock frees the UniqueUntilDone lock of a settled job.
-func (w *Worker) releaseLock(ctx context.Context, msg jetstream.Msg, info Info) {
+func (w *Worker) releaseLock(ctx context.Context, msg jetstream.Msg, info Info) bool {
 	if lock := msg.Headers().Get(HeaderUniqueLock); lock != "" {
-		w.client.unlock(ctx, lock, info.ID)
+		if publication := msg.Headers().Get(headerPublicationID); publication != "" {
+			if err := w.client.settlePublication(ctx, publication, info.ID, msg.Headers().Get(headerLockRevision)); err != nil {
+				w.client.cfg.logger.WarnContext(ctx, "jetq publication settlement failed", "id", info.ID, "error", err)
+				return false
+			}
+		}
+		revision, _ := strconv.ParseUint(msg.Headers().Get(headerLockRevision), 10, 64)
+		return w.client.unlockRevision(ctx, lock, lockOwner(info.ID, msg.Headers().Get(headerPublicationID)), revision)
 	}
+	return true
 }
 
 func truncate(s string, n int) string {

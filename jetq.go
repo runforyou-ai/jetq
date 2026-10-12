@@ -126,29 +126,10 @@ func WithLogger(l *slog.Logger) Option { return func(c *config) { c.logger = l }
 
 // New creates or updates the jetq streams and returns a client.
 func New(ctx context.Context, js jetstream.JetStream, opts ...Option) (*Client, error) {
-	cfg := config{
-		streamName: "JETQ",
-		prefix:     "jetq",
-		replicas:   1,
-		storage:    jetstream.FileStorage,
-		duplicates: 2 * time.Minute,
-		deadMaxAge: 14 * 24 * time.Hour,
-		uniqueTTL:  24 * time.Hour,
-		logger:     slog.Default(),
+	cfg, err := resolveConfig(opts...)
+	if err != nil {
+		return nil, err
 	}
-	for _, opt := range opts {
-		opt(&cfg)
-	}
-	if cfg.deadName == "" {
-		cfg.deadName = cfg.streamName + "_DEAD"
-	}
-	if !nameRE.MatchString(cfg.prefix) {
-		return nil, fmt.Errorf("jetq: invalid subject prefix %q", cfg.prefix)
-	}
-	if strings.ContainsAny(cfg.streamName, ". *>") || cfg.streamName == "" {
-		return nil, fmt.Errorf("jetq: invalid stream name %q", cfg.streamName)
-	}
-
 	stream, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
 		Name:              cfg.streamName,
 		Description:       "jetq jobs",
@@ -269,7 +250,7 @@ var ErrJobIDInUse = errors.New("jetq: job id in use by a pending delayed job")
 // the job as possibly enqueued; enqueueing it again may run it twice, unless
 // it uses [Unique] within the duplicate window or [UniqueUntilDone].
 //
-// For a [UniqueUntilDone] job without [Unique], Enqueue first publishes it a
+// With [MsgID], or a [UniqueUntilDone] job without [Unique], Enqueue first publishes it a
 // second time, deduplicated by a message id derived from its lock so that the
 // stream stores it at most once, and returns success if the server answers;
 // this may enqueue the job after ctx was cancelled. It does so only while
@@ -283,3 +264,31 @@ var ErrUncertain = errors.New("jetq: enqueue outcome unknown")
 
 // ErrNotFound is returned by [Client.Cancel] when no pending delayed job has the given id.
 var ErrNotFound = errors.New("jetq: delayed job not found")
+
+// resolveConfig resolves queue names and behavior from options.
+func resolveConfig(opts ...Option) (config, error) {
+	cfg := config{
+		streamName: "JETQ",
+		prefix:     "jetq",
+		replicas:   1,
+		storage:    jetstream.FileStorage,
+		duplicates: 2 * time.Minute,
+		deadMaxAge: 14 * 24 * time.Hour,
+		uniqueTTL:  24 * time.Hour,
+		logger:     slog.Default(),
+	}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	if cfg.deadName == "" {
+		cfg.deadName = cfg.streamName + "_DEAD"
+	}
+	if !nameRE.MatchString(cfg.prefix) {
+		return config{}, fmt.Errorf("jetq: invalid subject prefix %q", cfg.prefix)
+	}
+	if strings.ContainsAny(cfg.streamName, ". *>") || cfg.streamName == "" {
+		return config{}, fmt.Errorf("jetq: invalid stream name %q", cfg.streamName)
+	}
+
+	return cfg, nil
+}
