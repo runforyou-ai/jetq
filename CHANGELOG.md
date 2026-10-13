@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.4.1
+
+- Add read-only binding to pre-provisioned JetStream resources (`Attach` / resource configs) so hosts can validate streams without recreating them.
+- Stabilize publish retries for uniquely keyed jobs: bind settlement receipts to the original lock revision, persist unique-job settlement, and recover locks by publisher identity.
+- Keep cancellation markers independent of unique locks; cover lost-ack retries without deleting a reused job's lock by mistake.
+
 ## v0.4.0
 
 - Add `EnqueueNamed` and `HandleNamed` for explicit, stable job names and ordinary JSON payload types. `OnFailure` accepts ordinary types too.
