@@ -198,7 +198,8 @@ const (
 	// the holder when the driver knows it.
 	Suppressed
 	// Unknown: the job may or may not be stored; the error wraps
-	// ErrUncertain and JobID is the candidate to trace.
+	// ErrUncertain and JobID is the candidate to trace. A definite rejection,
+	// such as an occupied JobID (ErrJobIDInUse), is an error with no status.
 	Unknown
 )
 
@@ -237,6 +238,10 @@ var (
 	// ErrEnqueueKeyConflict: the EnqueueKey was used for different content
 	// within its retention; the original job is kept.
 	ErrEnqueueKeyConflict = errors.New("jetq: enqueue key reused with different content")
+	// ErrJobIDInUse: the explicitly chosen JobID already holds different
+	// content. The submission is definitely not stored and the existing job
+	// is left untouched; no result status is reported.
+	ErrJobIDInUse = errors.New("jetq: job id already in use with different content")
 	// ErrNotCancelable: the job has already started or finished.
 	ErrNotCancelable = errors.New("jetq: job can no longer be canceled")
 	// ErrNotFound: no job has this id.

@@ -76,13 +76,13 @@ type Delivery interface {
 }
 ```
 
-可选能力接口：`Canceler`（首次准入前取消）、`Inspector`（快照与分页查询）、`Maintainer`（回收与卡住任务恢复）、`BackgroundTasks`（scheduler 生命周期）。未实现的能力不存在于类型上，不以返回 `ErrNotSupported` 的空实现冒充。
+可选能力接口：`Canceler`（取消尚未开始的执行：等待中、已排期和 snooze 中的任务不再投递；运行中的 handler 不被打断，但其后续重试不再执行）、`Inspector`（快照与分页查询）、`Maintainer`（回收与卡住任务恢复）、`BackgroundTasks`（scheduler 生命周期）。未实现的能力不存在于类型上，不以返回 `ErrNotSupported` 的空实现冒充。
 
 ### 2.2 身份与载荷
 
 - **JobID** 标识一个逻辑任务，在延迟、重试和 Snooze 期间不变。
 - **EnqueueKey** 标识调用方可以重试的提交意图。保留期内同内容返回 `AlreadyAccepted`，内容冲突（指纹不同）返回 `ErrEnqueueKeyConflict`，不覆盖原任务。
-- **Fingerprint** 覆盖任务名、队列、载荷、执行时间、执行策略、唯一规则和 ParentJobID；不覆盖生产者时钟等内部生成字段。
+- **Fingerprint** 覆盖任务名、队列、载荷、执行时间、执行策略、元数据（按 key 排序）、唯一规则和 ParentJobID；不覆盖生产者时钟等内部生成字段。
 - **UniqueRule** 表达业务抑制，与任务身份、提交幂等互不混用。
 - **载荷** 是 JSON。原样字节（空白、`<` 等）在编码和持久化后保持不变：`Envelope`/`PreparedJob` 的 JSON 形式把载荷作为不透明字节（JSON 中为 base64）存储；NATS 记录、intent、调度快照同样保持原字节。`WithMaxPayloadBytes` 在进入驱动前限制编码后的字节数。
 
@@ -240,7 +240,7 @@ graph TD
 
 - 账本条目数与 `JobRetention`、提交速率成正比；调小保留期或按业务分命名空间可降低扫描成本。
 - 单个命名空间的写吞吐受 NATS 集群仲裁与 KV 写入限制。
-- 设计目标为账本规模在数十万记录以内的工作负载；[docs/benchmarks.md](benchmarks.md) 给出可复现的微基准及适用范围，不是生产压测。
+- [docs/benchmarks.md](benchmarks.md) 给出可复现的接收微基准及适用范围；它不是生产压测，也不包含有任务可领取时的延迟。
 
 ## 7. PostgreSQL 驱动草图（未实现）
 

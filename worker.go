@@ -409,6 +409,10 @@ func (w *Worker) process(runCtx, jobCtx context.Context, stop *stopper, q Queue,
 		Snoozes: state.Snoozes, Deliveries: state.Deliveries,
 		EnqueuedAt: env.CreatedAt, RunAt: env.RunAt,
 		Metadata: env.Metadata.Clone(), ParentJobID: env.ParentJobID,
+		// Paths that never admit (recorded decision, cancellation, exhausted
+		// budget, unknown handler, shutdown) still report the business
+		// execution this delivery stands for: the recorded budget.
+		Attempt: state.Budget,
 	}
 	// The log context is derived after admission, inside the lease window: a
 	// slow log context function must not let the lease expire.
@@ -689,15 +693,18 @@ func (w *Worker) release(ctx context.Context, dlv Delivery, info Info, logCtx co
 // best effort: a panic or error is logged and never affects settlement.
 func (w *Worker) failed(ctx context.Context, info Info, dec Decision, payload json.RawMessage) {
 	cause := errors.New(dec.Error)
+	// Observers reach the same Info as handlers do, so [JobInfo] reports the
+	// attempt, queue and task of the execution that failed.
+	obsCtx := context.WithValue(ctx, infoKey{}, info)
 	if h, ok := w.handlers[info.Name]; ok && h.failed != nil {
-		w.callback(ctx, info, "failure observer", func() {
-			if err := h.failed(ctx, payload, cause); err != nil {
+		w.callback(obsCtx, info, "failure observer", func() {
+			if err := h.failed(obsCtx, payload, cause); err != nil {
 				w.client.logger.WarnContext(ctx, "jetq failure observer skipped", "task", info.Name, "job", info.ID, "error", err)
 			}
 		})
 	}
 	for _, fn := range w.onFailed {
-		w.callback(ctx, info, "failure observer", func() { fn(ctx, info, payload, cause) })
+		w.callback(obsCtx, info, "failure observer", func() { fn(obsCtx, info, payload, cause) })
 	}
 }
 

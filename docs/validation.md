@@ -46,10 +46,11 @@ go list -deps . | grep -i nats              # 无输出（根包不依赖 NATS�
 | 载荷按原始字节保存（含空白与 `<`） | `TestEnvelopeJSONKeepsPayloadBytes`、`TestReviewPreparedJSONPreservesPayloadAndFingerprint`、`natsq/TestReviewDriverPreservesRawJSONBytes`、`natsq/TestReviewSchedulePreservesPrettyRawJSONBytes`、`natsq/TestReviewSchedulePreservesRawPayload` |
 | 编码不等于重编码：往返后指纹仍有效，outbox 重试不会指纹不匹配 | 同上文件；`natsq/TestSubmitRejectsTamperedFingerprint` |
 | 业务载荷上限，超限不进驱动 | `TestMaxPayloadBytes` |
-| EnqueueKey 幂等与内容冲突 | `natsq/TestEnqueueKeyIdempotencyAndConflict`、`TestConcurrentEnqueueKeyRetriesConverge`、`TestAlreadyAcceptedKeepsOriginalRunAt` |
+| EnqueueKey 幂等与内容冲突；显式 JobID 已占用是确定错误而非 Unknown | `natsq/TestEnqueueKeyIdempotencyAndConflict`、`TestConcurrentEnqueueKeyRetriesConverge`、`TestAlreadyAcceptedKeepsOriginalRunAt`、`drivertest` `SubmitJobIDInUse` |
 | 提交结果区分 Accepted/AlreadyAccepted/Suppressed/Unknown | `natsq/outcome_test.go`、`TestSubmitCreateResponseLost`、`TestStalledIntentIsCompletedNotReplaced`、`TestReviewIntentMarkerFailureKeepsAcceptedJob` |
 | 相对 Delay 准备时固定，重复提交不变时间 | `TestPrepareFixesRunAtAndFingerprint`、`TestPrepareTaskFixesIdentityAndDelay`、`TestPrepareRedriveFixesDelayAcrossRetries`、`drivertest` redrive 用例 |
 | 准入消耗预算、响应丢失不重复计费、上限不可越过 | `TestReviewAdmissionResponseLossAtBudgetLimit`、`TestLeaseExpiryRedeliversAndKeepsBudgetSpent`、`TestExhaustedBudgetAfterRedeliveryDoesNotRun` |
+| 失败观察者看到的尝试次数与预算一致（耗尽预算、恢复的失败决定、正常准入） | `TestFailureObserverSeesBudgetOnExhaustedPath`、`TestFailureObserverSeesBudgetOnPendingFail`、`TestObserverAttemptAfterAdmission` |
 | Snooze 幂等退款（只退一次） | `TestSnoozeRefundsBudget`、`natsq/TestSnoozeRefundsBudgetOnce` |
 | Release 退款、退还后不再运行 handler | `TestReleaseKeepsBudget`、`TestShutdownReleasesUnadmittedDelivery` |
 | 决定已持久化则不重跑业务 | `natsq/TestRecordedDecisionIsResumedNotRerun`、`TestRecoveryCompletesRecordedDecision`、`TestDecisionWriteResponseLost`、`TestRecordedJobBeatsUnmarkedIntent`、`TestPendingDecisionResumesWithoutHandler` |

@@ -228,14 +228,13 @@ then collected. Auxiliary records (intents, unique locks, schedule claims) depen
 are removed with it; a claim that cannot be removed holds the job for the next pass instead of
 letting a collected job be recreated.
 
-**Scan cost.** The driver has no deliverability index: `Receive` lists the ledger's job keys and
+**Scan cost.** There is no deliverability index: `Receive` lists the ledger's job keys and
 reads candidate records, so claim cost grows with the number of *retained* jobs, not the number of
-runnable ones. With the default 24-hour terminal retention, a namespace that stores millions of
-finished jobs pays for them in every receive. Claim visibility is governed by the scan interval and
-the wake stream, and a lease bounds how long a crashed worker's job stays claimed. The design targets
-workloads where the ledger stays in the hundreds of thousands of records; it has not been load-tested
-for throughput. See [docs/benchmarks.md](docs/benchmarks.md) for the reproducible micro-benchmarks
-and their scope.
+runnable ones. A namespace that keeps finished jobs for the default 24-hour retention pays for them
+in every receive; tune `JobRetention` or split namespaces when that matters. [docs/benchmarks.md](docs/benchmarks.md)
+records two reproducible samples (empty ledger and 1,000 retained records) measured on one machine;
+they include waiting for the next scan and are not claim or end-to-end latency figures for loaded
+queues. No throughput or stability claims are made.
 
 **Not measured.** No throughput, latency or production-stability claims are made here.
 

@@ -35,6 +35,7 @@ func Run(t *testing.T, f Factory, opts Options) {
 	s := suite{f: f, opts: opts}
 	t.Run("SubmitIdempotency", s.submitIdempotency)
 	t.Run("SubmitContentConflict", s.submitContentConflict)
+	t.Run("SubmitJobIDInUse", s.submitJobIDInUse)
 	t.Run("UniqueUntilDone", s.uniqueUntilDone)
 	t.Run("UniqueWindow", s.uniqueWindow)
 	t.Run("AdmitBudgetAndLease", s.admitBudgetAndLease)
@@ -127,6 +128,38 @@ func (s suite) submitContentConflict(t *testing.T) {
 		if _, exists, err := insp.GetJob(ctx, "conf-2"); err != nil || exists {
 			t.Fatalf("conflicting job was stored: %v, %v", exists, err)
 		}
+	}
+}
+
+// submitJobIDInUse: an explicit JobID that already holds different content,
+// with no EnqueueKey, is a definite conflict: a classified error, no result
+// status, and the original job untouched.
+func (s suite) submitJobIDInUse(t *testing.T) {
+	d := s.driver(t)
+	ctx := context.Background()
+	first := s.prepare(t, "dup-1", jetq.Submission{})
+	if res, err := d.Submit(ctx, first); err != nil || res.Status != jetq.Accepted {
+		t.Fatalf("first = %+v, %v", res, err)
+	}
+	again := s.prepare(t, "dup-1", jetq.Submission{})
+	again.Envelope.Payload = json.RawMessage(`{"n":2}`)
+	again.Fingerprint = again.Envelope.Fingerprint()
+	res, err := d.Submit(ctx, again)
+	if !errors.Is(err, jetq.ErrJobIDInUse) || errors.Is(err, jetq.ErrUncertain) {
+		t.Fatalf("conflicting job id = %v, want ErrJobIDInUse without ErrUncertain", err)
+	}
+	if res.Status != 0 || res.JobID != "" {
+		t.Fatalf("conflict reported a result: %+v", res)
+	}
+	if insp, ok := d.(jetq.Inspector); ok {
+		snap, found, err := insp.GetJob(ctx, "dup-1")
+		if err != nil || !found || string(snap.Envelope.Payload) != `{"n":1}` {
+			t.Fatalf("original job changed: %+v, %v, %v", snap.Envelope, found, err)
+		}
+	}
+	// The unchanged content is still the original job.
+	if res, err := d.Submit(ctx, s.prepare(t, "dup-1", jetq.Submission{})); err != nil || res.Status != jetq.AlreadyAccepted {
+		t.Fatalf("unchanged resubmission = %+v, %v", res, err)
 	}
 }
 

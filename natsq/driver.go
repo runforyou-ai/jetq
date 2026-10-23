@@ -268,8 +268,9 @@ func (d *Driver) submit(ctx context.Context, env *jetq.Envelope, fingerprint str
 		}
 		if ok {
 			if ent.rec.Fingerprint != fingerprint {
-				return jetq.EnqueueResult{Status: jetq.Unknown, JobID: env.JobID},
-					fmt.Errorf("natsq: submit %s: %w", env.JobID, errContentMismatch)
+				// The existing job is a definite conflict, not an uncertain
+				// outcome: nothing was stored and the original is untouched.
+				return jetq.EnqueueResult{}, fmt.Errorf("natsq: submit %s: %w", env.JobID, jetq.ErrJobIDInUse)
 			}
 			if ent.rec.Outcome == outcomePending {
 				// A competitor died before deciding: finish its submission
@@ -383,8 +384,6 @@ func (d *Driver) decidePending(ctx context.Context, env *jetq.Envelope, fingerpr
 	}
 	return jetq.EnqueueResult{Status: jetq.Accepted, JobID: env.JobID, RunAt: env.RunAt}, true, nil
 }
-
-var errContentMismatch = errors.New("natsq: job id already holds different content")
 
 // reportOutcome turns a decided job record into the submission result.
 func (d *Driver) reportOutcome(ent *ledgerEntry) jetq.EnqueueResult {
