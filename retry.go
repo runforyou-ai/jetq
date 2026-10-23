@@ -5,37 +5,6 @@ import (
 	"time"
 )
 
-// Backoff returns how long to wait before the next attempt after attempt
-// (1-based) failed.
-type Backoff func(attempt int) time.Duration
-
-// Exponential doubles the delay after every failed attempt, starting at base
-// and capped at limit. A non-positive base means one second; a limit below
-// base means base.
-func Exponential(base, limit time.Duration) Backoff {
-	if base <= 0 {
-		base = time.Second
-	}
-	limit = max(limit, base)
-	return func(attempt int) time.Duration {
-		delay := base
-		for i := 1; i < attempt && delay < limit; i++ {
-			if delay > limit/2 {
-				delay = limit
-			} else {
-				delay *= 2
-			}
-		}
-		return delay
-	}
-}
-
-// Constant waits the same delay after every failed attempt. A negative delay means zero.
-func Constant(delay time.Duration) Backoff {
-	delay = max(delay, 0)
-	return func(int) time.Duration { return delay }
-}
-
 type permanentError struct{ err error }
 
 func (e *permanentError) Error() string { return e.err.Error() }
@@ -71,8 +40,8 @@ func (e *snoozeError) Error() string { return "jetq: job snoozed for " + e.delay
 // counting the current attempt, for example while a tenant is paused. The
 // snoozed job keeps its id and can be cancelled with [Client.Cancel];
 // [Info.Snoozes] counts how often it was snoozed, so a handler can give up.
-// If putting it back fails, or another pending delayed job has its id, the
-// delivery is redelivered after delay instead and that counts as an attempt.
+// If the updated execution state cannot be recorded, the delivery is offered
+// again after delay instead and that counts as an attempt.
 func Snooze(delay time.Duration) error { return &snoozeError{delay: delay} }
 
 // RetryAfter fails the attempt and asks for the next attempt after delay

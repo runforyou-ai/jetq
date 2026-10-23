@@ -5,17 +5,9 @@
 
 [中文](README.zh-CN.md)
 
-jetq is a background job queue for Go built on [NATS JetStream](https://docs.nats.io/nats-concepts/jetstream).
-Jobs carry explicitly named JSON payloads. Handlers are ordinary Go functions; the queue manages retries, backoff, delays, uniqueness, failure callbacks and recurring schedules.
+jetq is a background job queue for Go. Jobs carry an explicit name and a JSON payload; producers and consumers are independent processes that share a storage backend. The root package defines submission, typed handlers, retries, timeouts, snooze, cancellation, uniqueness, inspection and redrive against a driver-neutral contract. The `natsq` package implements the contract on NATS JetStream: a KeyValue ledger is the authority for every job and decision, and a wake stream only shortens the delay before a new job is claimed.
 
-- **Typed handlers.** Payloads are ordinary structs; `EnqueueNamed` and `HandleNamed` share an explicit job name.
-- **Retries that make sense.** Per-queue attempt limits and backoff, `Permanent` errors, `RetryAfter`, and `Snooze` for "not now" without burning an attempt.
-- **Delayed and recurring jobs on the server.** Delays and cron schedules use JetStream message scheduling, so there is no scheduler process, polling or leader election in your app.
-- **Long jobs.** Running handlers keep their message alive; a crashed worker's job is redelivered after `AckWait`. `Queue.Timeout` and `jetq.Timeout(d)` bound a single attempt.
-- **Dead letters.** Jobs that run out of attempts land in a dead-letter stream with the last error, and your `OnFailure` callbacks run.
-- **Small surface.** One stream, one consumer per queue, plain `nats.go`. Embedded or standalone NATS is your application's choice.
-
-Requires nats-server **2.14+** (2.15 recommended) and Go 1.27+.
+Requires Go 1.27+ and, for the NATS driver, nats-server 2.14+ with JetStream.
 
 ## Install
 
@@ -23,113 +15,241 @@ Requires nats-server **2.14+** (2.15 recommended) and Go 1.27+.
 go get github.com/runforyou-ai/jetq
 ```
 
-Version 0.4 removes `Cron` and `Schedule.In`; see [migration instructions](CHANGELOG.md#v040) before upgrading.
-
 ## Usage
 
+The complete, compiling example is [example_test.go](example_test.go).
+
 ```go
-type WelcomeEmail struct {
-	UserID int64 `json:"user_id"`
+type Email struct {
+	To      string `json:"to"`
+	Subject string `json:"subject"`
 }
 
-q, err := jetq.New(ctx, js) // js is a jetstream.JetStream; creates the streams if needed
+// A task is a stable name plus default policy. It is not bound to a queue,
+// a connection or a driver.
+var SendEmail = jetq.MustTask[Email]("email.send", jetq.Policy{
+	MaxAttempts: 3,
+	Timeout:     jetq.TimeoutOf(30 * time.Second),
+	Backoff:     jetq.ExponentialBackoff(time.Second, time.Minute),
+})
 
-// Enqueue after your database transaction has committed.
-id, err := q.EnqueueNamed(ctx, "welcome-email", WelcomeEmail{UserID: 42},
-	jetq.OnQueue("mail"),
-	jetq.Delay(10*time.Minute),   // or jetq.At(t)
-	jetq.UniqueUntilDone("welcome-42"), // ErrDuplicate until that job settles; jetq.Unique(key) uses a time window
-	// jetq.JobID(id) sets the id yourself, e.g. to store it before enqueueing
-)
-// errors.Is(err, jetq.ErrUncertain): the job may or may not be enqueued (timeout, lost
-// connection); id is returned. A UniqueUntilDone job is published once more to settle
-// this, even after ctx is cancelled, and otherwise keeps its key until it settles or expires.
-_ = q.Cancel(ctx, id)            // cancel a pending delayed job
+// Provisioning (once per deployment) and opening validate shared parameters.
+cfg := natsq.Config{Namespace: "prod", Replicas: 3}
+if _, err := natsq.Provision(ctx, js, cfg); err != nil { ... }
+driver, err := natsq.Open(ctx, js, cfg)
 
-// Recurring jobs: every instance passes the same full set at startup.
-err = q.SyncSchedules(ctx,
-	jetq.Schedule{Key: "daily-report", Cron: "0 2 * * *", Name: "daily-report", Payload: DailyReport{}, Timezone: "Asia/Shanghai"},
-	jetq.Schedule{Key: "sweep", Cron: "@every 30s", Name: "sweep", Payload: Sweep{}, Queue: "maintenance"},
-)
+// Producer.
+client, err := jetq.NewClient(driver, jetq.WithMaxPayloadBytes(256<<10))
+res, err := jetq.SubmitTask(ctx, client, SendEmail,
+	Email{To: "a@example.com", Subject: "Welcome"},
+	jetq.Submission{Queue: "mail", EnqueueKey: "welcome:a@example.com"})
+// errors.Is(err, jetq.ErrEnqueueKeyConflict): the key is already held by
+// different content. res.Status == jetq.Accepted on the first submission and
+// jetq.AlreadyAccepted for an idempotent retry.
 
-// Workers.
-w := q.NewWorker(
-	jetq.Queue{Name: "default"},
-	jetq.Queue{Name: "mail", Concurrency: 8, MaxAttempts: 5, Backoff: jetq.Exponential(10*time.Second, time.Hour), Timeout: 5 * time.Minute},
-)
-jetq.HandleNamed(w, "welcome-email", func(ctx context.Context, job WelcomeEmail) error {
-	info, _ := jetq.JobInfo(ctx) // id, attempt, queue, headers...
-	return send(ctx, job.UserID)
-}, jetq.OnFailure(func(ctx context.Context, job WelcomeEmail, err error) {
-	// Record the terminal failure.
-}))
-w.Use(loggingMiddleware)
-err = w.Run(ctx) // blocks; on cancel, waits for running jobs
+// Consumer, in its own process if you like.
+worker := client.NewWorker(jetq.Queue{Name: "mail", Concurrency: 4})
+jetq.Handle(worker, SendEmail, func(ctx context.Context, e Email) error {
+	return send(ctx, e)
+})
+err = worker.Run(ctx) // blocks until ctx is cancelled and running handlers return
 ```
 
-### Provisioned resources and durable outboxes
+### The same task on several queues
 
-`jetq.ResourceConfigs(options...)` returns the work stream, dead-letter stream and state bucket definitions without writing to NATS. Provision these separately, then use `jetq.Attach(ctx, js, options...)` in application processes. Attach validates subjects, queue semantics and minimum retention while preserving replicas, storage, placement and capacity. `New` remains the convenience constructor that creates or updates resources.
+A task name is the handler lookup key; the queue is chosen per submission. `SendEmail` above can be
+submitted to `mail`, `bulk` and `priority` with the same handler registered on a worker that serves
+several queues (`client.NewWorker(jetq.Queue{Name: "mail"}, jetq.Queue{Name: "bulk"})`). Different
+producers can also set different default queues and policies with `WithDefaultQueue` and
+`WithDefaultPolicy`.
 
-For an outbox retry, keep the same payload, absolute scheduled time, `jetq.JobID(id)` and `jetq.MsgID(publicationID)` on every attempt. `MsgID` uses JetStream deduplication and can resume a `UniqueUntilDone` lock owned by the same job. It requires an explicit JobID and cannot be combined with `Unique` or relative `Delay`; use `At` for a fixed schedule. For UniqueUntilDone, the state TTL must cover the duplicate window; completion is recorded before releasing the lock. A retry acknowledges the same publication even if it has since completed or been cancelled. A recorded cancellation is respected for the state bucket TTL, including retries after the duplicate window. Keep the outbox row after `ErrUncertain`; remove it only after publication is confirmed. Deduplication lasts for the configured duplicate window, so handlers must remain idempotent for later retries.
+### Raw and dynamic task names
 
+Typed payloads are the normal case. Two other forms share the same envelope, execution policy,
+retry and admission path:
 
-### Runtime job names
+```go
+// Known at runtime, payload already JSON.
+client.Submit(ctx, "legacy.import", json.RawMessage(`{"id":7}`), jetq.Submission{})
+worker := client.NewWorker(jetq.Queue{Name: "imports"})
+jetq.HandleTask(worker, "legacy.import", func(ctx context.Context, raw json.RawMessage) error { ... })
 
-When job names are only known at runtime (for example when bridging an existing task system),
-use `EnqueueNamed(ctx, name, payload)` and `HandleNamed(w, name, fn, OnFailure(...))`. Ordinary structs need no methods. For byte-for-byte JSON handlers, pass `json.RawMessage` and register `w.HandleRaw(name, fn, jetq.OnRawFailure(...))`.
-The payload must be valid JSON and is delivered byte for byte.
+// Or with a raw task value, which applies a task default policy.
+raw := jetq.Raw("legacy.import")
+client.SubmitRaw(ctx, raw, json.RawMessage(`{"id":7}`), jetq.Submission{})
+```
 
-### Type-owned names
+Raw JSON is preserved byte for byte, including whitespace and characters such as `<`. An empty raw
+payload is stored as `null`. `WithMaxPayloadBytes` bounds the encoded payload of every path (typed,
+raw, dynamic, prepared); a larger payload returns `jetq.ErrPayloadTooLarge` and never reaches the
+driver.
 
-`Enqueue` and `Handle` also accept types implementing `JobName() string`. Use this convenience when a type owns its stable protocol name. Explicit names need no methods.
+### Preparing once, retrying idempotently
 
-`json.RawMessage` is validated and preserved byte for byte; an empty raw message or nil payload is encoded as `null`. Other values follow `encoding/json`, including base64 JSON strings for `[]byte`. Decoding `null` into a struct yields its zero value; handlers validate required business fields.
+`Prepare`/`PrepareTask` resolve the job id, the absolute run time and the full policy without
+storing anything. Repeating `SubmitPrepared` with the same value is how an outbox retries: the run
+time does not move and an `EnqueueKey` makes the retry idempotent.
 
-### Inspecting queues
+```go
+job, err := jetq.PrepareTask(client, SendEmail, email,
+	jetq.Submission{Queue: "mail", Delay: 10 * time.Minute, EnqueueKey: "digest:42"})
+res1, _ := client.SubmitPrepared(ctx, job) // records the job for now + 10m
+res2, _ := client.SubmitPrepared(ctx, job) // AlreadyAccepted, same run time
+```
 
-`q.Stats(ctx)` reports per queue the jobs not yet delivered (`Ready`), the delivered but unsettled
-jobs (`InFlight`, mostly running ones), and the dead-lettered jobs, plus the number of pending
-delayed jobs (including jobs waiting for a retry or snoozed) and installed schedules. `q.DeadLetters(ctx, jetq.DeadLetterQuery{...})` pages
-through dead-lettered jobs, newest first, with their last error.
+`Prepare` with no job id and no generator returns an error instead of panicking; a submission that
+sets both `RunAt` and `Delay`, or a negative delay, is rejected.
 
-### Log context
+### Policy priority
 
-`w.SetLogContext(func(ctx, info) context.Context)` derives the context of jetq's own job log records
-and of failure callbacks, so your logging handler can attach a trace id or tenant.
+The resolved policy is the merge of three layers, highest first: the submission's `Policy`, the
+task's default policy, then the producer client's default policy (`WithDefaultPolicy`). A `Policy`
+field left zero inherits the next layer down, except for the timeout: `jetq.NoTimeout()` explicitly
+declares "no timeout" and stops inheritance. The resolved policy is part of the job envelope, so the
+consumer executes exactly what the producer resolved, whatever its own defaults are.
 
 ### Handler results
 
 | Return | Effect |
 |---|---|
-| `nil` | Job done, removed from the queue. |
-| any error | Retried after the queue's backoff; dead-lettered when attempts run out. |
-| `jetq.RetryAfter(d, err)` | Retried after `d` instead of the backoff. |
-| `jetq.Permanent(err)` | Dead-lettered immediately. |
-| `jetq.Snooze(d)` | Runs again after `d`; the attempt is not counted (`Info.Snoozes` counts snoozes). |
-| panic | Treated as an error. |
-| timeout | The context is cancelled with cause `jetq.ErrTimeout`; the attempt fails. |
+| `nil` | Succeeded; the job is terminal. |
+| error | Retried after the resolved backoff until `MaxAttempts`; then failed. |
+| `jetq.Permanent(err)` | Failed immediately. |
+| `jetq.RetryAfter(d, err)` | Retried after `d`. |
+| `jetq.Snooze(d)` | Snoozed until `d`; the admission budget is refunded, so a snooze does not use an attempt. |
+| panic | Recovered and treated as an error. |
+| timeout | The handler context is cancelled with cause `jetq.ErrTimeout`; the attempt fails regardless of what the handler returns, snooze and permanent included. |
 
-Jobs waiting for a retry or a snooze are stored as delayed jobs, so they never hold up a queue and
-can be cancelled with `Cancel`. A job this worker has no handler for (for example during a rolling
-deploy) is put back for other workers without using up an attempt and dead-lettered after
-`w.SetUnknownJobTimeout` (default 1h). Jobs interrupted by the shutdown timeout are put back without
-using up an attempt; handlers that ignore cancellation are abandoned 10 seconds later. Retry delays
-under a second are served by redelivery, and delayed jobs fire no sooner than about 250ms.
+A handler that ignores cancellation keeps running in the background after a shutdown, up to the
+worker's abandon window; the job is not settled by it.
 
-Delivery is **at least once**: make handlers idempotent.
+### Timeouts, shutdown and cancellation
 
-## Deployment
+Each attempt runs under the resolved timeout (`jetq.NoTimeout()` disables it). Long attempts renew
+their lease automatically, so a slow handler is not redelivered just because it takes long. On
+`Run` returning, the worker waits for running handlers up to `SetShutdownTimeout`; handlers that
+finish are settled normally, handlers still running are released without settling (the attempt stays
+spent), and deliveries claimed but not admitted are released.
 
-jetq only needs a `jetstream.JetStream`. Run NATS however suits you:
+`Cancel` applies before the first admission. A job that is awaiting, scheduled, or snoozed becomes
+canceled and is never delivered; a running job is not interrupted.
 
-- **Single server:** embed `nats-server` in your process (see [docs/design.md](docs/design.md#embedding-nats)).
-- **Several servers:** use a standalone NATS server or cluster. Use `jetq.WithReplicas(3)` on a three-node cluster.
+### Inspection and redrive
 
-## Design
+```go
+snap, found, err := client.Inspect(ctx, jobID)          // state, wait reason, budget, attempts,
+                                                         // deliveries, snoozes, last error, pending
+page, err := client.ListJobs(ctx, jetq.JobQuery{Queue: "mail", FailedOnly: true, Limit: 50})
+stats, err := client.Stat(ctx)                           // per-queue ready/running/delayed/failed counts
+res, err := client.Redrive(ctx, failedID, jetq.RedriveEnqueueKey("redrive:"+failedID))
+```
 
-See [docs/design.md](docs/design.md) for streams, subjects, delivery semantics and the roadmap
-(transactional outbox for PostgreSQL and MySQL, job chains and batches, a dashboard).
+Snapshots carry no backend identifiers: no stream sequences and no KV revisions. The original job of
+a redrive is left untouched; the replacement gets a new `JobID`, records `ParentJobID`, and inherits
+the parent's task, payload, queue, policy, metadata and unique rule unless an option overrides them.
+It never inherits the parent's enqueue key.
+
+`Redrive` with a relative `RedriveDelay` fixes the run time at the call. To retry such a redrive
+idempotently, prepare it once and repeat the submit:
+
+```go
+job, err := client.PrepareRedrive(ctx, failedID,
+	jetq.RedriveDelay(time.Hour), jetq.RedriveEnqueueKey("redrive:"+failedID))
+_, err = client.SubmitPrepared(ctx, job) // again on retry: same replacement, same run time
+```
+
+### Recurring schedules (NATS driver)
+
+Schedules are recurring submissions to the normal path; they are not jobs themselves. A set is
+owned by an owner name and carries a configuration version. A sync states the version it expects,
+so a process still running an old set cannot delete what a newer deployment added.
+
+```go
+var v natsq.ScheduleVersion
+v, err = driver.SyncSchedules(ctx, "billing", v,
+	natsq.Schedule{Key: "daily", Cron: "0 2 * * *", Timezone: "Asia/Shanghai",
+		Task: "invoice.close", Payload: json.RawMessage(`{"region":"cn"}`), Queue: "billing"})
+if errors.Is(err, natsq.ErrVersionConflict) {
+	v, err = driver.CurrentScheduleVersion(ctx, "billing") // then re-sync on top of it
+}
+
+worker.SetScheduler(driver.Scheduler("billing")) // the worker runs the scheduler and shuts it down
+// or: driver.Scheduler("billing").Run(ctx)
+```
+
+- `expected` 0 creates the set; it conflicts when the owner already holds a different set.
+- A nonzero `expected` updates only the held version; otherwise `natsq.ErrVersionConflict` and no write.
+- Syncing the stored definitions is idempotent and returns the held version.
+- Only changed or new schedules lose their cursor; adding one schedule does not skip a due
+  occurrence of another.
+- Firing never changes the version.
+- Every occurrence is claimed durably with a fixed job id, enqueue key and run time. A crash
+  between claim and submission is repaired by recovery with that same job; a later edit or removal
+  of the schedule does not affect a claimed occurrence.
+- `CatchUp: false` (default) skips occurrences missed while no scheduler ran and fires the latest one
+  due; `CatchUp: true` fires up to `MaxCatchUp` of them, oldest first.
+
+### Deployment, connection ownership and failure modes
+
+`natsq.Provision` creates the namespace's ledger bucket, wake stream and schedule support, and
+`natsq.Open` validates them: ledger storage and replica count must match the config, the ledger must
+not allow direct (follower) reads, and the wake stream's subjects, retention and storage must match.
+`Open` never rewrites a mismatched deployment. Both take a `jetstream.JetStream` that the caller
+created and still owns; `Driver.Close` stops the driver's own goroutines but does not close the
+connection.
+
+The KV ledger is authoritative: a wake message missing because of a lost publish or a crash is found
+by the periodic ledger scan. `Recover` (run by `Maintain` in the worker, or directly) finishes
+recorded decisions, takes over jobs whose claim expired, completes lost submissions, and collects
+expired terminal jobs with their intents, unique locks and schedule claims.
+
+## Guarantees and limits
+
+**At least once.** A job whose settlement outcome was lost runs again; handlers must be idempotent
+for the side effects they cause. The admission budget bounds how often: an exhausted budget fails the
+job without running the handler.
+
+**Submission.** `Accepted` means the job is durable. `AlreadyAccepted` means the same `EnqueueKey`
+already holds this content. `Suppressed` means a unique rule suppressed it. `Unknown` (with
+`ErrUncertain`) means the outcome cannot be known; retry with the same `EnqueueKey` and prepared
+value.
+
+**EnqueueKey retention.** An accepted key is kept while its job is retained and is removed with the
+job; a retry within that window returns `AlreadyAccepted`, after it the content is new work. Use
+stable, content-derived keys and keep outbox rows until the submission is confirmed.
+
+**Unique rules.** `UniqueModeWindow` suppresses submissions for the window's duration from the
+holder's submission, whether or not the holder is still running; `UniqueModeUntilDone` suppresses
+until the holder succeeds, fails, is canceled, or its submission is definitively rejected. Stored
+suppression receipts expire on their own short retention and are never listed as jobs.
+
+**Retention.** Terminal jobs are kept for `JobRetention` (default 24h) for inspection and redrive,
+then collected. Auxiliary records (intents, unique locks, schedule claims) depend on their job and
+are removed with it; a claim that cannot be removed holds the job for the next pass instead of
+letting a collected job be recreated.
+
+**Scan cost.** The driver has no deliverability index: `Receive` lists the ledger's job keys and
+reads candidate records, so claim cost grows with the number of *retained* jobs, not the number of
+runnable ones. With the default 24-hour terminal retention, a namespace that stores millions of
+finished jobs pays for them in every receive. Claim visibility is governed by the scan interval and
+the wake stream, and a lease bounds how long a crashed worker's job stays claimed. The design targets
+workloads where the ledger stays in the hundreds of thousands of records; it has not been load-tested
+for throughput. See [docs/benchmarks.md](docs/benchmarks.md) for the reproducible micro-benchmarks
+and their scope.
+
+**Not measured.** No throughput, latency or production-stability claims are made here.
+
+## Design and validation
+
+- [docs/design.md](docs/design.md): the driver contract, core and driver
+  responsibilities, the NATS submission/admission/settlement/schedule protocols and safe garbage
+  collection, with a transactional PostgreSQL sketch.
+- [docs/validation.md](docs/validation.md): which guarantee each test group checks, including the
+  process-kill tests and the conformance suite every driver runs.
+- [CHANGELOG.md](CHANGELOG.md): what changed in this release.
+
+Run the whole suite with `make test` (race detector, 180-second timeout) and the linters with
+`make lint`.
 
 ## License
 
