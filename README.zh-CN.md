@@ -1,17 +1,13 @@
 # jetq
 
+[![CI](https://github.com/runforyou-ai/jetq/actions/workflows/ci.yml/badge.svg)](https://github.com/runforyou-ai/jetq/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/runforyou-ai/jetq.svg)](https://pkg.go.dev/github.com/runforyou-ai/jetq)
+
 [English](README.md)
 
-jetq 是基于 [NATS JetStream](https://docs.nats.io/nats-concepts/jetstream) 的 Go 后台任务队列，任务由稳定名称和普通 JSON 输入组成，处理函数是普通 Go 函数，支持重试、退避、延迟、唯一任务、失败处理和 cron 定时任务。
+jetq 是 Go 语言的持久化后台任务队列。每个任务由显式的任务名和 JSON 载荷组成；生产者与消费者是相互独立的进程，只共享存储后端。根包在驱动中立契约之上定义提交、带类型 handler、重试、超时、Snooze、取消、唯一性、状态查询和 redrive。`natsq` 包以 NATS JetStream 实现该契约：KeyValue 账本是每个任务及其决定的权威来源，wake 流只用于缩短新任务被领取前的等待。
 
-- **强类型处理函数**：输入是普通结构体，`EnqueueNamed` 与 `HandleNamed` 使用同一稳定任务名称。
-- **重试**：按队列设置最大尝试次数和退避；`Permanent` 直接失败，`RetryAfter` 指定下次时间，`Snooze` 推迟执行且不计入尝试次数。
-- **延迟与定时由服务端调度**：使用 JetStream 消息调度，应用里不需要调度进程、轮询或选主。
-- **长任务**：处理中自动续期；worker 崩溃后，任务在 `AckWait` 后重新投递；`Queue.Timeout` 与 `jetq.Timeout(d)` 限制单次尝试的执行时间。
-- **死信**：尝试次数用完的任务进入死信 stream，带最后一次错误，并调用 `OnFailure` 回调。
-- **接口小**：一个 stream，每个队列一个 consumer，直接使用 `nats.go`。嵌入式还是独立 NATS 由应用决定。
-
-要求 nats-server **2.14+**（推荐 2.15）、Go 1.27+。
+需要 Go 1.27+；NATS 驱动需要启用 JetStream 的 nats-server 2.14+。
 
 ## 安装
 
@@ -19,99 +15,175 @@ jetq 是基于 [NATS JetStream](https://docs.nats.io/nats-concepts/jetstream) �
 go get github.com/runforyou-ai/jetq
 ```
 
-0.4 版本删除 `Cron` 和 `Schedule.In`；升级前请阅读[迁移说明](CHANGELOG.md#v040)。
+## 使用
 
-## 用法
+可直接编译的完整示例见 [example_test.go](example_test.go)。
 
 ```go
-type WelcomeEmail struct {
-	UserID int64 `json:"user_id"`
+type Email struct {
+	To      string `json:"to"`
+	Subject string `json:"subject"`
 }
 
-q, err := jetq.New(ctx, js) // js 为 jetstream.JetStream，按需创建 stream
+// Task 是稳定任务名加默认策略；它不绑定队列、连接或驱动。
+var SendEmail = jetq.MustTask[Email]("email.send", jetq.Policy{
+	MaxAttempts: 3,
+	Timeout:     jetq.TimeoutOf(30 * time.Second),
+	Backoff:     jetq.ExponentialBackoff(time.Second, time.Minute),
+})
 
-// 在数据库事务提交后投递。
-id, err := q.EnqueueNamed(ctx, "welcome-email", WelcomeEmail{UserID: 42},
-	jetq.OnQueue("mail"),
-	jetq.Delay(10*time.Minute),   // 或 jetq.At(t)
-	jetq.UniqueUntilDone("welcome-42"), // 同键任务结束前重复投递返回 ErrDuplicate；jetq.Unique(key) 按时间窗口去重
-	// jetq.JobID(id) 自行指定任务编号，例如投递前先保存它
-)
-// errors.Is(err, jetq.ErrUncertain)：任务可能已投递也可能没有（超时、连接断开）；此时仍返回 id。
-// UniqueUntilDone 任务会再发布一次以确定结果（ctx 已取消也会），仍无法确定时保留键直到任务结束或锁过期。
-_ = q.Cancel(ctx, id)            // 取消尚未到点的延迟任务
+// Provision 每个部署执行一次；Provision 与 Open 都会校验共享参数。
+cfg := natsq.Config{Namespace: "prod", Replicas: 3}
+if _, err := natsq.Provision(ctx, js, cfg); err != nil { ... }
+driver, err := natsq.Open(ctx, js, cfg)
 
-// 定时任务：各实例启动时传入同一份完整清单。
-err = q.SyncSchedules(ctx,
-	jetq.Schedule{Key: "daily-report", Cron: "0 2 * * *", Name: "daily-report", Payload: DailyReport{}, Timezone: "Asia/Shanghai"},
-	jetq.Schedule{Key: "sweep", Cron: "@every 30s", Name: "sweep", Payload: Sweep{}, Queue: "maintenance"},
-)
+// 生产者。
+client, err := jetq.NewClient(driver, jetq.WithMaxPayloadBytes(256<<10))
+res, err := jetq.SubmitTask(ctx, client, SendEmail,
+	Email{To: "a@example.com", Subject: "Welcome"},
+	jetq.Submission{Queue: "mail", EnqueueKey: "welcome:a@example.com"})
+// errors.Is(err, jetq.ErrEnqueueKeyConflict)：该 key 已被不同内容占用。
+// 首次提交 res.Status == jetq.Accepted，幂等重试为 jetq.AlreadyAccepted。
 
-// worker
-w := q.NewWorker(
-	jetq.Queue{Name: "default"},
-	jetq.Queue{Name: "mail", Concurrency: 8, MaxAttempts: 5},
-)
-jetq.HandleNamed(w, "welcome-email", func(ctx context.Context, job WelcomeEmail) error {
-	info, _ := jetq.JobInfo(ctx) // 任务编号、尝试次数、队列、消息头……
-	return send(ctx, job.UserID)
-}, jetq.OnFailure(func(ctx context.Context, job WelcomeEmail, err error) {
-	// 记录最终失败。
-}))
-err = w.Run(ctx) // 阻塞；取消后等待正在执行的任务
+// 消费者，可以在独立进程中。
+worker := client.NewWorker(jetq.Queue{Name: "mail", Concurrency: 4})
+jetq.Handle(worker, SendEmail, func(ctx context.Context, e Email) error {
+	return send(ctx, e)
+})
+err = worker.Run(ctx) // 阻塞，直到 ctx 取消且运行中的 handler 返回
 ```
 
-### 预配置资源与事务 outbox
+### 同一任务投递到多个队列
 
-`jetq.ResourceConfigs(options...)` 返回任务流、死信流与状态桶定义，不写入 NATS。部署工具完成初始化后，应用进程通过 `jetq.Attach(ctx, js, options...)` 读取资源。Attach 校验主题、队列语义和最低保留期限，并保留副本、存储、放置与容量策略。`New` 继续提供自动创建或更新资源的便利入口。
+任务名是查找 handler 的键，队列在每次提交时选择。上面的 `SendEmail` 可以提交到 `mail`、`bulk` 和 `priority`；同一个 worker 可以注册同一个 handler 并服务多个队列（`client.NewWorker(jetq.Queue{Name: "mail"}, jetq.Queue{Name: "bulk"})`）。不同生产者也可以用 `WithDefaultQueue`、`WithDefaultPolicy` 设置各自的默认队列与策略。
 
-outbox 重试必须使用相同载荷、绝对执行时间、`jetq.JobID(id)` 与 `jetq.MsgID(publicationID)`。MsgID 使用 JetStream 去重，并允许同一任务恢复其持有的 UniqueUntilDone 锁；它要求显式 JobID，不能与 Unique 或相对 Delay 组合，固定排期使用 At。与 UniqueUntilDone 组合时，状态桶 TTL 必须覆盖去重窗口，任务结算记录先于唯一锁释放持久化。重复调用确认同一次发布，任务可能已执行完或被取消；取消标记在状态桶 TTL 内对同一发布持续生效，包括超过去重窗口后的重试。收到 ErrUncertain 时保留 outbox 登记，仅在确认发布成功后删除。去重受流的 duplicate window 限制，更晚的重复执行由任务处理器保证业务幂等。
+### Raw 与动态任务名
 
+带类型载荷是常规用法；以下两种形式共享同一 Envelope、执行策略、重试与准入路径：
 
-### 运行时指定任务名
+```go
+// 任务名在运行时才知道，载荷已经是 JSON。
+client.Submit(ctx, "legacy.import", json.RawMessage(`{"id":7}`), jetq.Submission{})
+worker := client.NewWorker(jetq.Queue{Name: "imports"})
+jetq.HandleTask(worker, "legacy.import", func(ctx context.Context, raw json.RawMessage) error { ... })
 
-用 `EnqueueNamed(ctx, name, payload)` 投递普通输入，用 `HandleNamed(w, name, fn, OnFailure(...))` 注册强类型处理函数。需要按原字节读取时，投递 `json.RawMessage` 并用 `w.HandleRaw(name, fn, jetq.OnRawFailure(...))` 注册；载荷必须是合法 JSON。
+// 或者使用带默认策略的 raw 任务值。
+raw := jetq.Raw("legacy.import")
+client.SubmitRaw(ctx, raw, json.RawMessage(`{"id":7}`), jetq.Submission{})
+```
 
-### 类型声明任务名称
+Raw JSON 按字节原样保存，包括空白和 `<` 等字符；空 raw 载荷保存为 `null`。`WithMaxPayloadBytes` 对每条路径（typed、raw、动态、prepared）检查编码后的载荷大小，超限返回 `jetq.ErrPayloadTooLarge`，不会进入驱动。
 
-`Enqueue` 与 `Handle` 也支持实现 `JobName() string` 的类型，适合由输入类型统一声明稳定协议名称的场景。`EnqueueNamed` 与 `HandleNamed` 直接接收名称，普通输入类型无需实现方法。
+### 准备一次、幂等重试
 
-`json.RawMessage` 校验后按原字节传递，空值和 nil 输入编码为 `null`。其他值遵循 `encoding/json`，包括将 `[]byte` 编码为 base64 JSON 字符串。`null` 解码到结构体时得到零值，业务必填字段由处理函数校验。
+`Prepare` / `PrepareTask` 在写入前确定 JobID、绝对运行时间和完整策略。对同一值重复 `SubmitPrepared` 就是 outbox 重试的方式：运行时间不会移动，`EnqueueKey` 保证幂等。
 
-### 查看队列
+```go
+job, err := jetq.PrepareTask(client, SendEmail, email,
+	jetq.Submission{Queue: "mail", Delay: 10 * time.Minute, EnqueueKey: "digest:42"})
+res1, _ := client.SubmitPrepared(ctx, job) // 记录为 now + 10m
+res2, _ := client.SubmitPrepared(ctx, job) // AlreadyAccepted，运行时间不变
+```
 
-`q.Stats(ctx)` 返回每个队列尚未投递（`Ready`）、已投递未结算（`InFlight`，主要是执行中）和死信的任务数，以及待执行的延迟任务数（含等待重试与推迟的任务）和已安装的定时任务数；`q.DeadLetters(ctx, jetq.DeadLetterQuery{...})` 按时间倒序分页读取死信及最后一次错误。
+没有 JobID 且没有 ID 生成器时 `Prepare` 返回错误而不是 panic；同时设置 `RunAt` 与 `Delay`，或 Delay 为负，都会被拒绝。
 
-### 日志上下文
+### 策略优先级
 
-`w.SetLogContext(func(ctx, info) context.Context)` 为 jetq 自身的任务日志和失败回调派生 context，日志处理器可据此附加串联编号、租户等字段。
+解析后的策略由三层合并，优先级从高到低：提交时的 `Policy`、任务默认策略、生产者客户端默认策略（`WithDefaultPolicy`）。零值字段继承下一层；超时例外：`jetq.NoTimeout()` 显式表示“无超时”，不继承。解析后的策略写入 Envelope，消费者严格按生产者解析的结果执行。
 
-### 处理函数的返回值
+### Handler 返回值
 
 | 返回 | 效果 |
 |---|---|
-| `nil` | 完成，从队列移除 |
-| 普通错误 | 按退避重试；次数用完进入死信 |
-| `jetq.RetryAfter(d, err)` | 在 `d` 后重试 |
-| `jetq.Permanent(err)` | 直接进入死信 |
-| `jetq.Snooze(d)` | `d` 后再执行，不计入尝试次数（`Info.Snoozes` 记录推迟次数） |
-| panic | 按错误处理 |
-| 超时 | context 以 `jetq.ErrTimeout` 为原因取消，本次尝试失败 |
+| `nil` | 成功，任务终态。 |
+| error | 按解析后的 backoff 重试，直到 `MaxAttempts`；之后失败。 |
+| `jetq.Permanent(err)` | 立即失败。 |
+| `jetq.RetryAfter(d, err)` | 在 `d` 之后重试。 |
+| `jetq.Snooze(d)` | 推迟到 `d`；准入预算退回，Snooze 不消耗尝试次数。 |
+| panic | 捕获后按错误处理。 |
+| 超时 | handler 的 ctx 以 `jetq.ErrTimeout` 为 cause 取消；无论 handler 返回什么（包括 Snooze 和 Permanent）该次尝试都算失败。 |
 
-等待重试或推迟的任务以延迟任务的形式保存，不会占住队列，也可以用 `Cancel` 取消。worker 没有注册处理函数的任务（例如滚动部署期间）会放回给其他 worker 且不计入尝试次数，超过 `w.SetUnknownJobTimeout`（默认 1 小时）后进入死信。停机超时中断的任务放回队列且不计入尝试次数；不响应取消的处理函数在 10 秒后被放弃。不足 1 秒的重试延迟通过重投实现；延迟任务最早约 250ms 后触发。
+忽略取消的 handler 会在关闭后继续运行，直到 worker 的放弃窗口；它不会结算该任务。
 
-投递语义是**至少一次**，处理函数必须幂等。
+### 超时、关闭与取消
 
-## 部署
+每次尝试都在解析后的超时下运行（`jetq.NoTimeout()` 关闭）。长时间运行的尝试会自动续租，不会仅因为耗时长而被重新投递。`Run` 返回时，worker 在 `SetShutdownTimeout` 内等待运行中的 handler：完成的正常结算，仍在运行的释放但不结算（尝试次数不退回），已领取但未准入的投递被释放。
 
-jetq 只需要一个 `jetstream.JetStream`：
+`Cancel` 只在首次准入前生效：等待中、已排期或 snooze 中的任务变为 canceled，不再投递；运行中的任务不会被中断。
 
-- **单台服务器**：在进程内嵌入 `nats-server`（见 [docs/design.md](docs/design.md#embedding-nats)）。
-- **多台服务器**：使用独立 NATS 或集群；三节点集群配合 `jetq.WithReplicas(3)`。
+### 状态查询与 redrive
 
-## 设计
+```go
+snap, found, err := client.Inspect(ctx, jobID)   // 状态、等待原因、预算、尝试、投递、snooze、最后错误、待完成决定
+page, err := client.ListJobs(ctx, jetq.JobQuery{Queue: "mail", FailedOnly: true, Limit: 50})
+stats, err := client.Stat(ctx)                    // 每队列 ready/running/delayed/failed 计数
+res, err := client.Redrive(ctx, failedID, jetq.RedriveEnqueueKey("redrive:"+failedID))
+```
 
-stream 与主题、投递语义和路线图见 [docs/design.md](docs/design.md)。
+快照不包含后端标识：没有 stream sequence，也没有 KV revision。redrive 不修改原任务；新任务使用新的 `JobID`，记录 `ParentJobID`，并默认继承原任务的任务名、载荷、队列、策略、元数据和唯一规则（可用选项覆盖），但绝不继承原 EnqueueKey。
+
+使用相对 `RedriveDelay` 的 `Redrive` 在调用时就固定了运行时间。要幂等重试这种 redrive，准备一次后重复提交：
+
+```go
+job, err := client.PrepareRedrive(ctx, failedID,
+	jetq.RedriveDelay(time.Hour), jetq.RedriveEnqueueKey("redrive:"+failedID))
+_, err = client.SubmitPrepared(ctx, job) // 重试时再次提交：同一个 replacement，同一运行时间
+```
+
+### 周期调度（NATS 驱动）
+
+调度是对常规提交路径的周期性提交，本身不是任务。每个调度集合由一个 owner 名称拥有，并带有配置版本；同步时必须声明所期望的版本，因此仍运行旧集合的进程无法删除新部署新增的调度。
+
+```go
+var v natsq.ScheduleVersion
+v, err = driver.SyncSchedules(ctx, "billing", v,
+	natsq.Schedule{Key: "daily", Cron: "0 2 * * *", Timezone: "Asia/Shanghai",
+		Task: "invoice.close", Payload: json.RawMessage(`{"region":"cn"}`), Queue: "billing"})
+if errors.Is(err, natsq.ErrVersionConflict) {
+	v, err = driver.CurrentScheduleVersion(ctx, "billing") // 再基于它重新同步
+}
+
+worker.SetScheduler(driver.Scheduler("billing")) // worker 运行调度器并随关闭一起停止
+// 或：driver.Scheduler("billing").Run(ctx)
+```
+
+- `expected` 为 0 时创建集合；owner 已持有不同集合时冲突。
+- `expected` 非 0 时仅在版本匹配时更新，否则返回 `natsq.ErrVersionConflict` 且不写入。
+- 同步已存储的定义是幂等的，返回当前版本。
+- 只有变更或新增的调度会丢失游标；新增一条调度不会跳过另一条已到期的发生。
+- 触发不会改变版本。
+- 每个发生（occurrence）以固定的 JobID、EnqueueKey 和运行时间持久 claim。claim 与提交之间崩溃时，恢复用同一份快照提交；之后修改或删除调度不影响已 claim 的发生。
+- `CatchUp: false`（默认）跳过无调度器运行期间错过的发生并触发到期的那一次；`CatchUp: true` 会从最早开始补发最多 `MaxCatchUp` 次。
+
+### 部署、连接所有权与故障模式
+
+`natsq.Provision` 创建命名空间的账本桶、wake 流与调度支持；`natsq.Open` 校验它们：账本存储类型与副本数必须与配置一致，账本不得允许 direct（follower）读取，wake 流的 subject、retention 和存储必须匹配。`Open` 不会改写不匹配的部署。二者都接收调用方创建、仍归调用方所有的 `jetstream.JetStream`；`Driver.Close` 停止驱动自身的 goroutine，不关闭连接。
+
+KV 账本是权威：wake 消息因发布丢失或崩溃而缺失时，周期账本扫描会发现任务。`Recover`（worker 中由 `Maintain` 调用，也可直接调用）完成已记录的决定、接管 lease 过期的任务、完成丢失的提交，并连同 intent、唯一锁和调度 claim 一起回收过期的终态任务。
+
+## 保证与限制
+
+**至少一次。** 结算结果丢失的任务会再次执行；handler 对其副作用必须幂等。准入预算限制执行次数：预算耗尽的任务直接失败，不再运行 handler。
+
+**提交结果。** `Accepted` 表示任务已持久化；`AlreadyAccepted` 表示同一 `EnqueueKey` 已持有相同内容；`Suppressed` 表示被唯一规则抑制；`Unknown`（伴随 `ErrUncertain`）表示结果未知，用同一 `EnqueueKey` 和同一 prepared 值重试即可。
+
+**EnqueueKey 保留。** 已接受的 key 随任务一起保留和删除；保留期内的重试返回 `AlreadyAccepted`，之后相同内容就是新工作。请使用稳定、由内容派生的 key，并在提交确认前保留 outbox 行。
+
+**唯一规则。** `UniqueModeWindow` 从持有者提交时起抑制窗口时长，无论持有者是否仍运行；`UniqueModeUntilDone` 抑制到持有者成功、失败、被取消或提交被明确拒绝。被抑制的持久回执有独立的短期保留期，不会作为任务出现在查询结果中。
+
+**保留期。** 终态任务保留 `JobRetention`（默认 24h）供查询和 redrive，之后回收。辅助记录（intent、唯一锁、调度 claim）依赖其任务，任务回收时一并删除；无法删除的 claim 会让任务保留到下一轮，避免已回收的任务被重新创建。
+
+**扫描开销。** 驱动没有可投递索引：`Receive` 会列出账本中的任务 key 并读取候选记录，因此领取开销随*保留中*的任务数增长，而不是随可运行任务数增长。保留已完成任务的命名空间在每次接收时都要为它们付出扫描成本；需要时应调小 `JobRetention` 或拆分命名空间。[docs/benchmarks.md](docs/benchmarks.md) 记录了同一台机器上的两个可复现样本（空账本与 1,000 条保留记录），其中包含等待下一次扫描的时间，不是有任务可领取时的领取延迟，也不是端到端延迟。本文不声明吞吐量或稳定性。
+
+**未测量的内容。** 本文不声明吞吐量、延迟或生产稳定性。
+
+## 设计与验证
+
+- [docs/design.md](docs/design.md)：驱动契约、core 与驱动的职责、NATS 的提交/准入/结算/调度协议与安全 GC，以及 PostgreSQL 事务式草图。
+- [docs/validation.md](docs/validation.md)：每条保证对应的测试组，包括进程 kill 测试和每个驱动都运行的 conformance 套件。
+- [CHANGELOG.md](CHANGELOG.md)：本版本变更。
+
+`make test` 运行全套测试（race 检测，180 秒超时），`make lint` 运行静态检查。
 
 ## 许可证
 

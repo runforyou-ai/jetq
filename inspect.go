@@ -3,279 +3,139 @@ package jetq
 import (
 	"context"
 	"errors"
-	"fmt"
-	"slices"
-	"strconv"
-	"strings"
 	"time"
-
-	"github.com/nats-io/nats.go"
-	"github.com/nats-io/nats.go/jetstream"
 )
 
-// Stats is a snapshot of the queue system.
-type Stats struct {
-	// Queues has one entry per queue that a worker has consumed, sorted by name.
-	Queues []QueueStats
-	// Delayed is the number of pending delayed jobs across all queues,
-	// including jobs waiting for a retry or a snooze.
-	Delayed uint64
-	// Schedules is the number of installed recurring schedules.
-	Schedules int
+// JobSnapshot is a point-in-time, driver-neutral view of one logical job. It
+// never contains backend identifiers such as stream sequences or KV
+// revisions: JobID is the only job identity.
+type JobSnapshot struct {
+	// Envelope is a copy of the job's submission-time envelope.
+	Envelope Envelope
+	State    JobState
+	// Wait says why an awaiting job waits.
+	Wait WaitReason
+	// RunAt is the next (or first) execution time; zero for an immediately
+	// due job. Terminal jobs have no run time.
+	RunAt time.Time
+	// Budget is the number of admitted executions minus refunds.
+	Budget int
+	// Attempts is the number of business executions the budget allowed.
+	Attempts int
+	// Deliveries counts physical deliveries, including this one.
+	Deliveries int
+	Snoozes    int
+	// LastError is the failure text of the most recent failed execution.
+	LastError string
+	// PendingDecision is the recorded decision whose follow-up work is not
+	// complete yet, if any.
+	PendingDecision *Decision
+	// Canceled reports that a cancellation was recorded.
+	Canceled bool
+	// UnknownSince is when a worker first found no handler; zero otherwise.
+	UnknownSince time.Time
+	// ParentJobID is set on jobs created by redrive.
+	ParentJobID string
+	// CreatedAt is when the job was submitted, by the producer's clock.
+	CreatedAt time.Time
+	// UpdatedAt is when the driver last changed the record.
+	UpdatedAt time.Time
 }
 
-// QueueStats describes one queue, as counted by its JetStream consumer.
-type QueueStats struct {
+// JobQuery selects jobs for [Inspector.List].
+type JobQuery struct {
+	// Queue limits the result to one queue. Empty means all queues.
 	Queue string
-	// Ready is the number of jobs not yet delivered to any worker.
-	Ready uint64
-	// InFlight is the number of delivered jobs that are not settled yet, mostly
-	// running jobs. Jobs waiting for a retry or a snooze count as [Stats.Delayed].
-	InFlight int
-	// Redelivered is the number of in-flight jobs that have been delivered more
-	// than once, after a worker crash or a failed settlement.
-	Redelivered int
-	// Dead is the number of dead-lettered jobs still kept for this queue.
-	Dead uint64
-}
-
-// Stats reports per-queue counts. Queues appear once a worker has created their consumer.
-func (c *Client) Stats(ctx context.Context) (Stats, error) {
-	var stats Stats
-	dead := map[string]uint64{}
-	deadInfo, err := c.info(ctx, c.cfg.deadName, jetstream.WithSubjectFilter(c.deadSubject(">")))
-	if err != nil {
-		return stats, fmt.Errorf("jetq: dead-letter stats: %w", err)
-	}
-	for subject, n := range deadInfo.State.Subjects {
-		dead[strings.TrimPrefix(subject, c.deadSubject(""))] = n
-	}
-
-	consumers := c.stream.ListConsumers(ctx)
-	for info := range consumers.Info() {
-		queue, ok := strings.CutPrefix(info.Name, "jetq-")
-		if !ok || info.Config.FilterSubject != c.queueSubject(queue) {
-			continue
-		}
-		stats.Queues = append(stats.Queues, QueueStats{
-			Queue:       queue,
-			Ready:       info.NumPending,
-			InFlight:    info.NumAckPending,
-			Redelivered: info.NumRedelivered,
-			Dead:        dead[queue],
-		})
-	}
-	if err := consumers.Err(); err != nil {
-		return stats, fmt.Errorf("jetq: list consumers: %w", err)
-	}
-	slices.SortFunc(stats.Queues, func(a, b QueueStats) int { return strings.Compare(a.Queue, b.Queue) })
-
-	delayed, err := c.info(ctx, c.cfg.streamName, jetstream.WithSubjectFilter(c.delaySubject(">")))
-	if err != nil {
-		return stats, fmt.Errorf("jetq: delayed stats: %w", err)
-	}
-	for _, n := range delayed.State.Subjects {
-		stats.Delayed += n
-	}
-	schedules, err := c.info(ctx, c.cfg.streamName, jetstream.WithSubjectFilter(c.cronSubject(">")))
-	if err != nil {
-		return stats, fmt.Errorf("jetq: schedule stats: %w", err)
-	}
-	stats.Schedules = len(schedules.State.Subjects)
-	return stats, nil
-}
-
-// DeadLetter is a job that ran out of attempts or failed permanently.
-type DeadLetter struct {
-	// Sequence identifies the entry in the dead-letter stream; pass it as
-	// [DeadLetterQuery.Before] to page backwards.
-	Sequence   uint64
-	ID         string
-	Name       string
-	Queue      string
-	Attempts   int
-	Error      string
-	FailedAt   time.Time
-	EnqueuedAt time.Time
-	Header     nats.Header
-	Payload    []byte
-}
-
-// DeadLetterQuery selects dead letters, newest first.
-type DeadLetterQuery struct {
-	// Queue limits results to one queue; empty means all queues.
-	Queue string
-	// Before only returns entries with a lower sequence; zero means from the newest.
-	Before uint64
-	// Limit is the maximum number of entries (default 50).
+	// State limits the result to one logical state. Empty means all states.
+	State JobState
+	// FailedOnly selects jobs in the failed state.
+	FailedOnly bool
+	// After is the JobID after which the page starts (exclusive); use the
+	// LastJobID of a page to fetch the next one.
+	After string
+	// Limit is the page size; zero means the driver's default.
 	Limit int
 }
 
-// DeadLetters returns dead-lettered jobs, newest first.
-//
-// Without a queue filter it reads the newest Limit entries below the cursor
-// in one pass, plus one more for each stretch of deleted entries it has to
-// step over. With a queue filter it reads that queue's dead letters in batches
-// up to the cursor, so its cost grows with the number of dead letters kept for
-// that queue.
-func (c *Client) DeadLetters(ctx context.Context, query DeadLetterQuery) ([]DeadLetter, error) {
-	if query.Limit <= 0 {
-		query.Limit = 50
-	}
-	if query.Queue != "" {
-		if err := validName("queue", query.Queue); err != nil {
-			return nil, err
-		}
-		return c.queueDeadLetters(ctx, query)
-	}
-	info, err := c.info(ctx, c.cfg.deadName)
-	if err != nil {
-		return nil, fmt.Errorf("jetq: dead letters: %w", err)
-	}
-	first, last := info.State.FirstSeq, info.State.LastSeq
-	if query.Before > 0 && query.Before-1 < last {
-		last = query.Before - 1
-	}
-	var out []DeadLetter
-	// Read the window of sequences just below the cursor; deleted entries leave
-	// gaps, so step further back until enough entries are found.
-	for end := last; end > 0 && end >= first && len(out) < query.Limit; {
-		start := first
-		if need := uint64(query.Limit - len(out)); end-first >= need {
-			start = end - need + 1
-		}
-		batch, err := c.readDeadLetters(ctx, start, end)
-		if err != nil {
-			return nil, fmt.Errorf("jetq: dead letters: %w", err)
-		}
-		for i := len(batch) - 1; i >= 0 && len(out) < query.Limit; i-- {
-			out = append(out, batch[i])
-		}
-		end = start - 1
-	}
-	return out, nil
+// JobPage is one page of [Inspector.List], ordered by JobID.
+type JobPage struct {
+	Jobs []JobSnapshot
+	// LastJobID is the JobID to pass as JobQuery.After for the next page; it
+	// is empty when the page is the last one.
+	LastJobID string
 }
 
-// readDeadLetters reads the dead letters with sequences from start to end in
-// one pass of an ordered consumer, oldest first.
-func (c *Client) readDeadLetters(ctx context.Context, start, end uint64) ([]DeadLetter, error) {
-	consumer, err := c.js.OrderedConsumer(ctx, c.cfg.deadName, jetstream.OrderedConsumerConfig{
-		FilterSubjects:    []string{c.deadSubject(">")},
-		DeliverPolicy:     jetstream.DeliverByStartSequencePolicy,
-		OptStartSeq:       start,
-		InactiveThreshold: 30 * time.Second,
-	})
-	if err != nil {
-		return nil, err
-	}
-	info, err := consumer.Info(ctx)
-	if err != nil {
-		return nil, err
-	}
-	var out []DeadLetter
-	if info.NumPending == 0 {
-		return out, nil
-	}
-	messages, err := consumer.Messages(jetstream.PullMaxMessages(int(min(end-start+1, 256))))
-	if err != nil {
-		return nil, err
-	}
-	defer messages.Stop()
-	for {
-		msg, err := nextDeadLetter(ctx, messages)
-		if err != nil {
-			return nil, err
-		}
-		meta, err := msg.Metadata()
-		if err != nil {
-			return nil, err
-		}
-		if meta.Sequence.Stream > end {
-			return out, nil
-		}
-		out = append(out, deadLetter(meta.Sequence.Stream, msg.Headers(), msg.Data()))
-		if meta.Sequence.Stream == end || meta.NumPending == 0 {
-			return out, nil
-		}
-	}
+// QueueStats is a count of jobs waiting in one queue.
+type QueueStats struct {
+	Queue string
+	// Ready counts jobs that are due now.
+	Ready int
+	// Delayed counts jobs awaiting a retry, snooze, release or schedule.
+	Delayed int
+	// Running counts jobs whose execution is in progress.
+	Running int
+	// Failed counts failed jobs that are still retained.
+	Failed int
 }
 
-// queueDeadLetters reads one queue's dead letters below the cursor through an
-// ordered consumer, keeping the newest query.Limit entries.
-func (c *Client) queueDeadLetters(ctx context.Context, query DeadLetterQuery) ([]DeadLetter, error) {
-	consumer, err := c.js.OrderedConsumer(ctx, c.cfg.deadName, jetstream.OrderedConsumerConfig{
-		FilterSubjects:    []string{c.deadSubject(query.Queue)},
-		InactiveThreshold: 30 * time.Second,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("jetq: dead letters: %w", err)
-	}
-	info, err := consumer.Info(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("jetq: dead letters: %w", err)
-	}
-	var window []DeadLetter
-	if info.NumPending == 0 {
-		return window, nil
-	}
-	messages, err := consumer.Messages(jetstream.PullMaxMessages(256))
-	if err != nil {
-		return nil, fmt.Errorf("jetq: dead letters: %w", err)
-	}
-	defer messages.Stop()
-	// Stop after the entries that existed when the query started, even while new dead letters arrive.
-	for remaining := info.NumPending; remaining > 0; remaining-- {
-		msg, err := nextDeadLetter(ctx, messages)
-		if err != nil {
-			return nil, fmt.Errorf("jetq: dead letters: %w", err)
-		}
-		meta, err := msg.Metadata()
-		if err != nil {
-			return nil, fmt.Errorf("jetq: dead letters: %w", err)
-		}
-		if query.Before > 0 && meta.Sequence.Stream >= query.Before {
-			break
-		}
-		window = append(window, deadLetter(meta.Sequence.Stream, msg.Headers(), msg.Data()))
-		if len(window) > query.Limit {
-			window = window[1:]
-		}
-		if meta.NumPending == 0 {
-			break
-		}
-	}
-	slices.Reverse(window)
-	return window, nil
+// Stats is a snapshot of the queue system.
+type Stats struct {
+	// Queues has one entry per queue with jobs, sorted by name.
+	Queues []QueueStats
+	// Succeeded and Canceled count retained terminal jobs.
+	Succeeded int
+	Canceled  int
 }
 
-// deadLetterWait bounds the wait for the next entry of a dead-letter read.
-const deadLetterWait = 5 * time.Second
-
-// nextDeadLetter returns the next message of a dead-letter read. Entries
-// deleted while reading would leave it waiting for new ones, so it fails after
-// deadLetterWait without a message.
-func nextDeadLetter(ctx context.Context, messages jetstream.MessagesContext) (jetstream.Msg, error) {
-	nextCtx, cancel := context.WithTimeout(ctx, deadLetterWait)
-	defer cancel()
-	msg, err := messages.Next(jetstream.NextContext(nextCtx))
-	if err != nil && ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
-		return nil, fmt.Errorf("no entry within %s, entries may have been deleted while reading: %w", deadLetterWait, err)
-	}
-	return msg, err
+// Inspector is the optional, driver-neutral inspection extension. Drivers
+// implement it when they can read job state; an application checks for it
+// rather than assuming it.
+type Inspector interface {
+	// GetJob returns the job with the given id, or false when no such job is
+	// retained.
+	GetJob(ctx context.Context, jobID string) (JobSnapshot, bool, error)
+	// List returns one page of jobs matching q.
+	List(ctx context.Context, q JobQuery) (JobPage, error)
+	// Stats returns counts per queue and per terminal state.
+	Stats(ctx context.Context) (Stats, error)
 }
 
-func deadLetter(seq uint64, h nats.Header, data []byte) DeadLetter {
-	entry := DeadLetter{
-		Sequence: seq,
-		ID:       h.Get(HeaderID),
-		Name:     h.Get(HeaderJob),
-		Queue:    h.Get(HeaderQueue),
-		Error:    h.Get(HeaderError),
-		Header:   h,
-		Payload:  data,
+// ErrNotSupported is returned by an optional capability a driver does not
+// implement.
+var ErrNotSupported = errors.New("jetq: capability not supported by this driver")
+
+// Inspector returns the driver's inspection extension, or [ErrNotSupported]
+// when the driver does not implement it.
+func (c *Client) Inspector() (Inspector, error) {
+	if i, ok := c.driver.(Inspector); ok {
+		return i, nil
 	}
-	entry.Attempts, _ = strconv.Atoi(h.Get(HeaderAttempts))
-	entry.FailedAt, _ = time.Parse(time.RFC3339Nano, h.Get(HeaderFailedAt))
-	entry.EnqueuedAt, _ = time.Parse(time.RFC3339Nano, h.Get(HeaderEnqueuedAt))
-	return entry
+	return nil, ErrNotSupported
+}
+
+// Inspect returns a snapshot of one job through the driver's [Inspector].
+func (c *Client) Inspect(ctx context.Context, jobID string) (JobSnapshot, bool, error) {
+	i, err := c.Inspector()
+	if err != nil {
+		return JobSnapshot{}, false, err
+	}
+	return i.GetJob(ctx, jobID)
+}
+
+// ListJobs returns one page of jobs through the driver's [Inspector].
+func (c *Client) ListJobs(ctx context.Context, q JobQuery) (JobPage, error) {
+	i, err := c.Inspector()
+	if err != nil {
+		return JobPage{}, err
+	}
+	return i.List(ctx, q)
+}
+
+// Stat returns counters through the driver's [Inspector].
+func (c *Client) Stat(ctx context.Context) (Stats, error) {
+	i, err := c.Inspector()
+	if err != nil {
+		return Stats{}, err
+	}
+	return i.Stats(ctx)
 }
