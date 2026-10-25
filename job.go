@@ -3,40 +3,44 @@ package jetq
 import (
 	"context"
 	"time"
+
+	"github.com/nats-io/nats.go"
 )
 
-// DefaultQueue is the queue used when neither the producer nor the
-// submission names one.
-const DefaultQueue = "default"
+// Job is a unit of background work. Its exported fields are encoded as JSON.
+//
+// JobName must return a stable name that identifies the job type across
+// deploys; renaming it orphans jobs already in the queue. It is called on the
+// zero value, so it must not depend on field values.
+type Job interface {
+	JobName() string
+}
 
-// Info describes an execution a handler runs. Retrieve it with [JobInfo].
+// Info describes the job being processed. Retrieve it with [JobInfo].
 type Info struct {
-	// ID is the logical job id, stable across retries and snoozes.
+	// ID is assigned at enqueue time. Jobs fired by a recurring schedule get
+	// "<schedule key>-<stream sequence>".
 	ID string
-	// Name is the task name used to find the handler.
+	// Name is the stable job name supplied explicitly or returned by [Job.JobName].
 	Name string
 	// Queue is the queue the job was taken from.
 	Queue string
-	// Attempt is the 1-based business execution number, including this one.
+	// Attempt is the 1-based delivery attempt, including redeliveries after a worker crash.
 	Attempt int
-	// MaxAttempts is the execution budget fixed at submission.
+	// MaxAttempts is the number of attempts after which the job is dead-lettered.
 	MaxAttempts int
-	// Timeout is how long this execution may run (zero: no limit).
+	// Timeout is how long this attempt may run (zero: no limit), from
+	// [Queue.Timeout] or [Timeout].
 	Timeout time.Duration
-	// Snoozes is how many times the job was snoozed.
+	// Snoozes is how many times the job was snoozed with [Snooze], for example
+	// to give up after a number of snoozes.
 	Snoozes int
-	// Deliveries is the number of physical deliveries of the job, including
-	// this one.
-	Deliveries int
-	// EnqueuedAt is when the submission was prepared, by the producer's clock.
+	// EnqueuedAt is when [Client.Enqueue] was called, by the producer's clock;
+	// for a delayed job that is before it became available. It is zero for jobs
+	// fired by a recurring schedule.
 	EnqueuedAt time.Time
-	// RunAt is the first execution time fixed at submission; zero means the
-	// job was due immediately.
-	RunAt time.Time
-	// Metadata is a copy of the job's metadata owned by the handler.
-	Metadata Metadata
-	// ParentJobID is set on a job created by redrive.
-	ParentJobID string
+	// Header carries the message headers, including headers set with [WithHeader].
+	Header nats.Header
 }
 
 type infoKey struct{}

@@ -1,99 +1,76 @@
 # Changelog
 
-## v0.5.0
+## v0.4.1
 
-This release rebuilds jetq around a driver-neutral contract. The root package
-depends only on the Go standard library; `natsq` implements the contract on NATS
-JetStream as a KeyValue ledger. There is no compatibility layer for the previous
-API: callers migrate by compiling.
+- Add read-only binding to pre-provisioned JetStream resources (`Attach` / resource configs) so hosts can validate streams without recreating them.
+- Stabilize publish retries for uniquely keyed jobs: bind settlement receipts to the original lock revision, persist unique-job settlement, and recover locks by publisher identity.
+- Keep cancellation markers independent of unique locks; cover lost-ack retries without deleting a reused job's lock by mistake.
 
-### Submission
+## v0.4.0
 
-- `Task[T]` declares a stable task name and default policy without binding a
-  queue, connection or driver. `SubmitTask`, `Submit`, `SubmitRaw` and the dynamic
-  name path resolve the same envelope and execution policy.
-- `Prepare`/`PrepareTask` and `PrepareRedrive` fix the job id, the absolute run
-  time (including a relative delay) and the resolved policy, so repeating
-  `SubmitPrepared` is an idempotent retry that keeps the original run time.
-- `EnqueueKey` idempotency: the same key with the same content returns
-  `AlreadyAccepted`; different content returns `ErrEnqueueKeyConflict`.
-- `Suppressed` is a final outcome for unique-rule suppression and is retained
-  for replay within the key's retention.
-- `WithMaxPayloadBytes` bounds the encoded payload of every submission path;
-  oversized payloads return `ErrPayloadTooLarge` before reaching the driver.
-- Payload bytes are preserved: envelopes persist the payload as opaque bytes, so
-  whitespace, key order and characters such as `<` survive, and a prepared job
-  restored from JSON keeps its fingerprint.
-
-### Execution
-
-- `Handle`, `HandleTask`, `HandleRaw` and `OnFailure` register typed, explicitly
-  named and raw JSON handlers on a worker; middleware via `Worker.Use`.
-- Policy priority: submission, task defaults, producer defaults. `NoTimeout()`
-  disables the timeout explicitly; a timeout fails the attempt whatever the
-  handler returns.
-- `Permanent`, `RetryAfter` and `Snooze` classify handler results; a snooze and a
-  shutdown release refund the admission budget exactly once. The budget bounds
-  how often a job runs, including after lost settlement responses.
-- Admission, extension and settlement are separate operations. Extending a lease
-  is not blocked by a concurrent settlement; long jobs renew until settlement
-  completes.
-- Graceful shutdown finishes running handlers within the shutdown timeout and
-  releases the rest; handlers that ignore cancellation are abandoned after a
-  bounded window.
-- Unknown handlers defer without spending budget and fail after the unknown
-  task timeout.
-
-### Inspection, redrive, schedules
-
-- `Inspector` (`Client.Inspect`, `ListJobs`, `Stat`) returns neutral snapshots:
-  state, wait reason, budget, attempts, deliveries, snoozes, last error, pending
-  decision, and no backend identifiers.
-- `Redrive`/`PrepareRedrive` create a replacement for a failed job with a new
-  id and `ParentJobID`; the original is untouched, the parent's enqueue key is
-  never inherited, and a prepared redrive is idempotent across retries.
-- Schedules (NATS extension) are owned sets with a configuration version.
-  `SyncSchedules(ctx, owner, expected, ...)` writes only on the expected version
-  and returns the new one; a stale sync returns `ErrVersionConflict` and changes
-  nothing. Firing does not change the version, and adding a schedule preserves
-  the cursors of unchanged ones. Every occurrence is claimed with an immutable
-  prepared job, so a crash is repaired without using a changed definition.
-- `CatchUp` controls whether occurrences missed while no scheduler ran are
-  skipped or replayed up to `MaxCatchUp`.
-
-### NATS driver
-
-- KeyValue is authoritative; the wake stream only shortens claim latency.
-- `Provision` creates resources and disables direct reads on the ledger stream;
-  `Open` validates storage, replicas, wake subjects and leader-consistent reads
-  without rewriting them.
-- Safe collection: a terminal job and its intent, unique lock and schedule claim
-  are removed in dependency order; while a claim exists the job is retained, so
-  a collected job is never recreated.
-- `Recover`/`Maintain` finish recorded decisions, take over expired claims,
-  complete lost submissions and run retention.
-
-### Testing and documentation
-
-- `drivertest` provides a reusable conformance suite; `natsq` runs it against a
-  real server.
-- Process-kill tests SIGKILL a worker after a durable admission, a durable
-  decision and a durable snooze, and verify recovery in another process.
-- README, design and validation docs describe the final interfaces, behaviour,
-  limits and the tests behind each guarantee.
+- Add `EnqueueNamed` and `HandleNamed` for explicit, stable job names and ordinary JSON payload types. `OnFailure` accepts ordinary types too.
+- Configure recurring jobs with exported `Schedule` fields: `Key`, `Cron`, `Timezone`, `Name`, `Payload`, `Queue`, `MaxAttempts`, `Timeout` and `Header`. One-off enqueue options cannot be passed to schedules.
+- Document the package independently, with named payloads as the primary examples.
 
 ### Migration
 
-- Replace `jetq.New`/`Attach` usage with `natsq.Provision` (deployment) and
-  `natsq.Open` (application).
-- Replace `EnqueueNamed` with `SubmitTask`/`Submit`; replace `HandleNamed` with
-  `Handle`/`HandleTask`; replace `OnFailure` option style with the same names on
-  the worker.
-- Replace `Queue{MaxAttempts, Backoff, Timeout}` worker settings with task or
-  submission policies.
-- Replace `SyncSchedules(ctx, schedules...)` with
-  `SyncSchedules(ctx, owner, expectedVersion, schedules...)` and track the
-  returned version.
-- Replace `Cron`/`Schedule.In` with `natsq.Schedule{Key, Cron, Timezone, Task,
-  Payload, Queue, Policy}` registered through the driver.
-- `Cancel` now applies only before the first admission.
+`Cron` and `Schedule.In` have been removed; callers must migrate to compile. Replace `Cron(key, spec, job, ...).In(zone)` with `Schedule{Key: key, Cron: spec, Name: name, Payload: job, Timezone: zone}` and set queue, attempt, timeout and header fields directly. `Enqueue` and `Handle` remain available for types implementing `JobName`. Existing stored jobs and schedules use the same wire format.
+
+For a schedule, replace `WithHeader("traceparent", value)` with `Header: nats.Header{"Traceparent": []string{value}}`, `OnQueue(queue)` with `Queue: queue`, and `MaxAttempts(n)` with `MaxAttempts: n`. Set `Timeout` to a duration pointer to override the worker timeout (zero disables it); nil inherits the worker setting. Negative schedule attempts and timeouts are rejected.
+
+## v0.3.0
+
+- Jobs waiting for a retry of a second or more are put back as delayed jobs
+  instead of being nak'ed with a delay, so they no longer count against the consumer's
+  `MaxAckPending`: a backlog of failing jobs no longer stalls a queue. They
+  count as `Stats.Delayed` instead of `InFlight` and can be cancelled.
+- Jobs interrupted by the shutdown timeout are put back without using up an
+  attempt.
+- Jobs without a registered handler are put back for other workers without
+  using up an attempt and dead-lettered after `Worker.SetUnknownJobTimeout`
+  (default 1h).
+- `Queue.Timeout` and the `Timeout` enqueue option bound an attempt
+  (`ErrTimeout`); handlers that ignore cancellation are abandoned after 10
+  seconds, so `Worker.Run` returns even then.
+- `Info.Timeout` and `Info.Snoozes`.
+- `Enqueue` errors wrap `ErrUncertain` when the job may have been stored, and
+  the job id is returned with them; other errors mean it was not stored. A
+  `UniqueUntilDone` job is published a second time with the same message id to
+  resolve such an outcome and releases its lock when the publish was certainly
+  not stored. A context that is already done fails `Enqueue` before anything
+  is published. `Unique` keys starting with `jetq-` are reserved.
+- `Enqueue` returns `ErrJobIDInUse` instead of replacing a pending delayed job
+  with the same `JobID`; retries and snoozes never replace one either and are
+  redelivered after their delay instead, which counts as an attempt.
+- `DeadLetters` without a queue filter reads a page through one ordered
+  consumer instead of one request per entry; reads fail when no entry arrives
+  within 5 seconds instead of waiting.
+- Dead-letter copies are deduplicated per delivered message; `OnFailure`
+  logs payloads that do not decode; keep-alives are sent at least every 5
+  seconds; workers recreate their consumer after fetch failures.
+
+## v0.2.0
+
+- `UniqueUntilDone` deduplicates a job by key until it settles, with locks in a
+  key-value bucket (`WithUniqueLockTTL`).
+- `Cancel` records the cancellation in the `<STREAM>_STATE` key-value bucket,
+  so workers skip a copy the schedule published while it ran; when it returns
+  nil the job does not run. The bucket is
+  created on first use; clients need permission to create it and to use
+  `$KV.<STREAM>_STATE.>`.
+
+## v0.1.1
+
+- `Worker.SetLogContext` derives the context of jetq's job log records and failure callbacks.
+
+## v0.1.0
+
+- `RawJob` and `Worker.HandleRaw` for job names known only at runtime; raw
+  payloads are delivered byte for byte.
+- `JobID` enqueue option to choose the job id.
+- `Client.Stats` and `Client.DeadLetters` for monitoring.
+
+- Initial release: typed jobs, queues with concurrency, retries with backoff,
+  `Permanent`, `RetryAfter`, `Snooze`, dead-letter stream with failure
+  callbacks, `Unique`, delayed jobs with `Cancel`, server-side cron schedules
+  with time zones, middleware, graceful shutdown and the `jetqtest` helper.
