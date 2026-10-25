@@ -386,22 +386,20 @@ func (s *suite) jobIDInUse(t *testing.T) {
 
 func (s *suite) uniqueUntilDone(t *testing.T) {
 	d := s.driver(t)
-	first := message(t, "q", jobq.Unique("k"))
-	enqueue(t, d, first)
+	enqueue(t, d, message(t, "q", jobq.Unique("k")))
 	if err := d.Enqueue(ctx(t), message(t, "q", jobq.Unique("k"))); !errors.Is(err, jobq.ErrDuplicate) {
 		t.Fatalf("second unique enqueue = %v, want ErrDuplicate", err)
 	}
-	enqueue(t, d, message(t, "q", jobq.Unique("other")))
-	l := claimOne(t, d, "q", time.Minute, 5*time.Second)
-	for l.Message().ID != first.ID {
-		must(t, l.Complete(ctx(t)))
-		l = claimOne(t, d, "q", time.Minute, 5*time.Second)
-	}
+	// Another key is independent.
+	enqueue(t, d, message(t, "other", jobq.Unique("other")))
+
 	// Retrying keeps the key.
+	l := claimOne(t, d, "q", time.Minute, 5*time.Second)
 	must(t, l.Retry(ctx(t), time.Now(), "again"))
 	if err := d.Enqueue(ctx(t), message(t, "q", jobq.Unique("k"))); !errors.Is(err, jobq.ErrDuplicate) {
 		t.Fatalf("enqueue while retrying = %v, want ErrDuplicate", err)
 	}
+	// Completing releases it.
 	l = claimOne(t, d, "q", time.Minute, 5*time.Second)
 	must(t, l.Complete(ctx(t)))
 	enqueue(t, d, message(t, "q", jobq.Unique("k")))

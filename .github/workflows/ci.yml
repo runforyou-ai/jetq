@@ -11,25 +11,36 @@ permissions:
 
 jobs:
   test:
-    name: Test
+    name: Test ${{ matrix.module }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [".", "natsq"]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version-file: ${{ matrix.module }}/go.mod
       - name: Test
+        working-directory: ${{ matrix.module }}
         run: go test -race -count=1 ./...
 
   lint:
-    name: Lint
+    name: Lint ${{ matrix.module }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [".", "natsq"]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version-file: ${{ matrix.module }}/go.mod
       - run: go vet ./...
+        working-directory: ${{ matrix.module }}
       - uses: golangci/golangci-lint-action@v9
         with:
           version: v2.14.0
+          working-directory: ${{ matrix.module }}

@@ -209,22 +209,62 @@ dead letter to `pending` with `attempt = 0`.
 
 ## NATS driver (natsq)
 
-natsq keeps jetq 0.x's storage layout. It maps the contract as follows:
+### Storage
 
-| Contract | JetStream |
+| Resource | Contents |
 |---|---|
-| `Enqueue` | Publish to `<prefix>.q.<queue>`, or as a schedule message on `<prefix>.at.<id>` when delayed. Job ids and unique keys are claimed in the state bucket. |
-| `Claim` | Fetch from the queue's durable pull consumer, up to `max`. `AckWait` is the lease. |
-| `Attempt` | Delivery count plus the attempt base carried in a header. |
-| `Extend` | `InProgress` |
-| `Complete` | Release the unique key and job id, then `Ack`. |
-| `Retry` / `Release` | Republish with the new attempt base (delayed when `at` is in the future), then `Ack`. |
-| `Fail` | Copy to `<STREAM>_DEAD`, release the key, then `Ack`. |
-| `Cancel` | Cancel marker plus deleting the schedule message (as in 0.x). |
-| `Scheduler` | Server-side message schedules on `<prefix>.cron.<key>`. |
+| Stream `JOBQ` (work queue, message schedules) | `<prefix>.q.<queue>` ready jobs, `<prefix>.at.<queue>.<id>` delayed jobs, `<prefix>.cron.<key>` schedules |
+| KV `JOBQ_STATE` | `job.<id>` state record per unfinished job, `uniq.<hash>` unique-key locks (per-key TTL) |
+| Stream `JOBQ_DEAD` (limits, MaxAge 14d) | `<prefix>.dead.<queue>` dead letters |
 
-The outbox-oriented `MsgID` option of 0.x is dropped. Use pgq with
-`EnqueueTx` when enqueueing must be transactional with database writes.
+Each queue has one durable pull consumer. Its `AckWait` is the shortest
+lease asked for on that queue.
+
+A message body is an 8-byte header length, the JSON envelope (id, name,
+queue, header, attempts and timeout overrides, snoozes, unique key, schedule
+key, generation), and then the payload unchanged.
+
+### The state record is the authority
+
+JetStream acks are not tied to a delivery. After a redelivery, a slow
+worker's ack would settle the newer claim. natsq therefore fences
+everything with a KV record per job:
+
+```
+{attempt, running, lease_until, lease_start, seq, gen, queue, unique_key, unique_for, canceled, finished_at, last_error}
+```
+
+- **Generation.** Every publish of a job (enqueue, retry, release) gets a
+  new `gen`. It is written to the record *before* the publish. A delivery
+  whose envelope `gen` differs from the record's is a stale copy, left
+  behind by a lost ack, a failed or uncertain publish, or a cancel, and it
+  is terminated on sight.
+- **Claim.** Read the record. Drop the delivery if it is stale, cancelled
+  or finished. If NATS redelivered early, while the record's lease still
+  runs, nak it until the lease ends. Otherwise CAS `attempt+1, running,
+  lease_until`.
+- **Extend.** `InProgress`, then CAS `lease_until`.
+- **Complete / Fail.** CAS-check the claim, store the dead letter (Fail),
+  delete the record, release the unique key, then ack. A lost ack is
+  harmless: the redelivery finds no record.
+- **Retry / Release.** CAS the record to `pending, attempt (or attempt-1),
+  new gen`, publish the new copy (delayed with `@at` when needed), record
+  its sequence, then ack. If the publish fails outright, the old
+  generation is restored and the delivery nak'ed, so the job is not lost.
+- **Cancel.** CAS the record away (or mark it cancelled while running),
+  delete the pending message, and release the key. Every remaining copy is
+  then stale.
+- **Enqueue.** Check the id (an unfinished record means `ErrJobIDInUse`),
+  take the unique key, create the record, then publish. After an uncertain
+  publish, the record and the lock stay in place.
+- **Schedules.** Server-side message schedules fire into the queue subject.
+  The first claim of an occurrence derives its id, `<key>-<stream
+  sequence>`, and creates the record. An id that is already taken skips the
+  occurrence.
+
+Lease expiry is judged by process clocks, with the server's message
+timestamp as a cross-check. Keep clocks synchronised to within a few
+seconds.
 
 ## Deferred
 
