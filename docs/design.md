@@ -1,318 +1,234 @@
-# jetq design
+# jobq design
 
 ## Goals
 
-- A Go job queue with explicit names, typed handlers and NATS JetStream storage.
-- Let the NATS server do the hard parts: persistence, redelivery, delays and
-  cron.
-- Keep the library database-agnostic. A transactional outbox is an optional
-  add-on (see [Roadmap](#roadmap)).
+- One job queue API for Go with interchangeable storage drivers: NATS
+  JetStream (`jobq/natsq`), PostgreSQL (`jobq/pgq`) and memory (`jobq/memq`).
+- The same semantics on every driver for retries, backoff, snoozes,
+  timeouts, unknown jobs and shutdown. They live in the core package, and
+  drivers only record state transitions.
+- A thin driver contract, checked by a shared conformance suite
+  (`jobq/drivertest`).
+- Separate Go modules for each driver, so an application only pulls in the
+  dependencies of the drivers it uses.
 
-## Streams and subjects
+## Modules
 
-`jetq.New` creates or updates two streams. The subject prefix (default `jetq`)
-and stream name (default `JETQ`) are configurable.
+| Module | Contents | Dependencies |
+|---|---|---|
+| `github.com/runforyou-ai/jobq` | Client, Worker, Driver contract, cron parser, `memq`, `drivertest` | standard library |
+| `github.com/runforyou-ai/jobq/natsq` | JetStream driver | nats.go, nats-server (tests) |
+| `github.com/runforyou-ai/jobq/pgq` | PostgreSQL driver | pgx/v5 |
 
-| Stream | Subjects | Retention | Purpose |
-|---|---|---|---|
-| `JETQ` | `jetq.q.<queue>` | WorkQueue | Runnable jobs. |
-|  | `jetq.at.<job id>` |  | Pending delayed jobs (server schedule messages). |
-|  | `jetq.cron.<key>` |  | Recurring schedules. |
-| `JETQ_DEAD` | `jetq.dead.<queue>` | Limits, MaxAge 14d | Dead-lettered jobs. |
-
-All queues share the work stream. Message schedules require the schedule
-message and its target to live in the same stream, so a shared stream lets a
-delayed job or schedule target any queue. The work stream enables
-`AllowMsgSchedules` and `AllowRollup`; it never uses `DiscardNew`, which
-message scheduling does not support.
-
-Each queue is a durable pull consumer `jetq-<queue>` filtered on
-`jetq.q.<queue>` with explicit acks. Schedule subjects match no consumer, so
-schedule messages stay in the stream until they fire or are cancelled.
-
-## Message format
-
-The body is the job encoded as JSON. Headers:
-
-| Header | Meaning |
-|---|---|
-| `Jetq-Job` | Stable job name supplied explicitly or by `JobName()`, used to find the handler. |
-| `Jetq-Id` | Job id: a NUID assigned at enqueue time, or the id given with `JobID`. |
-| `Jetq-Enqueued-At` | RFC 3339 enqueue time. |
-| `Jetq-Max-Attempts` | Optional per-job attempt limit. |
-| `Jetq-Timeout` | Optional per-job attempt timeout (Go duration). |
-| `Jetq-Attempt-Base` | Attempts used before the job was put back (internal). |
-| `Jetq-Snoozes` | Number of snoozes (internal, exposed as `Info.Snoozes`). |
-| `Jetq-Unknown-Since` | When a worker first found no handler for the job (internal). |
-| `Jetq-Delayed` | Set on a copy put back without a delay from a delayed job or a redelivery; keeps it subject to cancellation markers (internal). |
-| `Nats-Msg-Id` | `Unique` key, or `jetq-lock-<lock revision>` for a `UniqueUntilDone` job, deduplicated by the stream within its duplicate window. |
-| `Jetq-Unique-Lock` | Lock key of a `UniqueUntilDone` job. |
-
-Application headers set with `WithHeader` (for example `traceparent`) are kept.
-Headers starting with `Jetq-` or `Nats-` are reserved.
-
-## Delayed jobs
-
-`Delay`/`At` publish a schedule message on `jetq.at.<id>` with
-`Nats-Schedule: @at <time>` and `Nats-Schedule-Target: jetq.q.<queue>`,
-expecting the subject to be empty (`Nats-Expected-Last-Subject-Sequence: 0`):
-publishing on it would replace a pending delayed job with the same id, so
-`Enqueue` returns `ErrJobIDInUse` instead. A retry or snooze that finds the
-subject taken acks the delivery when the pending message is the same job (put
-back by an earlier delivery whose ack was lost); otherwise another job reuses
-the id, against the `JobID` contract, and the delivery is nak'ed with the
-delay, so its redelivery counts as an attempt. Ids of jobs that are not delayed
-are not checked. When it fires, the
-server publishes a copy (minus scheduling headers and `Nats-Msg-Id`) to the
-queue subject and purges the schedule message. `Cancel(id)` removes the
-pending schedule message; jobs waiting for a retry or a snooze are stored the
-same way and can be cancelled too. A schedule can fire while `Cancel` runs, so `Cancel`
-first records a marker `cancel.<id>` (holding the job's enqueue time) in the
-`<STREAM>_STATE` bucket, then deletes exactly the schedule message it read. If
-the delete succeeds, `Cancel` returns nil and workers skip a copy the
-scheduler published meanwhile, including redeliveries of it, releasing its
-lock. If it fails because the schedule already fired, `Cancel` returns
-`ErrNotFound` and the job either runs or is skipped; the same holds when
-`Cancel` fails with another error after recording the marker. Retries and
-snoozes of a job whose marker was recorded are skipped too, so a running job
-finishes its current attempt but is not retried. Markers are never
-withdrawn, so concurrent cancels cannot undo each other; they expire with the
-bucket TTL, and a later job reusing the id has another enqueue time and is not
-skipped. Workers and lock releases read markers and locks through the bucket
-stream's leader, because key-value direct gets may be answered by a lagging
-follower. When the marker cannot be read, the copy is put back like a snooze
-and checked again after 5 seconds instead of running, without using up an
-attempt; if putting it back fails too, the copy is redelivered and that
-delivery counts as an attempt. Cancelling does not clear the `Unique` key, which
-stays reserved for the rest of the duplicate window; a `UniqueUntilDone` lock
-is released.
-
-## Recurring jobs
-
-`SyncSchedules` installs schedule messages on `jetq.cron.<key>` with a cron or
-`@every` pattern and an optional `Nats-Schedule-Time-Zone`. Publishing on the
-same subject replaces the previous schedule (implicit subject rollup).
-
-The call is declarative: schedules missing from the given set are purged, and
-unchanged schedules are left alone so that restarts do not reset their timing.
-Every instance passes the same set; during a rolling deploy the last writer
-wins, which is harmless when versions agree on the set.
-
-Five-field cron expressions are converted to the six-field (seconds-first)
-format NATS expects. Time zones do not apply to `@every`. Jobs fired by a
-schedule have the id `<key>-<stream sequence>`.
-
-The server fires each occurrence once regardless of how many workers run, so
-there is no leader election. Missed occurrences while the server is down are
-skipped, not replayed.
-
-## Processing
-
-A worker runs one fetch loop per queue. It only fetches as many messages as it
-has free slots (`Concurrency`), so no job waits in a local buffer while its ack
-timer runs.
-
-For each message:
-
-1. Build `Info`: attempt = JetStream delivery count + attempt base.
-2. Start a keep-alive that sends `InProgress` every `AckWait/3`, at most every
-   5 seconds.
-3. Without a handler for the job name, put it back (see below).
-4. Run middleware and the handler under the attempt timeout; panics become
-   errors; undecodable payloads are permanent errors.
-5. Settle:
-   - success: `Ack`;
-   - `Snooze(d)`: put back after `d` with attempt base = attempt - 1, so this
-     attempt is not counted, and `Jetq-Snoozes` + 1;
-   - permanent error: dead-letter (below), also during shutdown;
-   - shutdown timeout cancelled the handler: put back right away with attempt
-     base = attempt - 1;
-   - attempts exhausted: copy to the dead-letter stream with
-     `Jetq-Error`, `Jetq-Attempts`, `Jetq-Failed-At`, `Jetq-Queue`; run
-     `OnFailure` and `OnFailed`; `Ack`;
-   - otherwise: retry after `RetryAfter` or `Backoff(attempt)`. Delays of a
-     second or more put the job back with attempt base = attempt; shorter ones
-     `NakWithDelay` the delivery, because the server fires delayed jobs no
-     sooner than about 250ms and such a retry holds a slot of `MaxAckPending`
-     only briefly.
-
-Putting back republishes the job with the same id, as a delayed job on
-`jetq.at.<id>` when there is a delay, and then acks the delivery. Jobs waiting
-for a retry or a snooze are therefore not in flight: the consumer's
-`MaxAckPending` (default 1000) only counts running jobs, and a backlog of
-failing jobs never blocks healthy ones. They can be cancelled like other
-delayed jobs. If republishing fails, the delivery is nak'ed with the delay
-instead and its redelivery counts as the next attempt, also for snoozes and
-shutdown interruptions. A copy put back without a delay skips the scheduler,
-so it carries `Jetq-Delayed` when the job was a delayed job, which keeps it
-subject to cancellation markers; so does a copy put back from a
-redelivery. Redeliveries are checked against markers too, since the original of a job put back before its ack was lost may come
-back after the copy was cancelled.
-
-If the ack after putting back is lost, the original is redelivered while the
-copy is pending. When that redelivery settles the job (success or dead letter),
-the worker deletes a delayed copy on `jetq.at.<id>` that has an attempt base and
-the same `Jetq-Enqueued-At`. A copy put back without a delay, or one that fired
-already, runs again; delivery stays at least once.
-
-jetq decides retry timing and the attempt limit itself; the consumer has
-`MaxDeliver: -1` and no server backoff, so there is a single source of truth.
-`AckWait` only bounds recovery after a worker crash. Crash redeliveries count as
-attempts.
-
-Delay times (`Delay`, snoozes, retries) are turned into an absolute `@at` time
-with the clock of the process that publishes them; keep clocks synchronised.
-
-### Timeouts
-
-`Queue.Timeout`, overridden per job by `Timeout(d)` (header `Jetq-Timeout`;
-zero means no limit), bounds one attempt: when it passes, the handler's context
-is cancelled with cause `ErrTimeout` and the attempt fails with an error
-wrapping `ErrTimeout`, whatever the handler then returns (`nil`, a snooze,
-`RetryAfter` or `Permanent` contribute only their text), and is retried like
-any other failure, also when shutdown cancels the job after the timeout. A handler that has not
-returned 10 seconds after its context was cancelled, by a timeout or by
-shutdown, is abandoned: its goroutine keeps running, but the worker settles
-the job, frees the slot and stops keeping the message alive. Abandoned
-handlers no longer count towards `Concurrency`, and settling the job may
-release its `UniqueUntilDone` lock or run failure callbacks while the
-abandoned code still runs.
-
-### Unknown jobs
-
-When a worker has no handler for a job, for example because a newer version or
-another service produces it, the worker puts it back after 10 seconds without
-using up an attempt and records in `Jetq-Unknown-Since` when this first
-happened. Middleware and handlers do not run. Once
-`SetUnknownJobTimeout` (default 1h) has passed since then, the worker
-dead-letters the job; only `OnFailed` callbacks run, since the job's own
-`OnFailure` is registered elsewhere. A non-positive timeout puts it back
-forever.
-
-### Logging
-
-jetq logs retries, dead-lettering and settlement problems through the
-client's `slog.Logger`. `Worker.SetLogContext` derives the context of those
-records from the job's `Info`, so a logging handler can attach application
-fields such as a trace id or tenant; failure callbacks receive the same
-context.
-
-### Shutdown
-
-When the `Run` context is cancelled the worker stops fetching, waits for
-running handlers up to the shutdown timeout (default 30s), then cancels their
-contexts and puts their jobs back for immediate delivery elsewhere without
-using up the attempt (a job failing with a `Permanent` error is dead-lettered
-instead). `Run` returns once every handler has returned or been abandoned (10
-seconds after the cancellation) and the jobs are settled; failure callbacks
-that ignore their context's cancellation still hold it up.
-
-Settlement (dead-lettering, failure callbacks, putting back) stays under the
-keep-alive and uses its own bounded context, so it completes during shutdown and
-the job is not redelivered while it runs. Panics in failure callbacks are logged
-and do not stop the worker. A delivery whose attempt already exceeds the limit
-(the previous worker crashed on the last attempt) is dead-lettered without
-running the handler.
-
-The dead-letter copy carries `Nats-Msg-Id: jetq-dead-<stream sequence>`, so a
-redelivery after a lost ack within the dead-letter stream's duplicate window
-(the server default, usually 2m) does not add a second entry; this needs an
-`AckWait` shorter than that window. Failure callbacks run again, so they must
-be idempotent.
-
-If fetching fails because the consumer was deleted or stopped sending
-heartbeats, or five times in a row,
-the worker waits a second and creates the consumer again with its own
-settings.
-
-## Inspection
-
-`Stats` reads consumer info for every `jetq-<queue>` consumer (ready =
-`NumPending`, in flight = `NumAckPending`) and subject counts of the
-dead-letter, delayed and cron subjects. Jobs waiting for a retry or a snooze
-count as delayed; `Redelivered` counts jobs redelivered after a crash or a
-failed settlement.
-
-`DeadLetters` without a queue filter reads the `Limit` sequences below the
-cursor through an ordered consumer, stepping further back by the number of
-entries still missing when deleted entries leave gaps. Reads fail when no
-entry arrives within 5 seconds, for example because entries were deleted while
-reading. With a queue filter it reads
-that queue's subject through an ordered consumer in batches and keeps the
-newest entries below the cursor. `Before` is an exclusive sequence cursor.
-
-Inspection calls read stream info through fresh stream handles, because
-`Stream.Info` caches its result on the handle and the client is used
-concurrently.
-
-## Guarantees
-
-- At-least-once delivery. A handler may run more than once (crash, ack lost,
-  keep-alive lost); handlers must be idempotent.
-- `Unique` only deduplicates within the stream's duplicate window (default
-  2m).
-- `UniqueUntilDone` takes a lock in the `<STREAM>_STATE` key-value bucket,
-  created on first use (an existing bucket keeps its configuration; the client
-  needs permission to create it and to publish to `$KV.<STREAM>_STATE.>`) (key
-  = SHA-256 of the unique key, value = job id) before publishing, and returns
-  `ErrDuplicate` while it is held. The worker releases it before acking a
-  success and after dead-lettering, before failure callbacks run; `Cancel`
-  releases it for delayed jobs; a publish the server rejected or the client
-  did not send releases it. After an uncertain failure such as a timeout the
-  job may have been stored: without `Unique`, and while half the duplicate
-  window has not passed, `Enqueue` publishes it once more with the same
-  message id (`jetq-lock-<lock revision>`, so `Unique` keys starting with
-  `jetq-` are rejected), which the stream stores at most once, and returns
-  success when the server answers. A rejection because the delayed subject is
-  taken counts as stored when the pending message is the same job (same id and
-  enqueue time), for example already put back for a retry. Otherwise it
-  returns the job id and an error wrapping `ErrUncertain` and keeps the lock.
-  A lock whose `Create` failed is removed if it was written and the job id was
-  generated for this call; with a caller-chosen id it may stay until it
-  expires, since it cannot be told apart from a lock of an earlier enqueue of
-  the same id. `Cancel` deletes exactly the schedule message it read
-  and releases the lock only if that delete succeeds. A lock is only released
-  by the job that holds it. Snoozed and retrying jobs keep it. Every lock
-  expires at the bucket TTL (`WithUniqueLockTTL`, default 24h) counted from
-  enqueue, which bounds locks left behind by crashes and also ends
-  deduplication for jobs that stay unsettled longer.
-- An `Enqueue` error wrapping `ErrUncertain` means the job may or may not have
-  been stored; other errors mean it was not.
-- `Enqueue` is not transactional with your database. Enqueue after commit; a
-  crash between commit and enqueue loses the job. The outbox add-on closes
-  this gap.
-- Job state lives only in JetStream. Store business results in your own
-  tables.
-- Workers of the same queue share one durable consumer whose `AckWait` is set
-  by the last worker to start; give every worker of a queue the same `Queue`
-  settings. Keep-alives are sent at least every 5 seconds, so mixed `AckWait`
-  values of 15 seconds or more are safe during a rolling deploy.
-- Applications sharing a NATS account must use distinct stream names and
-  subject prefixes: consumers are named `jetq-<queue>` and `SyncSchedules`
-  removes schedules it was not given.
-
-## Embedding NATS
-
-jetq does not start NATS. For a single server you can embed it:
+## Driver contract
 
 ```go
-srv, _ := server.NewServer(&server.Options{JetStream: true, StoreDir: dataDir, DontListen: true})
-srv.Start()
-srv.ReadyForConnections(10 * time.Second)
-nc, _ := nats.Connect("", nats.InProcessServer(srv))
-js, _ := jetstream.New(nc)
-q, _ := jetq.New(ctx, js)
+type Driver interface {
+    Enqueue(ctx, *Message) error                               // ErrJobIDInUse, ErrDuplicate, ErrUncertain
+    Claim(ctx, queue string, max int, lease time.Duration) ([]Lease, error)
+    Cancel(ctx, id string) error                               // ErrNotFound
+    Close() error
+}
+
+type Lease interface {
+    Message() *Message
+    Attempt() int
+    Extend(ctx) error
+    Complete(ctx) error
+    Retry(ctx, at time.Time, reason string) error              // counts the attempt
+    Release(ctx, Release) error                                // does not: snooze, shutdown, unknown job
+    Fail(ctx, reason string) error                             // dead letter
+}
 ```
 
-For several servers use a standalone NATS server or cluster. Do not run an
-embedded JetStream cluster of two nodes: Raft needs a majority, so losing either
-node stops the stream.
+Optional capabilities are detected with type assertions. When a driver lacks
+one, the client returns `ErrUnsupported`:
 
-## Roadmap
+- `Scheduler`: `SyncSchedules`
+- `Inspector`: `Stats`, `DeadLetters`, `RetryDead`, `DeleteDead`
 
-- Transactional outbox: `EnqueueTx(ctx, tx, job)` writes to an outbox table in
-  the caller's transaction and a relay publishes it, with PostgreSQL and MySQL
-  dialect modules.
-- Job chains and batches.
-- Dead-letter requeue (API and CLI), dashboard.
-- OpenTelemetry instrumentation.
+The rules every driver keeps, and `drivertest` checks:
+
+- **Attempts.** The driver owns the attempt counter. A claim increments it.
+  `Release` takes it back. A lease that expires without settling keeps its
+  increment, so a worker crash counts as an attempt.
+- **Fencing.** Every lease method is fenced on its claim. Once the lease
+  expired and the job may be claimed again, the methods return
+  `ErrLeaseLost` and never touch the newer claim. Settling ends the lease.
+- **Claim.** It returns at most `max` jobs. It may wait for work, but returns
+  empty within a few seconds, and promptly once ctx is done. Expired leases
+  are claimable again.
+- **Unique keys.** `UniqueFor == 0` holds the key until the job succeeds, is
+  dead-lettered or is cancelled. Retries and snoozes keep it.
+  `UniqueFor > 0` holds the key for that long after enqueue, whatever
+  happens to the job.
+- **Ids.** A job id is unique among unfinished jobs on every queue. Once the
+  job has finished, the id can be used again. Retrying an enqueue that
+  failed with `ErrUncertain` under the same `JobID` returns `ErrJobIDInUse`
+  while the first copy is unfinished. If that copy has already finished,
+  the job is stored again, as at-least-once delivery allows.
+- **Cancel.** It removes jobs waiting for their run time, a retry or a
+  snooze, and releases the job's unique key. A running job finishes its
+  attempt but is not retried.
+- **Schedules.** Each occurrence fires once however many processes run. The
+  fired job's id is `<key>-<suffix>`, where the suffix is unique per
+  occurrence. Missed occurrences are not replayed.
+
+Compared with the reverted driver-neutral attempt (PR #13), this contract has
+no admission ledger, execution budget or decision log. The worker decides,
+and the driver applies the transition atomically. The cost is that a crash
+between a handler's return and its settlement runs the job again, as at
+least once delivery allows.
+
+## Worker
+
+A worker runs one claim loop per queue and claims only as many jobs as it
+has free slots. For each job it:
+
+1. Builds `Info` from the message and `Lease.Attempt()`.
+2. Starts a keep-alive that calls `Extend` every `Lease/3`. When the driver
+   reports `ErrLeaseLost`, the handler's context is cancelled with that
+   cause, and the job is left to whoever holds it now.
+3. Without a handler, puts the job back with `Release` after 10s, without
+   using up an attempt. After `SetUnknownJobTimeout` (default 1h) it
+   dead-letters the job.
+4. Runs middleware and the handler under the attempt timeout. Panics become
+   errors, and payloads that do not decode are permanent errors.
+5. Settles the job:
+
+   | Outcome | Transition |
+   |---|---|
+   | success | `Complete` |
+   | `Snooze(d)` | `Release{At: now+d, Snooze: true}` |
+   | `Permanent` error | `Fail`, then failure callbacks |
+   | interrupted by shutdown | `Release{}` (immediately, attempt not counted) |
+   | attempts exhausted | `Fail`, then failure callbacks |
+   | other error | `Retry(now + RetryAfter or Backoff(attempt))` |
+
+   A failed settlement is logged. The lease then expires and the job is
+   claimed again as a new attempt.
+
+A job that is claimed again with an attempt above its limit, because the
+previous worker crashed on the last attempt, is dead-lettered without running
+the handler.
+
+Timeouts, abandoning handlers that ignore cancellation (10s), shutdown
+(default 30s grace) and log contexts work as in jetq 0.x.
+
+## PostgreSQL driver (pgq)
+
+### Schema
+
+The schema lives in a configurable schema (default `jobq`) and is created by
+versioned migrations recorded in `jobq.migrations`. Migrations run under
+`pg_advisory_xact_lock`.
+
+```sql
+CREATE TABLE jobq.jobs (
+  id            text PRIMARY KEY,
+  queue         text NOT NULL,
+  name          text NOT NULL,
+  payload       bytea NOT NULL,
+  header        jsonb,
+  state         text NOT NULL,         -- pending | running | succeeded | failed | canceled
+  attempt       int  NOT NULL DEFAULT 0,
+  max_attempts  int  NOT NULL DEFAULT 0,
+  timeout_ms    bigint NOT NULL DEFAULT 0,
+  snoozes       int  NOT NULL DEFAULT 0,
+  unknown_since timestamptz,
+  run_at        timestamptz NOT NULL,
+  locked_until  timestamptz,
+  claim_token   bigint NOT NULL DEFAULT 0,
+  last_error    text,
+  unique_key    text,
+  unique_until  timestamptz,          -- null: until done
+  enqueued_at   timestamptz NOT NULL,
+  finished_at   timestamptz
+);
+CREATE INDEX ON jobq.jobs (queue, run_at, id) WHERE state = 'pending';
+CREATE INDEX ON jobq.jobs (locked_until) WHERE state = 'running';
+CREATE INDEX ON jobq.jobs (queue, finished_at DESC) WHERE state = 'failed';
+CREATE INDEX ON jobq.jobs (finished_at) WHERE state IN ('succeeded', 'canceled');
+
+-- Unique keys live in their own table, so the until-done and windowed
+-- rules are one primary key check.
+CREATE TABLE jobq.unique_keys (
+  key    text PRIMARY KEY,
+  job_id text NOT NULL,
+  until  timestamptz            -- null: until the job finishes
+);
+
+CREATE TABLE jobq.schedules (
+  key         text PRIMARY KEY,
+  spec        jsonb NOT NULL,     -- cron, timezone, message
+  next_run_at timestamptz NOT NULL
+);
+```
+
+Dead letters stay in `jobs` with `state = 'failed'`. `RetryDead` resets a
+dead letter to `pending` with `attempt = 0`.
+
+### Operations
+
+- **Enqueue.** One transaction claims the unique key with
+  `INSERT ... ON CONFLICT (key) DO UPDATE ... WHERE expired` and inserts the
+  job. If the id belongs to a finished job, the insert reuses that row;
+  if it belongs to an unfinished job, it fails with `ErrJobIDInUse`.
+  `pgq.EnqueueTx(ctx, tx, ...)` runs the same statements inside the caller's
+  `pgx.Tx`, so a job commits or rolls back with the business data.
+- **Claim.** One statement claims due jobs and expired leases in batches:
+
+  ```sql
+  UPDATE jobq.jobs SET state = 'running', attempt = attempt + 1,
+         claim_token = claim_token + 1, locked_until = now() + $lease
+  WHERE id IN (SELECT id FROM jobq.jobs
+               WHERE queue = $1 AND ((state = 'pending' AND run_at <= now())
+                                  OR (state = 'running' AND locked_until < now()))
+               ORDER BY run_at, id LIMIT $max FOR UPDATE SKIP LOCKED)
+  RETURNING ...
+  ```
+
+- **Fencing.** Every lease method carries
+  `WHERE id = $1 AND claim_token = $2 AND state = 'running' AND locked_until > now()`.
+  Zero affected rows means `ErrLeaseLost`.
+- **Wake-ups.** A trigger runs `pg_notify('jobq', queue)` when a job becomes
+  pending. One listener connection per driver fans notifications out to
+  waiting claims. A timer set to the next `run_at` handles delayed jobs, and
+  a poll (default 5s) covers lost notifications. `WithoutListen()` disables
+  the listener for PgBouncer transaction pooling.
+- **Time.** All times come from the database clock (`now()`).
+- **Schedules.** Every driver instance ticks once a second and claims due
+  schedule rows with `FOR UPDATE SKIP LOCKED`. In the same transaction it
+  inserts the job `<key>-<unix seconds of the occurrence>` and advances
+  `next_run_at`. The primary key makes an occurrence fire at most once, so no
+  leader election is needed.
+- **Retention.** A janitor deletes succeeded and cancelled jobs after 24h
+  (`WithRetention`), dead letters after 14 days (`WithDeadRetention`) and
+  expired unique keys. It deletes in batches, and only one instance runs it
+  at a time, under an advisory lock.
+
+## NATS driver (natsq)
+
+natsq keeps jetq 0.x's storage layout. It maps the contract as follows:
+
+| Contract | JetStream |
+|---|---|
+| `Enqueue` | Publish to `<prefix>.q.<queue>`, or as a schedule message on `<prefix>.at.<id>` when delayed. Job ids and unique keys are claimed in the state bucket. |
+| `Claim` | Fetch from the queue's durable pull consumer, up to `max`. `AckWait` is the lease. |
+| `Attempt` | Delivery count plus the attempt base carried in a header. |
+| `Extend` | `InProgress` |
+| `Complete` | Release the unique key and job id, then `Ack`. |
+| `Retry` / `Release` | Republish with the new attempt base (delayed when `at` is in the future), then `Ack`. |
+| `Fail` | Copy to `<STREAM>_DEAD`, release the key, then `Ack`. |
+| `Cancel` | Cancel marker plus deleting the schedule message (as in 0.x). |
+| `Scheduler` | Server-side message schedules on `<prefix>.cron.<key>`. |
+
+The outbox-oriented `MsgID` option of 0.x is dropped. Use pgq with
+`EnqueueTx` when enqueueing must be transactional with database writes.
+
+## Deferred
+
+- **Lanes and priorities.** `Message` can gain `Lane` and `Priority` fields
+  without changing the driver interface. pgq would implement lanes with a
+  partial unique index over running jobs; natsq has no efficient equivalent.
+- Job chains and batches, dashboard, OpenTelemetry middleware.

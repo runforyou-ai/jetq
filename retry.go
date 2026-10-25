@@ -1,4 +1,4 @@
-package jetq
+package jobq
 
 import (
 	"errors"
@@ -65,20 +65,17 @@ func (e *retryAfterError) Unwrap() error { return e.err }
 
 type snoozeError struct{ delay time.Duration }
 
-func (e *snoozeError) Error() string { return "jetq: job snoozed for " + e.delay.String() }
+func (e *snoozeError) Error() string { return "jobq: job snoozed for " + e.delay.String() }
 
 // Snooze puts the job back on its queue to run again after delay without
 // counting the current attempt, for example while a tenant is paused. The
 // snoozed job keeps its id and can be cancelled with [Client.Cancel];
 // [Info.Snoozes] counts how often it was snoozed, so a handler can give up.
-// If putting it back fails, or another pending delayed job has its id, the
-// delivery is redelivered after delay instead and that counts as an attempt.
 func Snooze(delay time.Duration) error { return &snoozeError{delay: delay} }
 
 // RetryAfter fails the attempt and asks for the next attempt after delay
 // instead of the queue's backoff. The attempt still counts towards the limit.
-// Like every retry, the job waits as a delayed job and can be cancelled with
-// [Client.Cancel].
+// Like every retry, the waiting job can be cancelled with [Client.Cancel].
 func RetryAfter(delay time.Duration, err error) error {
 	if err == nil {
 		return nil
