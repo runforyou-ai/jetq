@@ -125,7 +125,7 @@ func (d *Driver) migrate(ctx context.Context) error {
 		return fmt.Errorf("pgq: migrate: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('jobq_migrate'))`); err != nil {
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, d.cfg.schema+":migrate"); err != nil {
 		return fmt.Errorf("pgq: migrate lock: %w", err)
 	}
 	if _, err := tx.Exec(ctx, "CREATE SCHEMA IF NOT EXISTS "+d.s); err != nil {
@@ -260,26 +260,35 @@ func (d *Driver) clean(ctx context.Context) {
 	if err != nil {
 		return
 	}
+	// One instance cleans at a time; the lock is held until this returns.
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
 	var got bool
-	if err := tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtext('jobq_clean'))`).Scan(&got); err != nil || !got {
+	if err := tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtext($1))`, d.cfg.schema+":clean").Scan(&got); err != nil || !got {
 		return
 	}
+	const batch = 1000
 	stmts := []struct {
 		sql string
-		arg time.Duration
+		arg int64
 	}{
-		{"DELETE FROM " + d.s + ".jobs WHERE id IN (SELECT id FROM " + d.s + ".jobs WHERE state IN ('succeeded','canceled') AND finished_at < now() - $1 * interval '1 microsecond' LIMIT 1000)", d.cfg.retention},
-		{"DELETE FROM " + d.s + ".jobs WHERE id IN (SELECT id FROM " + d.s + ".jobs WHERE state = 'failed' AND finished_at < now() - $1 * interval '1 microsecond' LIMIT 1000)", d.cfg.deadRetention},
-		{"DELETE FROM " + d.s + ".unique_keys WHERE until IS NOT NULL AND until < now() AND $1::bigint >= 0", 0},
+		{"DELETE FROM " + d.s + ".jobs WHERE id IN (SELECT id FROM " + d.s + ".jobs WHERE state IN ('succeeded','canceled') AND finished_at < clock_timestamp() - $1 * interval '1 microsecond' LIMIT 1000)", d.cfg.retention.Microseconds()},
+		{"DELETE FROM " + d.s + ".jobs WHERE id IN (SELECT id FROM " + d.s + ".jobs WHERE state = 'failed' AND finished_at < clock_timestamp() - $1 * interval '1 microsecond' LIMIT 1000)", d.cfg.deadRetention.Microseconds()},
+		{"DELETE FROM " + d.s + ".unique_keys WHERE key IN (SELECT key FROM " + d.s + ".unique_keys WHERE until IS NOT NULL AND until < clock_timestamp() AND $1::bigint >= 0 LIMIT 1000)", 0},
 	}
+	// Repeat each statement in its own short transaction until it is caught
+	// up, so a burst of finished jobs is cleared within the time budget.
 	for _, st := range stmts {
-		if _, err := tx.Exec(ctx, st.sql, st.arg.Microseconds()); err != nil {
-			d.cfg.logger.Warn("pgq: clean", "error", err)
-			return
+		for ctx.Err() == nil {
+			tag, err := d.pool.Exec(ctx, st.sql, st.arg)
+			if err != nil {
+				d.cfg.logger.Warn("pgq: clean", "error", err)
+				return
+			}
+			if tag.RowsAffected() < batch {
+				break
+			}
 		}
 	}
-	_ = tx.Commit(ctx)
 }
 
 var errClosed = errors.New("pgq: driver closed")

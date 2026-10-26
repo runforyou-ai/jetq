@@ -5,6 +5,7 @@ package pgq
 var migrations = []string{
 	// 1: tables, indexes and the notification trigger.
 	`
+CREATE SEQUENCE IF NOT EXISTS %[1]s.claim_token_seq;
 CREATE TABLE IF NOT EXISTS %[1]s.jobs (
   id            text PRIMARY KEY,
   queue         text NOT NULL,

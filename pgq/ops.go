@@ -82,9 +82,9 @@ func (d *Driver) insert(ctx context.Context, tx pgx.Tx, msg *jobq.Message) error
 	}
 	if msg.UniqueKey != "" {
 		tag, err := tx.Exec(ctx, `INSERT INTO `+d.s+`.unique_keys (key, job_id, until)
-VALUES ($1, $2, CASE WHEN $3::bigint > 0 THEN now() + $3::bigint * interval '1 microsecond' END)
+VALUES ($1, $2, CASE WHEN $3::bigint > 0 THEN clock_timestamp() + $3::bigint * interval '1 microsecond' END)
 ON CONFLICT (key) DO UPDATE SET job_id = EXCLUDED.job_id, until = EXCLUDED.until
-WHERE `+d.s+`.unique_keys.until IS NOT NULL AND `+d.s+`.unique_keys.until <= now()`,
+WHERE `+d.s+`.unique_keys.until IS NOT NULL AND `+d.s+`.unique_keys.until <= clock_timestamp()`,
 			msg.UniqueKey, msg.ID, msg.UniqueFor.Microseconds())
 		if err != nil {
 			return fmt.Errorf("pgq: unique key: %w", err)
@@ -106,7 +106,7 @@ WHERE `+d.s+`.unique_keys.until IS NOT NULL AND `+d.s+`.unique_keys.until <= now
 	}
 	_, err := tx.Exec(ctx, `INSERT INTO `+d.s+`.jobs
 (id, queue, name, payload, header, state, max_attempts, timeout_ns, run_at, unique_key, unique_for_ns, enqueued_at)
-VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, now() + $8::bigint * interval '1 microsecond', $9, $10, $11)`,
+VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, clock_timestamp() + $8::bigint * interval '1 microsecond', $9, $10, $11)`,
 		msg.ID, msg.Queue, msg.Name, msg.Payload, header, msg.MaxAttempts, int64(msg.Timeout),
 		untilMicros(msg.RunAt), key, int64(msg.UniqueFor), nilIfZero(msg.EnqueuedAt))
 	if err != nil {
@@ -195,7 +195,7 @@ func (d *Driver) untilNext(ctx context.Context, queue string) (time.Duration, er
 
 func (d *Driver) claim(ctx context.Context, queue string, limit int, leaseFor time.Duration) ([]jobq.Lease, error) {
 	rows, err := d.pool.Query(ctx, `UPDATE `+d.s+`.jobs SET state = 'running', attempt = attempt + 1,
-  claim_token = claim_token + 1, locked_until = now() + $3::bigint * interval '1 microsecond'
+  claim_token = nextval('`+d.s+`.claim_token_seq'), locked_until = now() + $3::bigint * interval '1 microsecond'
 WHERE id IN (
   SELECT id FROM `+d.s+`.jobs
   WHERE queue = $1 AND ((state = 'pending' AND run_at <= now()) OR (state = 'running' AND locked_until <= now()))

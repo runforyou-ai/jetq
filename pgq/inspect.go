@@ -39,7 +39,7 @@ func (d *Driver) SyncSchedules(ctx context.Context, specs []jobq.ScheduleSpec) e
 		return fmt.Errorf("pgq: begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('jobq_schedules'))`); err != nil {
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, d.cfg.schema+":schedules"); err != nil {
 		return fmt.Errorf("pgq: schedule lock: %w", err)
 	}
 	var now time.Time
@@ -148,37 +148,57 @@ WHERE next_run_at <= now() ORDER BY next_run_at LIMIT 20 FOR UPDATE SKIP LOCKED`
 		return nil
 	}
 	for _, s := range due {
-		cron, err := jobq.ParseCron(s.cron)
+		sp, err := tx.Begin(ctx)
 		if err != nil {
-			return fmt.Errorf("schedule %q: %w", s.key, err)
-		}
-		loc, err := scheduleLocation(s.timezone)
-		if err != nil {
-			return fmt.Errorf("schedule %q: %w", s.key, err)
-		}
-		var sm scheduleMsg
-		if err := json.Unmarshal(s.spec, &sm); err != nil {
-			return fmt.Errorf("schedule %q: %w", s.key, err)
-		}
-		msg := &jobq.Message{
-			ID:   fmt.Sprintf("%s-%d", s.key, s.at.Unix()),
-			Name: sm.Name, Queue: sm.Queue, Payload: sm.Payload, Header: sm.Header,
-			MaxAttempts: sm.MaxAttempts, Timeout: sm.Timeout,
-		}
-		// An id still in use means the occurrence already exists: skip it.
-		if err := d.EnqueueTx(ctx, tx, msg); err != nil && !errors.Is(err, jobq.ErrJobIDInUse) {
 			return err
 		}
-		// Missed occurrences are not replayed: the next one is after now.
-		next := cron.Next(now, loc)
-		if next.IsZero() {
-			return fmt.Errorf("schedule %q never fires again", s.key)
+		if err := d.fireOne(ctx, sp, s, now); err != nil {
+			// A schedule that cannot fire must not hold up the others: undo
+			// its work, log it and try again in a minute.
+			_ = sp.Rollback(context.WithoutCancel(ctx))
+			d.cfg.logger.Warn("pgq: schedule failed", "key", s.key, "error", err)
+			if _, err := tx.Exec(ctx, `UPDATE `+d.s+`.schedules SET next_run_at = clock_timestamp() + interval '1 minute' WHERE key = $1`, s.key); err != nil {
+				return err
+			}
+			continue
 		}
-		if _, err := tx.Exec(ctx, `UPDATE `+d.s+`.schedules SET next_run_at = $2 WHERE key = $1`, s.key, next); err != nil {
+		if err := sp.Commit(ctx); err != nil {
 			return err
 		}
 	}
 	return tx.Commit(ctx)
+}
+
+// fireOne enqueues one occurrence of s and moves its next run time past now.
+func (d *Driver) fireOne(ctx context.Context, tx pgx.Tx, s dueSchedule, now time.Time) error {
+	cron, err := jobq.ParseCron(s.cron)
+	if err != nil {
+		return err
+	}
+	loc, err := scheduleLocation(s.timezone)
+	if err != nil {
+		return err
+	}
+	var sm scheduleMsg
+	if err := json.Unmarshal(s.spec, &sm); err != nil {
+		return err
+	}
+	msg := &jobq.Message{
+		ID:   fmt.Sprintf("%s-%d", s.key, s.at.Unix()),
+		Name: sm.Name, Queue: sm.Queue, Payload: sm.Payload, Header: sm.Header,
+		MaxAttempts: sm.MaxAttempts, Timeout: sm.Timeout,
+	}
+	// An id still in use means the occurrence already exists: skip it.
+	if err := d.EnqueueTx(ctx, tx, msg); err != nil && !errors.Is(err, jobq.ErrJobIDInUse) {
+		return err
+	}
+	// Missed occurrences are not replayed: the next one is after now.
+	next := cron.Next(now, loc)
+	if next.IsZero() {
+		return errors.New("schedule never fires again")
+	}
+	_, err = tx.Exec(ctx, `UPDATE `+d.s+`.schedules SET next_run_at = $2 WHERE key = $1`, s.key, next)
+	return err
 }
 
 // === inspection ===
@@ -289,7 +309,7 @@ func (d *Driver) RetryDead(ctx context.Context, id string) error {
 	var got string
 	err := d.pool.QueryRow(ctx, `UPDATE `+d.s+`.jobs SET state = 'pending', attempt = 0, snoozes = 0,
   unknown_since = NULL, run_at = now(), locked_until = NULL, finished_at = NULL, last_error = NULL,
-  unique_key = NULL, unique_for_ns = 0, claim_token = claim_token + 1
+  unique_key = NULL, unique_for_ns = 0, claim_token = nextval('`+d.s+`.claim_token_seq')
 WHERE id = $1 AND state = 'failed' RETURNING id`, id).Scan(&got)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return jobq.ErrNotFound
