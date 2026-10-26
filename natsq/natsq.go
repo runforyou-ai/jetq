@@ -854,28 +854,33 @@ func (l *jobLease) Extend(ctx context.Context) error {
 // Complete implements [jobq.Lease].
 func (l *jobLease) Complete(ctx context.Context) error {
 	return l.settle(ctx, func(s *jobState) (*jobState, error) {
-		if l.scheduled {
-			// A schedule occurrence has no record before its first claim, so
-			// deleting it would make a redelivery look like a first delivery.
-			// Keep a finished record; the janitor removes it after the state TTL.
-			s.Running = false
-			s.LeaseUntil, s.LeaseStart = time.Time{}, time.Time{}
-			s.FinishedAt = time.Now()
-			return s, nil
-		}
-		return nil, nil // finished: remove the record
+		return l.finished(s), nil
 	})
+}
+
+// finished is the record left when the job ends. A schedule occurrence has no
+// record before its first claim, so deleting it would make a redelivery look
+// like a first delivery: keep a finished record, which the janitor removes
+// after the state TTL. Other jobs have no record, and their copies are dropped.
+func (l *jobLease) finished(s *jobState) *jobState {
+	if !l.scheduled {
+		return nil
+	}
+	s.Running = false
+	s.LeaseUntil, s.LeaseStart = time.Time{}, time.Time{}
+	s.FinishedAt = time.Now()
+	return s
 }
 
 // Fail implements [jobq.Lease]. The dead letter is stored once the lease is
 // confirmed, before the record is removed; a crash in between leaves a dead
 // letter for a job that runs again.
 func (l *jobLease) Fail(ctx context.Context, reason string) error {
-	return l.settle(ctx, func(*jobState) (*jobState, error) {
+	return l.settle(ctx, func(s *jobState) (*jobState, error) {
 		if _, err := l.d.storeDead(ctx, l.msg, l.attempt, reason); err != nil {
 			return nil, err
 		}
-		return nil, nil
+		return l.finished(s), nil
 	})
 }
 
@@ -936,14 +941,20 @@ func (l *jobLease) requeue(ctx context.Context, env *envelope, at time.Time, att
 	// Step 3: switch the record to the new copy.
 	done := pending
 	done.Gen, done.Next, done.Seq = env.Gen, "", seq
-	if _, err := l.d.putState(ctx, l.msg.ID, pendRev, &done); err != nil {
-		// The new copy is published and the record names it as Next, so its
-		// first claim completes the handoff. Do not fail the requeue.
-		l.d.cfg.logger.WarnContext(ctx, "natsq: confirm requeue", "id", l.msg.ID, "error", err)
-	}
+	_, err = l.d.putState(ctx, l.msg.ID, pendRev, &done)
 	l.done = true
-	// A lost ack is harmless: the old copy is stale once the record switched,
-	// and is dropped after the switch.
+	if err != nil {
+		// The switch failed. The record may have been claimed by another
+		// worker meanwhile, and a JetStream ack is not tied to a delivery:
+		// acking now could settle that worker's delivery. Look at the record
+		// and ack only when it confirms the handoff.
+		cur, _, getErr := l.d.getState(ctx, l.msg.ID)
+		if getErr != nil || cur.Gen != env.Gen {
+			l.d.cfg.logger.WarnContext(ctx, "natsq: requeue not confirmed, leaving the old delivery to expire", "id", l.msg.ID, "error", err)
+			return nil
+		}
+	}
+	// A lost ack is harmless: the old copy is stale once the record switched.
 	_ = l.nmsg.Ack()
 	return nil
 }
