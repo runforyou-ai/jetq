@@ -1,4 +1,4 @@
-MODULES := . natsq
+MODULES := . natsq pgq
 
 .PHONY: test lint tidy
 

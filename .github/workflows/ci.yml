@@ -16,7 +16,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        module: [".", "natsq"]
+        module: [".", "natsq", "pgq"]
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v7
@@ -32,7 +42,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        module: [".", "natsq"]
+        module: [".", "natsq", "pgq"]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v7
