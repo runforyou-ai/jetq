@@ -737,7 +737,11 @@ func (d *Driver) consumer(ctx context.Context, queue string, lease time.Duration
 	// lease is redelivered in time. A longer lease is redelivered early,
 	// and claimMessage puts it back until the lease in the record runs out.
 	if qc.consumer != nil && qc.ackWait <= lease {
-		return qc.consumer, nil
+		// Another process may have raised the shared consumer's AckWait.
+		if info, err := qc.consumer.Info(ctx); err == nil && info.Config.AckWait <= lease {
+			qc.ackWait = info.Config.AckWait
+			return qc.consumer, nil
+		}
 	}
 	cfg := jetstream.ConsumerConfig{
 		Durable:       d.consumerName(queue),
@@ -1061,12 +1065,17 @@ func (d *Driver) storeDead(ctx context.Context, msg *jobq.Message, attempts int,
 	}
 	pubCtx, cancel := context.WithTimeout(ctx, publishTimeout)
 	defer cancel()
-	ack, err := d.js.Publish(pubCtx, d.cfg.prefix+".dead."+msg.Queue, data)
+	// A retried Fail must not store the same dead letter twice.
+	ack, err := d.js.Publish(pubCtx, d.cfg.prefix+".dead."+msg.Queue, data,
+		jetstream.WithMsgID("dead-"+msg.ID+"-"+strconv.Itoa(attempts)))
 	if err != nil {
 		return 0, fmt.Errorf("natsq: store dead letter %s: %w", msg.ID, err)
 	}
 	return ack.Sequence, nil
 }
+
+// scanWindow bounds a dead-letter scan that asks for no limit.
+const scanWindow = 1000
 
 // deadEntry is one dead letter with its stream sequence.
 type deadEntry struct {
@@ -1089,8 +1098,11 @@ func (d *Driver) scanDead(ctx context.Context, queue string, before uint64, limi
 	if before > 0 {
 		seq = before - 1
 	}
+	if limit <= 0 {
+		limit = scanWindow
+	}
 	var out []deadEntry
-	for seq >= first && first > 0 && (limit <= 0 || len(out) < limit) {
+	for seq >= first && first > 0 && len(out) < limit {
 		raw, err := d.dead.GetMsg(ctx, seq)
 		if errors.Is(err, jetstream.ErrMsgNotFound) {
 			seq--

@@ -217,20 +217,21 @@ func (d *Driver) listen() {
 }
 
 func (d *Driver) listenOnce(ctx context.Context) error {
-	conn, err := d.pool.Acquire(ctx)
+	// A connection of its own: the listener is held for the driver's lifetime
+	// and must not take a slot from the pool that serves claims.
+	conn, err := pgx.ConnectConfig(ctx, d.pool.Config().ConnConfig)
 	if err != nil {
 		return err
 	}
-	defer conn.Release()
+	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
 	if _, err := conn.Exec(ctx, "LISTEN "+pgx.Identifier{"jobq." + d.cfg.schema}.Sanitize()); err != nil {
 		return err
 	}
 	// Notifications may have been missed while disconnected.
 	d.wakeAll()
 	for {
-		n, err := conn.Conn().WaitForNotification(ctx)
+		n, err := conn.WaitForNotification(ctx)
 		if err != nil {
-			_, _ = conn.Exec(context.WithoutCancel(ctx), "UNLISTEN *")
 			return err
 		}
 		d.wake(n.Payload)
@@ -256,16 +257,20 @@ func (d *Driver) janitor() {
 }
 
 func (d *Driver) clean(ctx context.Context) {
-	tx, err := d.pool.Begin(ctx)
+	conn, err := d.pool.Acquire(ctx)
 	if err != nil {
 		return
 	}
-	// One instance cleans at a time; the lock is held until this returns.
-	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	defer conn.Release()
+	// One instance cleans at a time. A session-level lock on this one
+	// connection, released below, keeps a janitor run to a single slot.
 	var got bool
-	if err := tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtext($1))`, d.cfg.schema+":clean").Scan(&got); err != nil || !got {
+	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(hashtext($1))`, d.cfg.schema+":clean").Scan(&got); err != nil || !got {
 		return
 	}
+	defer func() {
+		_, _ = conn.Exec(context.WithoutCancel(ctx), `SELECT pg_advisory_unlock(hashtext($1))`, d.cfg.schema+":clean")
+	}()
 	const batch = 1000
 	stmts := []struct {
 		sql string
@@ -279,7 +284,7 @@ func (d *Driver) clean(ctx context.Context) {
 	// up, so a burst of finished jobs is cleared within the time budget.
 	for _, st := range stmts {
 		for ctx.Err() == nil {
-			tag, err := d.pool.Exec(ctx, st.sql, st.arg)
+			tag, err := conn.Exec(ctx, st.sql, st.arg)
 			if err != nil {
 				d.cfg.logger.Warn("pgq: clean", "error", err)
 				return

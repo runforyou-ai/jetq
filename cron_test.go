@@ -86,3 +86,33 @@ func TestParseCronErrors(t *testing.T) {
 		t.Fatalf("normalized = %q, %v", c.String(), err)
 	}
 }
+
+func TestCronNextFallBackFiresOnce(t *testing.T) {
+	t.Parallel()
+	ny, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := jobq.ParseCron("0 30 1 * * *")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 2026-11-01: 01:30 happens at EDT and again at EST.
+	first := c.Next(time.Date(2026, 11, 1, 0, 0, 0, 0, ny), ny)
+	if got := first.Format("15:04 MST"); got != "01:30 EDT" {
+		t.Fatalf("first = %s", got)
+	}
+	next := c.Next(first, ny)
+	if sameWallClock(first, next) {
+		t.Fatalf("fired twice at %s and %s", first.Format(time.RFC3339), next.Format(time.RFC3339))
+	}
+	if next.Day() != 2 || next.Hour() != 1 || next.Minute() != 30 {
+		t.Fatalf("next = %s, want the next day at 01:30", next)
+	}
+}
+
+func sameWallClock(a, b time.Time) bool {
+	a, b = a.In(a.Location()), b.In(b.Location())
+	return a.Year() == b.Year() && a.YearDay() == b.YearDay() &&
+		a.Hour() == b.Hour() && a.Minute() == b.Minute() && a.Second() == b.Second()
+}

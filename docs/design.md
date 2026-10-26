@@ -68,8 +68,10 @@ The rules every driver keeps, and `drivertest` checks:
   while the first copy is unfinished. If that copy has already finished,
   the job is stored again, as at-least-once delivery allows.
 - **Cancel.** It removes jobs waiting for their run time, a retry or a
-  snooze, and releases the job's unique key. A running job finishes its
-  attempt but is not retried.
+  snooze, and releases the job's unique key. A running job keeps its lease,
+  finishes its attempt, and ends as a cancellation: it is neither retried
+  nor dead-lettered. A cancel request whose worker never settles ends the
+  job once its lease runs out.
 - **Schedules.** Each occurrence fires once however many processes run. The
   fired job's id is `<key>-<suffix>`, where the suffix is unique per
   occurrence. Missed occurrences are not replayed.
@@ -171,12 +173,17 @@ Dead letters stay in `jobs` with `state = 'failed'`. `RetryDead` resets one to
 - **Fencing.** Every lease method carries
   `WHERE id = $1 AND claim_token = $2 AND state = 'running' AND locked_until > now()`.
   Zero affected rows means `ErrLeaseLost`.
-- **Wake-ups.** A trigger runs `pg_notify('jobq', queue)` when a job becomes
-  pending. One listener per driver fans notifications out to waiting claims,
+- **Wake-ups.** A trigger runs `pg_notify('jobq.<schema>', queue)` when a job
+  becomes pending, so drivers of other schemas in the same database are not
+  woken. One listener per driver fans notifications out to waiting claims,
   and a timer set to the next due job plus a poll (default 5s) cover delayed
-  jobs and lost notifications. The listener holds one pool connection for the
-  driver's lifetime, so the pool needs at least two. `WithoutListen()` turns it
-  off, for PgBouncer in transaction mode.
+  jobs and lost notifications. The listener uses a connection of its own, not
+  a pool slot. `WithoutListen()` turns it off, for PgBouncer in transaction
+  mode.
+- **Jobs that must end.** A cancel request whose worker is gone is applied
+  when its lease runs out, so such a job is never claimed again. A janitor
+  run holds one pool connection under a session-level advisory lock and
+  deletes in batches of 1000 until it is caught up.
 - **Time.** Run times and unique windows are offsets applied to the database
   clock (`clock_timestamp()`), so client clock skew and the age of a caller's
   transaction do not shift them.
@@ -235,9 +242,11 @@ everything with a KV record per job:
   new gen`, publish the new copy (delayed with `@at` when needed), record
   its sequence, then ack. If the publish fails outright, the old
   generation is restored and the delivery nak'ed, so the job is not lost.
-- **Cancel.** CAS the record away (or mark it cancelled while running),
-  delete the pending message, and release the key. Every remaining copy is
-  then stale.
+- **Cancel.** CAS the record to a cancellation tombstone, delete the pending
+  message, and release the key. The same record keeps a leftover copy from
+  being read as a first delivery. A cancellation marks the record rather than
+  ending the lease, so a running job finishes its attempt and its settlement
+  ends as a cancellation.
 - **Enqueue.** Check the id (an unfinished record means `ErrJobIDInUse`),
   take the unique key, create the record, then publish. After an uncertain
   publish, the record and the lock stay in place.

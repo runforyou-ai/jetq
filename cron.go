@@ -184,6 +184,13 @@ func (c Cron) Next(t time.Time, loc *time.Location) time.Time {
 			}
 			continue
 		}
+		// When DST ends, a wall time happens twice. time.Date returns the
+		// first occurrence, so any other instant with the same wall clock is
+		// the second: fire once per wall time and skip it.
+		if !t.Equal(time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, loc)) {
+			t = t.Add(time.Second)
+			continue
+		}
 		return t
 	}
 	return time.Time{}

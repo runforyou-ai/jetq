@@ -127,7 +127,7 @@ err = tx.Commit(ctx)
 
 Notes:
 
-- Waiting workers are woken by `LISTEN/NOTIFY`. The listener **holds one connection from your pool** for the driver's lifetime, so size the pool accordingly (at least 2 connections, more with many workers). With PgBouncer in transaction mode use `pgq.WithoutListen()`; workers then poll (`pgq.WithPollInterval`).
+- Waiting workers are woken by `LISTEN/NOTIFY` on a channel of the driver's own, separate from the pool, so a small pool is fine. With PgBouncer in transaction mode use `pgq.WithoutListen()`; workers then poll (`pgq.WithPollInterval`).
 - All times are applied against the database clock, so clock skew between application hosts does not shift delays.
 - Succeeded and cancelled jobs are kept for 24 hours (`WithRetention`), dead letters for 14 days (`WithDeadRetention`).
 
