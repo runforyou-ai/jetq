@@ -217,6 +217,9 @@ type jobState struct {
 	// UniqueKey and UniqueFor mirror the message, to release the lock.
 	UniqueKey string `json:"unique_key,omitempty"`
 	UniqueFor int64  `json:"unique_for,omitempty"`
+	// LockOwner is the token the unique key was taken with, from enqueue. It
+	// outlives the generations of the copies, which change on every requeue.
+	LockOwner string `json:"lock_owner,omitempty"`
 	// FinishedAt is when the job ended, for the janitor.
 	FinishedAt time.Time `json:"finished_at,omitzero"`
 	// Canceled marks a job cancelled while it ran; its next claim drops it.
@@ -224,6 +227,10 @@ type jobState struct {
 	// Next is the generation of a copy published by a requeue whose record
 	// switch is not confirmed yet. A claim of that copy completes the handoff.
 	Next string `json:"next,omitempty"`
+	// Claim identifies the current claim. It is new on every claim and never
+	// reused, even when the job id is, so it fences a lease where the attempt,
+	// which restarts at one for a reused id, cannot.
+	Claim string `json:"claim,omitempty"`
 	// LastError is the reason of the last retry, for inspection.
 	LastError string `json:"last_error,omitempty"`
 }
@@ -412,8 +419,11 @@ func (d *Driver) Enqueue(ctx context.Context, msg *jobq.Message) error {
 	} else if !errors.Is(err, jetstream.ErrKeyNotFound) {
 		return err
 	}
+	env := newEnvelope(msg)
+	env.Gen = jobq.NewID()
+	// The lock owner is this job instance, not its id, which can be reused.
 	if msg.UniqueKey != "" {
-		ok, err := d.lockUnique(ctx, msg)
+		ok, err := d.lockUnique(ctx, msg, env.Gen)
 		if err != nil {
 			return err
 		}
@@ -421,15 +431,13 @@ func (d *Driver) Enqueue(ctx context.Context, msg *jobq.Message) error {
 			return jobq.ErrDuplicate
 		}
 	}
-	env := newEnvelope(msg)
-	env.Gen = jobq.NewID()
-	state := &jobState{Queue: msg.Queue, Gen: env.Gen, UniqueKey: msg.UniqueKey, UniqueFor: int64(msg.UniqueFor)}
+	state := &jobState{Queue: msg.Queue, Gen: env.Gen, UniqueKey: msg.UniqueKey, UniqueFor: int64(msg.UniqueFor), LockOwner: env.Gen}
 	rev, err := d.putState(ctx, msg.ID, 0, state)
 	if err != nil {
 		if errors.Is(err, jobq.ErrLeaseLost) {
 			err = jobq.ErrJobIDInUse
 		}
-		d.unlockUnique(context.WithoutCancel(ctx), msg.UniqueKey, msg.UniqueFor, msg.ID)
+		d.unlockUnique(context.WithoutCancel(ctx), msg.UniqueKey, msg.UniqueFor, env.Gen)
 		return err
 	}
 	seq, err := d.publish(ctx, msg, env, msg.RunAt)
@@ -442,7 +450,7 @@ func (d *Driver) Enqueue(ctx context.Context, msg *jobq.Message) error {
 	if err != nil {
 		cleanup := context.WithoutCancel(ctx)
 		_ = d.deleteState(cleanup, msg.ID, rev)
-		d.unlockUnique(cleanup, msg.UniqueKey, msg.UniqueFor, msg.ID)
+		d.unlockUnique(cleanup, msg.UniqueKey, msg.UniqueFor, env.Gen)
 		return err
 	}
 	state.Seq = seq
@@ -487,7 +495,7 @@ func uniqueKey(key string) string {
 
 // lockUnique takes the job's unique key. Windowed keys live for their window;
 // the others live until released, bounded by the lock TTL.
-func (d *Driver) lockUnique(ctx context.Context, msg *jobq.Message) (bool, error) {
+func (d *Driver) lockUnique(ctx context.Context, msg *jobq.Message, owner string) (bool, error) {
 	ttl := d.cfg.uniqueLockTTL
 	if msg.UniqueFor > 0 {
 		ttl = msg.UniqueFor
@@ -495,7 +503,7 @@ func (d *Driver) lockUnique(ctx context.Context, msg *jobq.Message) (bool, error
 	// Create takes over a key whose TTL ran out, using the marker the server
 	// leaves, and applies this key's TTL. Every other existing key is in use:
 	// its own TTL decides when it ends, never this caller's.
-	_, err := d.state.Create(ctx, uniqueKey(msg.UniqueKey), []byte(msg.ID), jetstream.KeyTTL(ttl))
+	_, err := d.state.Create(ctx, uniqueKey(msg.UniqueKey), []byte(owner), jetstream.KeyTTL(ttl))
 	if errors.Is(err, jetstream.ErrKeyExists) {
 		return false, nil
 	}
@@ -692,11 +700,13 @@ func (d *Driver) claimMessage(ctx context.Context, msg jetstream.Msg, leaseDur t
 	// never outlives the claim.
 	next.Next = ""
 	next.Attempt = attempt
+	next.Claim = jobq.NewID()
 	next.Running = true
 	next.LeaseUntil = now.Add(leaseDur)
 	next.LeaseStart = now
 	next.Queue = env.Queue
 	next.UniqueKey, next.UniqueFor = env.UniqueKey, int64(env.UniqueFor)
+	next.LockOwner = s.LockOwner
 	_, err = d.putState(ctx, env.ID, rev, &next)
 	if err != nil {
 		if errors.Is(err, jobq.ErrLeaseLost) && rev == 0 {
@@ -718,7 +728,7 @@ func (d *Driver) claimMessage(ctx context.Context, msg jetstream.Msg, leaseDur t
 		}
 		return nil, err
 	}
-	return &jobLease{d: d, msg: env.message(), attempt: attempt, nmsg: msg, lease: leaseDur, scheduled: env.Schedule != "", schedule: env.Schedule}, nil
+	return &jobLease{d: d, msg: env.message(), attempt: attempt, claim: next.Claim, nmsg: msg, lease: leaseDur, scheduled: env.Schedule != "", schedule: env.Schedule}, nil
 }
 
 // consumer returns the durable consumer of queue, creating it with AckWait
@@ -802,7 +812,7 @@ func (d *Driver) Cancel(ctx context.Context, id string) error {
 				d.cfg.logger.WarnContext(ctx, "natsq: delete cancelled job message", "id", id, "error", err)
 			}
 		}
-		d.unlockUnique(ctx, s.UniqueKey, time.Duration(s.UniqueFor), id)
+		d.unlockUnique(ctx, s.UniqueKey, time.Duration(s.UniqueFor), s.LockOwner)
 		return nil
 	}
 }
@@ -813,6 +823,7 @@ type jobLease struct {
 	d       *Driver
 	msg     *jobq.Message
 	attempt int
+	claim   string // the record's Claim at this claim; see jobState.Claim
 	nmsg    jetstream.Msg
 	lease   time.Duration
 	// scheduled marks a job fired by a recurring schedule, and schedule is its
@@ -828,8 +839,9 @@ func (l *jobLease) Message() *jobq.Message { return l.msg }
 func (l *jobLease) Attempt() int           { return l.attempt }
 
 // own reads the record and reports whether this lease still holds the job:
-// the record is running at this lease's attempt. A newer claim always has a
-// higher attempt. A cancellation keeps the job held until it settles.
+// the record is running under this lease's claim token. Every claim, also of
+// a reused job id, gets a new token. A cancellation keeps the job held until
+// it settles.
 func (l *jobLease) own(ctx context.Context) (*jobState, uint64, error) {
 	s, rev, err := l.d.getState(ctx, l.msg.ID)
 	if errors.Is(err, jetstream.ErrKeyNotFound) {
@@ -838,7 +850,7 @@ func (l *jobLease) own(ctx context.Context) (*jobState, uint64, error) {
 	if err != nil {
 		return nil, 0, err
 	}
-	if !s.Running || s.Attempt != l.attempt {
+	if !s.Running || s.Claim != l.claim {
 		return nil, 0, jobq.ErrLeaseLost
 	}
 	return s, rev, nil
@@ -851,9 +863,8 @@ func (l *jobLease) Extend(ctx context.Context) error {
 	if l.done {
 		return jobq.ErrLeaseLost
 	}
-	if err := l.nmsg.InProgress(); err != nil {
-		return fmt.Errorf("natsq: extend %s: %w", l.msg.ID, err)
-	}
+	// Confirm the lease first: InProgress resets the delivery's AckWait, which
+	// a lease that is already lost has no right to do.
 	s, rev, err := l.own(ctx)
 	if errors.Is(err, jobq.ErrLeaseLost) {
 		l.done = true
@@ -862,13 +873,14 @@ func (l *jobLease) Extend(ctx context.Context) error {
 		return err
 	}
 	s.LeaseUntil, s.LeaseStart = time.Now().Add(l.lease), time.Now()
-	_, err = l.d.putState(ctx, l.msg.ID, rev, s)
-	if errors.Is(err, jobq.ErrLeaseLost) {
-		l.done = true
-		return jobq.ErrLeaseLost
-	}
-	if err != nil {
+	if _, err := l.d.putState(ctx, l.msg.ID, rev, s); err != nil {
+		if errors.Is(err, jobq.ErrLeaseLost) {
+			l.done = true
+		}
 		return err
+	}
+	if err := l.nmsg.InProgress(); err != nil {
+		return fmt.Errorf("natsq: extend %s: %w", l.msg.ID, err)
 	}
 	return nil
 }
@@ -899,7 +911,7 @@ func (l *jobLease) finished(s *jobState) *jobState {
 // letter for a job that runs again.
 func (l *jobLease) Fail(ctx context.Context, reason string) error {
 	return l.settle(ctx, func(s *jobState) (*jobState, error) {
-		if _, err := l.d.storeDead(ctx, l.msg, l.attempt, reason); err != nil {
+		if err := l.d.storeDead(ctx, l.msg, l.attempt, reason, l.claim); err != nil {
 			return nil, err
 		}
 		return l.finished(s), nil
@@ -1020,7 +1032,7 @@ func (l *jobLease) settle(ctx context.Context, change func(*jobState) (*jobState
 			return err
 		}
 	}
-	l.d.unlockUnique(ctx, s.UniqueKey, time.Duration(s.UniqueFor), l.msg.ID)
+	l.d.unlockUnique(ctx, s.UniqueKey, time.Duration(s.UniqueFor), s.LockOwner)
 	l.done = true
 	// A lost ack is harmless: the redelivery finds no record and is dropped.
 	_ = l.nmsg.Ack()
@@ -1057,21 +1069,22 @@ type deadLetter struct {
 
 // storeDead appends the job to the dead-letter stream and returns its
 // sequence, which is the paging cursor.
-func (d *Driver) storeDead(ctx context.Context, msg *jobq.Message, attempts int, reason string) (uint64, error) {
+func (d *Driver) storeDead(ctx context.Context, msg *jobq.Message, attempts int, reason, claim string) error {
 	dl := deadLetter{Envelope: *newEnvelope(msg), Payload: msg.Payload, Attempts: attempts, Error: reason, FailedAt: time.Now()}
 	data, err := json.Marshal(dl)
 	if err != nil {
-		return 0, err
+		return err
 	}
 	pubCtx, cancel := context.WithTimeout(ctx, publishTimeout)
 	defer cancel()
-	// A retried Fail must not store the same dead letter twice.
-	ack, err := d.js.Publish(pubCtx, d.cfg.prefix+".dead."+msg.Queue, data,
-		jetstream.WithMsgID("dead-"+msg.ID+"-"+strconv.Itoa(attempts)))
+	// A retried Fail of one claim must not store its dead letter twice; a later
+	// claim of the same job, after RetryDead, has its own token.
+	_, err = d.js.Publish(pubCtx, d.cfg.prefix+".dead."+msg.Queue, data,
+		jetstream.WithMsgID("dead-"+claim))
 	if err != nil {
-		return 0, fmt.Errorf("natsq: store dead letter %s: %w", msg.ID, err)
+		return fmt.Errorf("natsq: store dead letter %s: %w", msg.ID, err)
 	}
-	return ack.Sequence, nil
+	return nil
 }
 
 // scanWindow bounds a dead-letter scan that asks for no limit.
@@ -1217,15 +1230,23 @@ func (d *Driver) DeadLetters(ctx context.Context, q jobq.DeadLetterQuery) (jobq.
 
 // findDead returns the newest dead letter of job id.
 func (d *Driver) findDead(ctx context.Context, id string) (deadEntry, bool, error) {
-	entries, err := d.scanDead(ctx, "", 0, 0, id)
-	if err != nil {
-		return deadEntry{}, false, err
+	// Each scan reads a bounded batch; page back until the job turns up or
+	// the stream is exhausted.
+	before := uint64(0)
+	for {
+		entries, err := d.scanDead(ctx, "", before, scanWindow, id)
+		if err != nil {
+			return deadEntry{}, false, err
+		}
+		n := len(entries)
+		if n > 0 && entries[n-1].dl.Envelope.ID == id {
+			return entries[n-1], true, nil
+		}
+		if n < scanWindow {
+			return deadEntry{}, false, nil
+		}
+		before = entries[n-1].seq
 	}
-	// The scan stops at a match; without one the list holds no such job.
-	if n := len(entries); n > 0 && entries[n-1].dl.Envelope.ID == id {
-		return entries[n-1], true, nil
-	}
-	return deadEntry{}, false, nil
 }
 
 // RetryDead implements [jobq.Inspector].
