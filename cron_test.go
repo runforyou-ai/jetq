@@ -43,6 +43,37 @@ func TestCronNext(t *testing.T) {
 	}
 }
 
+func TestCronNextAcrossDST(t *testing.T) {
+	t.Parallel()
+	ny, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := jobq.ParseCron("0 2 * * *")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan time.Time, 1)
+	from := time.Date(2026, 3, 7, 12, 0, 0, 0, ny)
+	go func() { done <- c.Next(from, ny) }()
+	select {
+	case got := <-done:
+		if !got.After(from) {
+			t.Fatalf("Next = %s, not after %s", got, from)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Next did not return across the spring-forward gap")
+	}
+	t0 := from
+	for range 10 {
+		n := c.Next(t0, ny)
+		if !n.After(t0) {
+			t.Fatalf("Next(%s) = %s does not advance", t0, n)
+		}
+		t0 = n
+	}
+}
+
 func TestParseCronErrors(t *testing.T) {
 	t.Parallel()
 	for _, spec := range []string{"", "* * * *", "60 * * * *", "* * * * * * *", "@every 10ms", "@sometimes", "*/0 * * * *", "5-1 * * * *", "MON * * * *"} {

@@ -148,7 +148,14 @@ func (c Cron) Next(t time.Time, loc *time.Location) time.Time {
 	}
 	t = t.In(loc).Truncate(time.Second).Add(time.Second)
 	limit := t.AddDate(5, 0, 0)
+	last := t.Add(-time.Second)
 	for t.Before(limit) {
+		// time.Date maps a wall time that does not exist (a DST gap) to an
+		// earlier instant. Never go backwards or stand still: skip an hour.
+		if !t.After(last) {
+			t = last.Add(time.Hour)
+		}
+		last = t
 		if c.month&(1<<int(t.Month())) == 0 {
 			t = time.Date(t.Year(), t.Month()+1, 1, 0, 0, 0, 0, loc)
 			continue

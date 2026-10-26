@@ -520,12 +520,28 @@ func (w *Worker) deadLetter(ctx context.Context, j *job, h *handler, cause error
 }
 
 func (w *Worker) callback(ctx context.Context, j *job, fn func()) {
-	defer func() {
-		if r := recover(); r != nil {
-			w.client.logger.ErrorContext(ctx, "jobq failure callback panicked", w.attrs(j, "panic", r, "stack", string(debug.Stack()))...)
-		}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer func() {
+			if r := recover(); r != nil {
+				w.client.logger.ErrorContext(ctx, "jobq failure callback panicked", w.attrs(j, "panic", r, "stack", string(debug.Stack()))...)
+			}
+		}()
+		fn()
 	}()
-	fn()
+	select {
+	case <-done:
+		return
+	case <-ctx.Done():
+	}
+	// ctx ended: it is the settlement timeout, which bounds failure callbacks.
+	// Stop waiting so Run can return; the callback keeps running unobserved.
+	select {
+	case <-done:
+	default:
+		w.client.logger.ErrorContext(ctx, "jobq failure callback ignored cancellation, abandoning it", w.attrs(j)...)
+	}
 }
 
 // settled logs a failed settlement. The job's lease then expires and it is

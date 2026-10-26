@@ -221,6 +221,9 @@ type jobState struct {
 	FinishedAt time.Time `json:"finished_at,omitzero"`
 	// Canceled marks a job cancelled while it ran; its next claim drops it.
 	Canceled bool `json:"canceled,omitempty"`
+	// Next is the generation of a copy published by a requeue whose record
+	// switch is not confirmed yet. A claim of that copy completes the handoff.
+	Next string `json:"next,omitempty"`
 	// LastError is the reason of the last retry, for inspection.
 	LastError string `json:"last_error,omitempty"`
 }
@@ -426,7 +429,7 @@ func (d *Driver) Enqueue(ctx context.Context, msg *jobq.Message) error {
 		if errors.Is(err, jobq.ErrLeaseLost) {
 			err = jobq.ErrJobIDInUse
 		}
-		d.unlockUnique(context.WithoutCancel(ctx), msg.UniqueKey, msg.UniqueFor)
+		d.unlockUnique(context.WithoutCancel(ctx), msg.UniqueKey, msg.UniqueFor, msg.ID)
 		return err
 	}
 	seq, err := d.publish(ctx, msg, env, msg.RunAt)
@@ -439,7 +442,7 @@ func (d *Driver) Enqueue(ctx context.Context, msg *jobq.Message) error {
 	if err != nil {
 		cleanup := context.WithoutCancel(ctx)
 		_ = d.deleteState(cleanup, msg.ID, rev)
-		d.unlockUnique(cleanup, msg.UniqueKey, msg.UniqueFor)
+		d.unlockUnique(cleanup, msg.UniqueKey, msg.UniqueFor, msg.ID)
 		return err
 	}
 	state.Seq = seq
@@ -508,11 +511,23 @@ func (d *Driver) lockUnique(ctx context.Context, msg *jobq.Message) (bool, error
 }
 
 // unlockUnique releases an until-done key; windowed keys expire on their own.
-func (d *Driver) unlockUnique(ctx context.Context, key string, window time.Duration) {
+func (d *Driver) unlockUnique(ctx context.Context, key string, window time.Duration, owner string) {
 	if key == "" || window > 0 {
 		return
 	}
-	if err := d.state.Delete(ctx, uniqueKey(key)); err != nil && !errors.Is(err, jetstream.ErrKeyNotFound) {
+	entry, err := d.state.Get(ctx, uniqueKey(key))
+	if errors.Is(err, jetstream.ErrKeyNotFound) {
+		return
+	}
+	if err != nil {
+		d.cfg.logger.WarnContext(ctx, "natsq: read unique key", "error", err)
+		return
+	}
+	// A lock that expired may be held by another job by now: leave it alone.
+	if string(entry.Value()) != owner {
+		return
+	}
+	if err := d.state.Delete(ctx, uniqueKey(key), jetstream.LastRevision(entry.Revision())); err != nil && !errors.Is(err, jetstream.ErrKeyNotFound) && !isConflict(err) {
 		d.cfg.logger.WarnContext(ctx, "natsq: release unique key", "error", err)
 	}
 }
@@ -654,8 +669,11 @@ func (d *Driver) claimMessage(ctx context.Context, msg jetstream.Msg, leaseDur t
 		return nil, err
 	}
 	switch {
-	case s.Canceled || !s.FinishedAt.IsZero() || s.Gen != env.Gen:
-		// Cancelled, finished, or an older copy of the job.
+	case s.Canceled || !s.FinishedAt.IsZero():
+		_ = msg.Term()
+		return nil, nil
+	case s.Gen != env.Gen && (s.Next == "" || s.Next != env.Gen):
+		// An older copy of the job.
 		_ = msg.Term()
 		return nil, nil
 	case s.Running && s.LeaseUntil.After(now) && msgTime(msg).Add(s.LeaseUntil.Sub(s.LeaseStart)).After(now):
@@ -667,6 +685,13 @@ func (d *Driver) claimMessage(ctx context.Context, msg jetstream.Msg, leaseDur t
 	}
 	attempt := s.Attempt + 1
 	next := *s
+	if s.Next != "" && s.Next == env.Gen {
+		// Complete an unconfirmed requeue handoff: this copy becomes current.
+		next.Gen = env.Gen
+	}
+	// Whichever copy is claimed first settles the handoff, so a stale Next
+	// never outlives the claim.
+	next.Next = ""
 	next.Attempt = attempt
 	next.Running = true
 	next.LeaseUntil = now.Add(leaseDur)
@@ -688,7 +713,7 @@ func (d *Driver) claimMessage(ctx context.Context, msg jetstream.Msg, leaseDur t
 		}
 		return nil, err
 	}
-	return &jobLease{d: d, msg: env.message(), attempt: attempt, nmsg: msg, stateRev: newRev, lease: leaseDur}, nil
+	return &jobLease{d: d, msg: env.message(), attempt: attempt, nmsg: msg, stateRev: newRev, lease: leaseDur, scheduled: env.Schedule != ""}, nil
 }
 
 // consumer returns the durable consumer of queue, creating it with AckWait
@@ -776,7 +801,7 @@ func (d *Driver) Cancel(ctx context.Context, id string) error {
 				d.cfg.logger.WarnContext(ctx, "natsq: delete cancelled job message", "id", id, "error", err)
 			}
 		}
-		d.unlockUnique(ctx, s.UniqueKey, time.Duration(s.UniqueFor))
+		d.unlockUnique(ctx, s.UniqueKey, time.Duration(s.UniqueFor), id)
 		return nil
 	}
 }
@@ -790,6 +815,8 @@ type jobLease struct {
 	nmsg     jetstream.Msg
 	stateRev uint64
 	lease    time.Duration
+	// scheduled marks a job fired by a recurring schedule.
+	scheduled bool
 
 	mu   sync.Mutex
 	done bool
@@ -827,6 +854,15 @@ func (l *jobLease) Extend(ctx context.Context) error {
 // Complete implements [jobq.Lease].
 func (l *jobLease) Complete(ctx context.Context) error {
 	return l.settle(ctx, func(s *jobState) (*jobState, error) {
+		if l.scheduled {
+			// A schedule occurrence has no record before its first claim, so
+			// deleting it would make a redelivery look like a first delivery.
+			// Keep a finished record; the janitor removes it after the state TTL.
+			s.Running = false
+			s.LeaseUntil, s.LeaseStart = time.Time{}, time.Time{}
+			s.FinishedAt = time.Now()
+			return s, nil
+		}
 		return nil, nil // finished: remove the record
 	})
 }
@@ -875,41 +911,39 @@ func (l *jobLease) requeue(ctx context.Context, env *envelope, at time.Time, att
 		return jobq.ErrLeaseLost
 	}
 	env.Gen = jobq.NewID()
-	next := *s
-	next.Attempt = attempt
-	next.Running = false
-	next.LeaseUntil, next.LeaseStart = time.Time{}, time.Time{}
-	next.LastError = reason
-	next.Gen = env.Gen
-	// Record the new generation first: from here on the delivery being
-	// settled is a stale copy, and so is the new copy if the publish fails.
-	newRev, err := l.d.putState(ctx, l.msg.ID, rev, &next)
+	// Step 1: record the intent. The record stays current for the old copy and
+	// remembers the new generation, so either copy can be recovered.
+	pending := *s
+	pending.Next = env.Gen
+	pending.Running = false
+	pending.Attempt = attempt
+	pending.LeaseUntil, pending.LeaseStart = time.Time{}, time.Time{}
+	pending.LastError = reason
+	pendRev, err := l.d.putState(ctx, l.msg.ID, rev, &pending)
 	if err != nil {
 		l.done = true
 		return err
 	}
-	l.stateRev = newRev
-	l.done = true
+	l.stateRev = pendRev
+	// Step 2: publish the new copy. On any failure leave the old delivery
+	// unacked and report the error: nothing is lost, the old delivery comes
+	// back after its lease and the record's pending generation is superseded.
 	seq, err := l.d.publish(ctx, l.msg, env, at)
-	if err != nil && !errors.Is(err, jobq.ErrUncertain) {
-		// Nothing holds the job now. Leave the old delivery unacked: when it
-		// comes back its generation is stale, so restore the record to make
-		// it current again.
-		next.Gen = s.Gen
-		next.Attempt = s.Attempt
-		if _, restoreErr := l.d.putState(context.WithoutCancel(ctx), l.msg.ID, newRev, &next); restoreErr != nil {
-			l.d.cfg.logger.ErrorContext(ctx, "natsq: job may be lost after a failed requeue", "id", l.msg.ID, "error", restoreErr)
-		}
-		_ = l.nmsg.Nak()
+	if err != nil {
+		l.done = true
 		return err
 	}
-	if err == nil {
-		next.Seq = seq
-		if _, err := l.d.putState(ctx, l.msg.ID, newRev, &next); err != nil && !errors.Is(err, jobq.ErrLeaseLost) {
-			l.d.cfg.logger.WarnContext(ctx, "natsq: record job sequence", "id", l.msg.ID, "error", err)
-		}
+	// Step 3: switch the record to the new copy.
+	done := pending
+	done.Gen, done.Next, done.Seq = env.Gen, "", seq
+	if _, err := l.d.putState(ctx, l.msg.ID, pendRev, &done); err != nil {
+		// The new copy is published and the record names it as Next, so its
+		// first claim completes the handoff. Do not fail the requeue.
+		l.d.cfg.logger.WarnContext(ctx, "natsq: confirm requeue", "id", l.msg.ID, "error", err)
 	}
-	// A lost ack is harmless: the old copy's generation is stale.
+	l.done = true
+	// A lost ack is harmless: the old copy is stale once the record switched,
+	// and is dropped after the switch.
 	_ = l.nmsg.Ack()
 	return nil
 }
@@ -942,7 +976,7 @@ func (l *jobLease) settle(ctx context.Context, change func(*jobState) (*jobState
 			return err
 		}
 	}
-	l.d.unlockUnique(ctx, s.UniqueKey, time.Duration(s.UniqueFor))
+	l.d.unlockUnique(ctx, s.UniqueKey, time.Duration(s.UniqueFor), l.msg.ID)
 	l.done = true
 	// A lost ack is harmless: the redelivery finds no record and is dropped.
 	_ = l.nmsg.Ack()
