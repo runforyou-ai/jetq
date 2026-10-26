@@ -32,6 +32,12 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: ${{ matrix.module }}/go.mod
+      # The sub-modules are built against the core module in this checkout,
+      # so CI does not depend on which core version is tagged.
+      - name: Use workspace
+        run: |
+          go work init . ./natsq ./pgq
+          go work edit -replace github.com/runforyou-ai/jobq@v0.5.0=.
       - name: Test
         working-directory: ${{ matrix.module }}
         run: go test -race -count=1 ./...
@@ -48,6 +54,12 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: ${{ matrix.module }}/go.mod
+      # The sub-modules are built against the core module in this checkout,
+      # so CI does not depend on which core version is tagged.
+      - name: Use workspace
+        run: |
+          go work init . ./natsq ./pgq
+          go work edit -replace github.com/runforyou-ai/jobq@v0.5.0=.
       - run: go vet ./...
         working-directory: ${{ matrix.module }}
       - uses: golangci/golangci-lint-action@v9
