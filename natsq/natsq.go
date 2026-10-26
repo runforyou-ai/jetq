@@ -492,16 +492,11 @@ func (d *Driver) lockUnique(ctx context.Context, msg *jobq.Message) (bool, error
 	if msg.UniqueFor > 0 {
 		ttl = msg.UniqueFor
 	}
+	// Create takes over a key whose TTL ran out, using the marker the server
+	// leaves, and applies this key's TTL. Every other existing key is in use:
+	// its own TTL decides when it ends, never this caller's.
 	_, err := d.state.Create(ctx, uniqueKey(msg.UniqueKey), []byte(msg.ID), jetstream.KeyTTL(ttl))
 	if errors.Is(err, jetstream.ErrKeyExists) {
-		// A lock that ran out but whose marker is still there can be taken.
-		if entry, getErr := d.state.Get(ctx, uniqueKey(msg.UniqueKey)); getErr == nil {
-			if time.Since(entry.Created()) > ttl {
-				if _, err := d.state.Update(ctx, uniqueKey(msg.UniqueKey), []byte(msg.ID), entry.Revision()); err == nil {
-					return true, nil
-				}
-			}
-		}
 		return false, nil
 	}
 	if err != nil {
@@ -614,6 +609,10 @@ func (d *Driver) Claim(ctx context.Context, queue string, max int, lease time.Du
 			l, err := d.claimMessage(ctx, msg, lease)
 			if err != nil {
 				stopFetch()
+				_ = msg.Nak()
+				for rest := range res.batch.Messages() {
+					_ = rest.Nak()
+				}
 				for _, claimed := range leases {
 					_ = claimed.Release(context.WithoutCancel(ctx), jobq.Release{})
 				}
@@ -698,12 +697,18 @@ func (d *Driver) claimMessage(ctx context.Context, msg jetstream.Msg, leaseDur t
 	next.LeaseStart = now
 	next.Queue = env.Queue
 	next.UniqueKey, next.UniqueFor = env.UniqueKey, int64(env.UniqueFor)
-	newRev, err := d.putState(ctx, env.ID, rev, &next)
+	_, err = d.putState(ctx, env.ID, rev, &next)
 	if err != nil {
 		if errors.Is(err, jobq.ErrLeaseLost) && rev == 0 {
-			// A schedule occurrence whose id is taken by another job.
-			d.cfg.logger.WarnContext(ctx, "natsq: schedule occurrence id in use, skipping it", "id", env.ID)
-			_ = msg.Term()
+			// Another delivery created the record first. Only an id owned by a
+			// different job is a collision; otherwise hand the copy back.
+			cur, _, getErr := d.getState(ctx, env.ID)
+			if getErr == nil && cur.Gen != env.Gen && cur.Next != env.Gen {
+				d.cfg.logger.WarnContext(ctx, "natsq: schedule occurrence id in use, skipping it", "id", env.ID)
+				_ = msg.Term()
+				return nil, nil
+			}
+			_ = msg.NakWithDelay(time.Second)
 			return nil, nil
 		}
 		if errors.Is(err, jobq.ErrLeaseLost) {
@@ -713,7 +718,7 @@ func (d *Driver) claimMessage(ctx context.Context, msg jetstream.Msg, leaseDur t
 		}
 		return nil, err
 	}
-	return &jobLease{d: d, msg: env.message(), attempt: attempt, nmsg: msg, stateRev: newRev, lease: leaseDur, scheduled: env.Schedule != "", schedule: env.Schedule}, nil
+	return &jobLease{d: d, msg: env.message(), attempt: attempt, nmsg: msg, lease: leaseDur, scheduled: env.Schedule != "", schedule: env.Schedule}, nil
 }
 
 // consumer returns the durable consumer of queue, creating it with AckWait
@@ -772,14 +777,14 @@ func (d *Driver) Cancel(ctx context.Context, id string) error {
 		if !s.FinishedAt.IsZero() || s.Canceled {
 			return jobq.ErrNotFound
 		}
-		if s.Running {
-			// The worker settles under its lease; the record makes that fail.
-			s.Canceled = true
-			s.FinishedAt = time.Now()
-			_, err = d.putState(ctx, id, rev, s)
-		} else {
-			err = d.deleteState(ctx, id, rev)
-		}
+		// Keep the record as a tombstone, running or not: a leftover copy of a
+		// scheduled occurrence would otherwise find no record and be treated
+		// as a first delivery. A running job keeps its lease and finishes its
+		// attempt, which then ends as a cancellation; the janitor removes the
+		// record after the state TTL.
+		s.Canceled = true
+		s.FinishedAt = time.Now()
+		_, err = d.putState(ctx, id, rev, s)
 		if errors.Is(err, jobq.ErrLeaseLost) {
 			continue // the record changed meanwhile: look again
 		}
@@ -801,12 +806,11 @@ func (d *Driver) Cancel(ctx context.Context, id string) error {
 // === lease ===
 
 type jobLease struct {
-	d        *Driver
-	msg      *jobq.Message
-	attempt  int
-	nmsg     jetstream.Msg
-	stateRev uint64
-	lease    time.Duration
+	d       *Driver
+	msg     *jobq.Message
+	attempt int
+	nmsg    jetstream.Msg
+	lease   time.Duration
 	// scheduled marks a job fired by a recurring schedule, and schedule is its
 	// key; both survive Retry and Release.
 	scheduled bool
@@ -819,6 +823,23 @@ type jobLease struct {
 func (l *jobLease) Message() *jobq.Message { return l.msg }
 func (l *jobLease) Attempt() int           { return l.attempt }
 
+// own reads the record and reports whether this lease still holds the job:
+// the record is running at this lease's attempt. A newer claim always has a
+// higher attempt. A cancellation keeps the job held until it settles.
+func (l *jobLease) own(ctx context.Context) (*jobState, uint64, error) {
+	s, rev, err := l.d.getState(ctx, l.msg.ID)
+	if errors.Is(err, jetstream.ErrKeyNotFound) {
+		return nil, 0, jobq.ErrLeaseLost
+	}
+	if err != nil {
+		return nil, 0, err
+	}
+	if !s.Running || s.Attempt != l.attempt {
+		return nil, 0, jobq.ErrLeaseLost
+	}
+	return s, rev, nil
+}
+
 // Extend implements [jobq.Lease].
 func (l *jobLease) Extend(ctx context.Context) error {
 	l.mu.Lock()
@@ -827,21 +848,24 @@ func (l *jobLease) Extend(ctx context.Context) error {
 		return jobq.ErrLeaseLost
 	}
 	if err := l.nmsg.InProgress(); err != nil {
-		l.done = true
-		return jobq.ErrLeaseLost
+		return fmt.Errorf("natsq: extend %s: %w", l.msg.ID, err)
 	}
-	s, rev, err := l.d.getState(ctx, l.msg.ID)
-	if err != nil || rev != l.stateRev || s.Attempt != l.attempt || !s.Running {
+	s, rev, err := l.own(ctx)
+	if errors.Is(err, jobq.ErrLeaseLost) {
 		l.done = true
-		return jobq.ErrLeaseLost
+	}
+	if err != nil {
+		return err
 	}
 	s.LeaseUntil, s.LeaseStart = time.Now().Add(l.lease), time.Now()
-	newRev, err := l.d.putState(ctx, l.msg.ID, rev, s)
-	if err != nil {
+	_, err = l.d.putState(ctx, l.msg.ID, rev, s)
+	if errors.Is(err, jobq.ErrLeaseLost) {
 		l.done = true
 		return jobq.ErrLeaseLost
 	}
-	l.stateRev = newRev
+	if err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -892,9 +916,8 @@ func (l *jobLease) Release(ctx context.Context, r jobq.Release) error {
 	if r.Snooze {
 		env.Snoozes++
 	}
-	if !r.UnknownSince.IsZero() {
-		env.UnknownSince = r.UnknownSince
-	}
+	// Release replaces UnknownSince, so a release without one clears it.
+	env.UnknownSince = r.UnknownSince
 	return l.requeue(ctx, env, r.At, l.attempt-1, "", r)
 }
 
@@ -906,10 +929,16 @@ func (l *jobLease) requeue(ctx context.Context, env *envelope, at time.Time, att
 	if l.done {
 		return jobq.ErrLeaseLost
 	}
-	s, rev, err := l.d.getState(ctx, l.msg.ID)
-	if err != nil || rev != l.stateRev || s.Attempt != l.attempt || !s.Running {
+	s, rev, err := l.own(ctx)
+	if errors.Is(err, jobq.ErrLeaseLost) {
 		l.done = true
-		return jobq.ErrLeaseLost
+	}
+	if err != nil {
+		return err
+	}
+	if s.Canceled {
+		// Cancelled while it ran: it is not retried.
+		return l.endCanceled(ctx, s, rev)
 	}
 	env.Gen = jobq.NewID()
 	// Step 1: record the intent. The record stays current for the old copy and
@@ -925,7 +954,6 @@ func (l *jobLease) requeue(ctx context.Context, env *envelope, at time.Time, att
 		l.done = true
 		return err
 	}
-	l.stateRev = pendRev
 	// Step 2: publish the new copy. On any failure leave the old delivery
 	// unacked and report the error: nothing is lost, the old delivery comes
 	// back after its lease and the record's pending generation is superseded.
@@ -963,10 +991,15 @@ func (l *jobLease) settle(ctx context.Context, change func(*jobState) (*jobState
 	if l.done {
 		return jobq.ErrLeaseLost
 	}
-	s, rev, err := l.d.getState(ctx, l.msg.ID)
-	if err != nil || rev != l.stateRev || s.Attempt != l.attempt || !s.Running {
+	s, rev, err := l.own(ctx)
+	if errors.Is(err, jobq.ErrLeaseLost) {
 		l.done = true
-		return jobq.ErrLeaseLost
+	}
+	if err != nil {
+		return err
+	}
+	if s.Canceled {
+		return l.endCanceled(ctx, s, rev)
 	}
 	next, err := change(s)
 	if err != nil {
@@ -986,6 +1019,23 @@ func (l *jobLease) settle(ctx context.Context, change func(*jobState) (*jobState
 	l.d.unlockUnique(ctx, s.UniqueKey, time.Duration(s.UniqueFor), l.msg.ID)
 	l.done = true
 	// A lost ack is harmless: the redelivery finds no record and is dropped.
+	_ = l.nmsg.Ack()
+	return nil
+}
+
+// endCanceled settles a job that was cancelled while it ran: it keeps the
+// cancelled record as a tombstone and acks the delivery. Cancel released the
+// unique key already.
+func (l *jobLease) endCanceled(ctx context.Context, s *jobState, rev uint64) error {
+	s.Running = false
+	s.LeaseUntil, s.LeaseStart = time.Time{}, time.Time{}
+	if _, err := l.d.putState(ctx, l.msg.ID, rev, s); err != nil {
+		if errors.Is(err, jobq.ErrLeaseLost) {
+			l.done = true
+		}
+		return err
+	}
+	l.done = true
 	_ = l.nmsg.Ack()
 	return nil
 }
@@ -1025,18 +1075,22 @@ type deadEntry struct {
 }
 
 // scanDead walks the dead-letter stream backwards from before (zero: the
-// newest) and returns entries matching queue, newest first.
-func (d *Driver) scanDead(ctx context.Context, queue string, before uint64, limit int) ([]deadEntry, error) {
+// newest) and returns entries matching queue, newest first. limit zero means
+// no limit, but stopAt ends the scan at the first entry with that job id.
+func (d *Driver) scanDead(ctx context.Context, queue string, before uint64, limit int, stopAt string) ([]deadEntry, error) {
 	info, err := d.dead.Info(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("natsq: dead letter stream: %w", err)
 	}
+	// Older entries have expired; walking below FirstSeq would be one empty
+	// round trip per sequence.
+	first := info.State.FirstSeq
 	seq := info.State.LastSeq
 	if before > 0 {
 		seq = before - 1
 	}
 	var out []deadEntry
-	for seq > 0 && (limit <= 0 || len(out) < limit) {
+	for seq >= first && first > 0 && (limit <= 0 || len(out) < limit) {
 		raw, err := d.dead.GetMsg(ctx, seq)
 		if errors.Is(err, jetstream.ErrMsgNotFound) {
 			seq--
@@ -1049,6 +1103,9 @@ func (d *Driver) scanDead(ctx context.Context, queue string, before uint64, limi
 		if json.Unmarshal(raw.Data, &dl) == nil && (queue == "" || dl.Envelope.Queue == queue) {
 			dl.Envelope.Payload = dl.Payload
 			out = append(out, deadEntry{seq: seq, dl: dl})
+			if stopAt != "" && dl.Envelope.ID == stopAt {
+				return out, nil
+			}
 		}
 		seq--
 	}
@@ -1095,13 +1152,14 @@ func (d *Driver) Stats(ctx context.Context) (jobq.Stats, error) {
 	}
 	stats.Schedules = len(schedules.State.Subjects)
 
-	// Dead letters are counted by scanning the stream once, newest first.
-	dead, err := d.scanDead(ctx, "", 0, 0)
+	dead, err := d.dead.Info(ctx, jetstream.WithSubjectFilter(d.cfg.prefix+".dead.>"))
 	if err != nil {
-		return stats, err
+		return stats, fmt.Errorf("natsq: dead letter stats: %w", err)
 	}
-	for _, e := range dead {
-		get(e.dl.Envelope.Queue).Dead++
+	for subject, n := range dead.State.Subjects {
+		rest := strings.TrimPrefix(subject, d.cfg.prefix+".dead.")
+		queue, _, _ := strings.Cut(rest, ".")
+		get(queue).Dead += int64(n)
 	}
 	queues := slices.SortedFunc(maps.Values(counts), func(a, b *jobq.QueueStats) int {
 		return strings.Compare(a.Queue, b.Queue)
@@ -1114,6 +1172,9 @@ func (d *Driver) Stats(ctx context.Context) (jobq.Stats, error) {
 
 // DeadLetters implements [jobq.Inspector].
 func (d *Driver) DeadLetters(ctx context.Context, q jobq.DeadLetterQuery) (jobq.DeadLetterPage, error) {
+	if q.Limit <= 0 {
+		q.Limit = 50
+	}
 	before := uint64(0)
 	if q.Cursor != "" {
 		n, err := strconv.ParseUint(q.Cursor, 10, 64)
@@ -1122,7 +1183,7 @@ func (d *Driver) DeadLetters(ctx context.Context, q jobq.DeadLetterQuery) (jobq.
 		}
 		before = n
 	}
-	entries, err := d.scanDead(ctx, q.Queue, before, q.Limit+1)
+	entries, err := d.scanDead(ctx, q.Queue, before, q.Limit+1, "")
 	if err != nil {
 		return jobq.DeadLetterPage{}, err
 	}
@@ -1144,14 +1205,13 @@ func (d *Driver) DeadLetters(ctx context.Context, q jobq.DeadLetterQuery) (jobq.
 
 // findDead returns the newest dead letter of job id.
 func (d *Driver) findDead(ctx context.Context, id string) (deadEntry, bool, error) {
-	entries, err := d.scanDead(ctx, "", 0, 0)
+	entries, err := d.scanDead(ctx, "", 0, 0, id)
 	if err != nil {
 		return deadEntry{}, false, err
 	}
-	for _, e := range entries {
-		if e.dl.Envelope.ID == id {
-			return e, true, nil
-		}
+	// The scan stops at a match; without one the list holds no such job.
+	if n := len(entries); n > 0 && entries[n-1].dl.Envelope.ID == id {
+		return entries[n-1], true, nil
 	}
 	return deadEntry{}, false, nil
 }
@@ -1231,6 +1291,8 @@ func (d *Driver) SyncSchedules(ctx context.Context, schedules []jobq.ScheduleSpe
 		if current != nil && string(current.Data) == string(msg.Data) && scheduleEqual(current.Header, msg.Header) {
 			continue
 		}
+		// Rollup replaces the previous schedule on this subject.
+		msg.Header.Set(jetstream.MsgRollup, jetstream.MsgRollupSubject)
 		if _, err := d.js.PublishMsg(ctx, msg, jetstream.WithExpectStream(d.cfg.stream)); err != nil {
 			return fmt.Errorf("natsq: install schedule %s: %w", subject, err)
 		}

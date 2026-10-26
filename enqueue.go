@@ -52,6 +52,9 @@ func UniqueFor(key string, d time.Duration) EnqueueOption {
 		if d <= 0 {
 			o.err = errors.New("jobq: UniqueFor needs a positive duration")
 		}
+		if key == "" {
+			o.err = errors.New("jobq: UniqueFor needs a key")
+		}
 		o.unique, o.uniqueFor = key, d
 	}
 }
@@ -73,6 +76,9 @@ func Timeout(d time.Duration) EnqueueOption {
 // names starting with [HeaderPrefix] are reserved.
 func WithHeader(key, value string) EnqueueOption {
 	return func(o *enqueueOptions) {
+		if strings.ContainsAny(value, "\r\n\x00") {
+			o.err = fmt.Errorf("jobq: header %q has a control character in its value", key)
+		}
 		if o.header == nil {
 			o.header = map[string]string{}
 		}

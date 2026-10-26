@@ -3,6 +3,7 @@
 package memq
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"maps"
@@ -18,6 +19,7 @@ import (
 // [jobq.Scheduler] and [jobq.Inspector].
 type Driver struct {
 	mu        sync.Mutex
+	seq       int64
 	jobs      map[string]*entry
 	dead      []*dead // oldest first
 	unique    map[string]uniqueHold
@@ -31,6 +33,7 @@ type Driver struct {
 }
 
 type entry struct {
+	seq         int64 // insertion order, for a fair claim order
 	msg         *jobq.Message
 	state       int
 	attempt     int
@@ -97,6 +100,9 @@ func (d *Driver) insert(msg *jobq.Message) error {
 	}
 	now := d.now()
 	if msg.UniqueKey != "" {
+		if h, ok := d.unique[msg.UniqueKey]; ok && !h.until.IsZero() && !now.Before(h.until) {
+			delete(d.unique, msg.UniqueKey) // the window has passed
+		}
 		if h, ok := d.unique[msg.UniqueKey]; ok && (h.until.IsZero() || now.Before(h.until)) {
 			return jobq.ErrDuplicate
 		}
@@ -106,7 +112,8 @@ func (d *Driver) insert(msg *jobq.Message) error {
 		}
 		d.unique[msg.UniqueKey] = hold
 	}
-	d.jobs[msg.ID] = &entry{msg: msg}
+	d.seq++
+	d.jobs[msg.ID] = &entry{seq: d.seq, msg: msg}
 	d.queues[msg.Queue] = true
 	d.signal()
 	return nil
@@ -135,7 +142,13 @@ const pollInterval = 2 * time.Second
 func (d *Driver) Claim(ctx context.Context, queue string, limit int, lease time.Duration) ([]jobq.Lease, error) {
 	deadline := time.NewTimer(pollInterval)
 	defer deadline.Stop()
+	if limit <= 0 {
+		return nil, nil
+	}
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		d.mu.Lock()
 		if d.closed {
 			d.mu.Unlock()
@@ -192,10 +205,10 @@ func (d *Driver) claim(queue string, limit int, lease time.Duration) ([]jobq.Lea
 		due = append(due, e)
 	}
 	slices.SortFunc(due, func(a, b *entry) int {
-		if c := a.msg.RunAt.Compare(b.msg.RunAt); c != 0 {
+		if c := dueAt(a, now).Compare(dueAt(b, now)); c != 0 {
 			return c
 		}
-		return compareStrings(a.msg.ID, b.msg.ID)
+		return cmp.Compare(a.seq, b.seq)
 	})
 	var leases []jobq.Lease
 	for _, e := range due[:min(len(due), limit)] {
@@ -208,14 +221,18 @@ func (d *Driver) claim(queue string, limit int, lease time.Duration) ([]jobq.Lea
 	return leases, next
 }
 
-func compareStrings(a, b string) int {
+// dueAt is when the entry became claimable: the run time, the end of a
+// running lease, or the enqueue time for a job that was due at once.
+func dueAt(e *entry, now time.Time) time.Time {
 	switch {
-	case a < b:
-		return -1
-	case a > b:
-		return 1
+	case e.state == running:
+		return e.lockedUntil
+	case !e.msg.RunAt.IsZero():
+		return e.msg.RunAt
+	case !e.msg.EnqueuedAt.IsZero():
+		return e.msg.EnqueuedAt
 	}
-	return 0
+	return now
 }
 
 // Cancel implements [jobq.Driver]. Pending jobs, due or not, can be cancelled;
@@ -331,9 +348,7 @@ func (l *memLease) Release(_ context.Context, r jobq.Release) error {
 	if r.Snooze {
 		l.e.msg.Snoozes++
 	}
-	if !r.UnknownSince.IsZero() {
-		l.e.msg.UnknownSince = r.UnknownSince
-	}
+	l.e.msg.UnknownSince = r.UnknownSince
 	l.d.signal()
 	return nil
 }
@@ -492,7 +507,8 @@ func (d *Driver) DeadLetters(_ context.Context, q jobq.DeadLetterQuery) (jobq.De
 func (d *Driver) RetryDead(_ context.Context, id string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	for i, x := range d.dead {
+	for i := len(d.dead) - 1; i >= 0; i-- {
+		x := d.dead[i]
 		if x.msg.ID != id {
 			continue
 		}
@@ -514,8 +530,8 @@ func (d *Driver) RetryDead(_ context.Context, id string) error {
 func (d *Driver) DeleteDead(_ context.Context, id string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	for i, x := range d.dead {
-		if x.msg.ID == id {
+	for i := len(d.dead) - 1; i >= 0; i-- {
+		if d.dead[i].msg.ID == id {
 			d.dead = slices.Delete(d.dead, i, i+1)
 			return nil
 		}

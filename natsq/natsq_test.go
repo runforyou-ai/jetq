@@ -146,13 +146,25 @@ func TestCancelRunningJob(t *testing.T) {
 	if err := d.Cancel(ctx, msg.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := l.Retry(ctx, time.Now(), "x"); !errors.Is(err, jobq.ErrLeaseLost) {
-		t.Fatalf("retry after cancel = %v", err)
+	// The running attempt keeps its lease.
+	if err := l.Extend(ctx); err != nil {
+		t.Fatalf("extend after cancel = %v", err)
 	}
 	// The unique key is free again.
-	other, _ := jobq.NewMessage("x", 2, jobq.OnQueue("q"), jobq.Unique("u"))
+	other, _ := jobq.NewMessage("x", 2, jobq.OnQueue("q2"), jobq.Unique("u"))
 	if err := d.Enqueue(ctx, other); err != nil {
 		t.Fatal(err)
+	}
+	// Its retry ends the job instead of running it again.
+	if err := l.Retry(ctx, time.Now(), "x"); err != nil {
+		t.Fatalf("retry after cancel = %v", err)
+	}
+	c, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	for c.Err() == nil {
+		if ls, _ := d.Claim(c, "q", 1, time.Minute); len(ls) > 0 {
+			t.Fatalf("cancelled job ran again: attempt %d", ls[0].Attempt())
+		}
 	}
 }
 

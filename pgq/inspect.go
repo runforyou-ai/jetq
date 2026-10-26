@@ -154,10 +154,10 @@ WHERE next_run_at <= now() ORDER BY next_run_at LIMIT 20 FOR UPDATE SKIP LOCKED`
 		}
 		if err := d.fireOne(ctx, sp, s, now); err != nil {
 			// A schedule that cannot fire must not hold up the others: undo
-			// its work, log it and try again in a minute.
+			// its work, log it and try again at its next occurrence.
 			_ = sp.Rollback(context.WithoutCancel(ctx))
 			d.cfg.logger.Warn("pgq: schedule failed", "key", s.key, "error", err)
-			if _, err := tx.Exec(ctx, `UPDATE `+d.s+`.schedules SET next_run_at = clock_timestamp() + interval '1 minute' WHERE key = $1`, s.key); err != nil {
+			if _, err := tx.Exec(ctx, `UPDATE `+d.s+`.schedules SET next_run_at = $2 WHERE key = $1`, s.key, retryAt(s, now)); err != nil {
 				return err
 			}
 			continue
@@ -201,6 +201,24 @@ func (d *Driver) fireOne(ctx context.Context, tx pgx.Tx, s dueSchedule, now time
 	return err
 }
 
+// retryAt is when a schedule that failed to fire is tried again: its next
+// occurrence, so it never fires off its cron, or in an hour when the schedule
+// itself cannot be read.
+func retryAt(s dueSchedule, now time.Time) time.Time {
+	cron, err := jobq.ParseCron(s.cron)
+	if err != nil {
+		return now.Add(time.Hour)
+	}
+	loc, err := scheduleLocation(s.timezone)
+	if err != nil {
+		return now.Add(time.Hour)
+	}
+	if next := cron.Next(now, loc); !next.IsZero() {
+		return next
+	}
+	return now.Add(time.Hour)
+}
+
 // === inspection ===
 
 // Stats implements [jobq.Inspector].
@@ -211,8 +229,7 @@ func (d *Driver) Stats(ctx context.Context) (jobq.Stats, error) {
   count(*) FILTER (WHERE state = 'pending' AND run_at > now()),
   count(*) FILTER (WHERE state = 'running' AND locked_until > now()),
   count(*) FILTER (WHERE state = 'failed')
-FROM `+d.s+`.jobs GROUP BY queue
-HAVING count(*) FILTER (WHERE state IN ('pending', 'running', 'failed')) > 0
+FROM `+d.s+`.jobs WHERE state IN ('pending', 'running', 'failed') GROUP BY queue
 ORDER BY queue`)
 	if err != nil {
 		return stats, fmt.Errorf("pgq: stats: %w", err)
@@ -238,6 +255,9 @@ ORDER BY queue`)
 // DeadLetters implements [jobq.Inspector]. The cursor is the finish time and
 // id of the last entry returned.
 func (d *Driver) DeadLetters(ctx context.Context, q jobq.DeadLetterQuery) (jobq.DeadLetterPage, error) {
+	if q.Limit <= 0 {
+		q.Limit = 50
+	}
 	var page jobq.DeadLetterPage
 	var curAt *time.Time
 	curID := ""

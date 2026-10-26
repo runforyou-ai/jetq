@@ -57,4 +57,21 @@ DROP TRIGGER IF EXISTS jobs_notify ON %[1]s.jobs;
 CREATE TRIGGER jobs_notify AFTER INSERT OR UPDATE OF state, run_at ON %[1]s.jobs
   FOR EACH ROW WHEN (NEW.state = 'pending') EXECUTE FUNCTION %[1]s.notify_job();
 `,
+	// 2: cancelling a running job is a request, applied when the job settles,
+	// and dead letters are paged per queue.
+	`
+ALTER TABLE %[1]s.jobs ADD COLUMN IF NOT EXISTS cancel_requested boolean NOT NULL DEFAULT false;
+CREATE INDEX IF NOT EXISTS jobs_queue_failed ON %[1]s.jobs (queue, finished_at DESC, id DESC) WHERE state = 'failed';
+DROP INDEX IF EXISTS %[1]s.jobs_failed;
+CREATE INDEX IF NOT EXISTS jobs_failed ON %[1]s.jobs (finished_at DESC, id DESC) WHERE state = 'failed';
+
+-- One notification channel per schema, so drivers of other schemas in the
+-- same database are not woken.
+CREATE OR REPLACE FUNCTION %[1]s.notify_job() RETURNS trigger AS $$
+BEGIN
+  PERFORM pg_notify('jobq.' || TG_TABLE_SCHEMA, NEW.queue);
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+`,
 }

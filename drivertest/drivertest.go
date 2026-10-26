@@ -307,11 +307,13 @@ func (s *suite) release(t *testing.T) {
 	if m := l.Message(); m.Snoozes != 1 || !m.UnknownSince.Equal(since) {
 		t.Fatalf("snoozes = %d, unknown since = %s, want 1, %s", m.Snoozes, m.UnknownSince, since)
 	}
+	// Release replaces UnknownSince, so a release without one clears it: a
+	// value from an earlier deploy must not dead-letter a healthy job later.
 	must(t, l.Release(ctx(t), jobq.Release{At: time.Now().Add(2 * time.Second)}))
 	expectNone(t, d, "q", time.Second)
 	l = claimOne(t, d, "q", time.Minute, 2*time.Second+s.opts.Resolution+5*time.Second)
-	if m := l.Message(); l.Attempt() != 1 || m.Snoozes != 1 || !m.UnknownSince.Equal(since) {
-		t.Fatalf("after delayed release: attempt %d, snoozes %d, unknown since %s", l.Attempt(), m.Snoozes, m.UnknownSince)
+	if m := l.Message(); l.Attempt() != 1 || m.Snoozes != 1 || !m.UnknownSince.IsZero() {
+		t.Fatalf("after delayed release: attempt %d, snoozes %d, unknown since %s (want zero)", l.Attempt(), m.Snoozes, m.UnknownSince)
 	}
 }
 
@@ -453,7 +455,9 @@ func (s *suite) cancelRunning(t *testing.T) {
 	must(t, d.Cancel(ctx(t), msg.ID))
 	expectNone(t, d, "q", time.Second)
 
-	msg = message(t, "q")
+	// A running job finishes its current attempt: Cancel neither ends its
+	// lease nor lets it run again, and frees its unique key at once.
+	msg = message(t, "q", jobq.Unique("running"))
 	enqueue(t, d, msg)
 	l = claimOne(t, d, "q", time.Minute, 5*time.Second)
 	err := d.Cancel(ctx(t), msg.ID)
@@ -461,8 +465,9 @@ func (s *suite) cancelRunning(t *testing.T) {
 		t.Fatalf("cancel running = %v", err)
 	}
 	if err == nil {
-		// Accepted while running: the retry must not run.
-		_ = l.Retry(ctx(t), time.Now(), "again")
+		must(t, l.Extend(ctx(t)))
+		enqueue(t, d, message(t, "other", jobq.Unique("running")))
+		must(t, l.Retry(ctx(t), time.Now(), "again"))
 		expectNone(t, d, "q", time.Second+s.opts.Resolution)
 	} else {
 		must(t, l.Complete(ctx(t)))

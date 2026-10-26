@@ -53,6 +53,10 @@ func (s Schedule) spec() (ScheduleSpec, error) {
 	if err := validName("schedule key", s.Key); err != nil {
 		return ScheduleSpec{}, err
 	}
+	// Fired job ids are "<key>-<unix seconds>", which must stay a valid name.
+	if len(s.Key) > 106 {
+		return ScheduleSpec{}, fmt.Errorf("jobq: schedule %q: key must be at most 106 characters", s.Key)
+	}
 	cron, err := ParseCron(s.Cron)
 	if err != nil {
 		return ScheduleSpec{}, fmt.Errorf("jobq: schedule %q: %w", s.Key, err)

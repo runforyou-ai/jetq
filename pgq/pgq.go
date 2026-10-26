@@ -196,7 +196,7 @@ func (d *Driver) wakeAll() {
 	d.mu.Unlock()
 }
 
-// listen holds one connection on LISTEN jobq and fans notifications out.
+// listen holds one connection on the schema's channel and fans notifications out.
 func (d *Driver) listen() {
 	defer d.wg.Done()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -222,7 +222,7 @@ func (d *Driver) listenOnce(ctx context.Context) error {
 		return err
 	}
 	defer conn.Release()
-	if _, err := conn.Exec(ctx, "LISTEN jobq"); err != nil {
+	if _, err := conn.Exec(ctx, "LISTEN "+pgx.Identifier{"jobq." + d.cfg.schema}.Sanitize()); err != nil {
 		return err
 	}
 	// Notifications may have been missed while disconnected.

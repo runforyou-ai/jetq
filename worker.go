@@ -270,6 +270,9 @@ func (w *Worker) consume(ctx, jobCtx context.Context, q Queue, running *sync.Wai
 	}
 	failures := 0
 	for {
+		if ctx.Err() != nil {
+			return
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -436,9 +439,14 @@ func (w *Worker) attempt(parent context.Context, j *job, h *handler) error {
 	result := make(chan error, 1)
 	go func() { result <- w.run(ctx, j.info, h, j.msg.Payload) }()
 	var err error
+	// Only a result taken after the timeout fired is a timeout failure. A
+	// handler that returned first keeps its own result, even when the timer
+	// goes off before the check below.
+	timedOut := false
 	select {
 	case err = <-result:
 	case <-ctx.Done():
+		timedOut = errors.Is(context.Cause(ctx), ErrTimeout)
 		abandon := time.NewTimer(abandonAfter)
 		defer abandon.Stop()
 		select {
@@ -451,7 +459,7 @@ func (w *Worker) attempt(parent context.Context, j *job, h *handler) error {
 	// Once the timeout has passed the attempt is an ordinary failure,
 	// whatever the handler returned: snoozes, RetryAfter and Permanent only
 	// contribute their text.
-	if errors.Is(context.Cause(ctx), ErrTimeout) {
+	if timedOut {
 		text := "context deadline exceeded"
 		if err != nil {
 			text = err.Error()
@@ -520,6 +528,10 @@ func (w *Worker) deadLetter(ctx context.Context, j *job, h *handler, cause error
 }
 
 func (w *Worker) callback(ctx context.Context, j *job, fn func()) {
+	// Each callback has its own bound: one that uses up the settlement budget
+	// must not make the callbacks after it look abandoned.
+	cbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), settleTimeout)
+	defer cancel()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -533,9 +545,9 @@ func (w *Worker) callback(ctx context.Context, j *job, fn func()) {
 	select {
 	case <-done:
 		return
-	case <-ctx.Done():
+	case <-cbCtx.Done():
 	}
-	// ctx ended: it is the settlement timeout, which bounds failure callbacks.
+	// The callback used up its time.
 	// Stop waiting so Run can return; the callback keeps running unobserved.
 	select {
 	case <-done:

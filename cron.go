@@ -118,6 +118,9 @@ func parseField(field string, lo, hi int) (uint64, error) {
 		if from < lo || to > hi {
 			return 0, fmt.Errorf("value out of range %d-%d in %q", lo, hi, part)
 		}
+		if step > hi-lo+1 {
+			return 0, fmt.Errorf("step %d is larger than the field range in %q", step, part)
+		}
 		for v := from; v <= to; v += step {
 			set |= 1 << v
 		}

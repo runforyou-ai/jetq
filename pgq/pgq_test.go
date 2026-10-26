@@ -106,6 +106,9 @@ func TestEnqueueTx(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A failed assertion must not leave the transaction open: the schema
+	// cleanup would wait on its locks forever.
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
 	if err := d.EnqueueTx(ctx, tx, committed); err != nil {
 		t.Fatal(err)
 	}
@@ -162,13 +165,16 @@ func TestReusedJobIDDoesNotRevivePreviousLease(t *testing.T) {
 	if err := d.Enqueue(ctx, first); err != nil {
 		t.Fatal(err)
 	}
-	stale, err := d.Claim(ctx, "q", 1, time.Minute)
+	stale, err := d.Claim(ctx, "q", 1, time.Second)
 	if err != nil || len(stale) != 1 {
 		t.Fatalf("claim = %v, %v", stale, err)
 	}
 	if err := d.Cancel(ctx, first.ID); err != nil {
 		t.Fatal(err)
 	}
+	// The cancelled job is unfinished until its attempt ends; its worker is
+	// gone here, so wait for the lease to run out before reusing the id.
+	time.Sleep(1200 * time.Millisecond)
 	second, _ := jobq.NewMessage("x", 2, jobq.OnQueue("q"), jobq.JobID(first.ID), jobq.Unique("k"))
 	if err := d.Enqueue(ctx, second); err != nil {
 		t.Fatal(err)
