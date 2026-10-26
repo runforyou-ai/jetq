@@ -537,6 +537,9 @@ func (d *Driver) unlockUnique(ctx context.Context, key string, window time.Durat
 
 // === claim ===
 
+// claimWindow bounds how long one Claim waits for work.
+const claimWindow = 5 * time.Second
+
 // Claim implements [jobq.Driver].
 func (d *Driver) Claim(ctx context.Context, queue string, max int, lease time.Duration) ([]jobq.Lease, error) {
 	if max <= 0 {
@@ -546,16 +549,8 @@ func (d *Driver) Claim(ctx context.Context, queue string, max int, lease time.Du
 	if err != nil {
 		return nil, err
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		// Fetch takes its expiry from the context deadline; a context that is
-		// already past yields no fetch at all.
-		if time.Now().After(deadline) {
-			return nil, nil
-		}
+	deadline := time.Now().Add(claimWindow)
+	for ctx.Err() == nil {
 		window := min(time.Until(deadline), fetchWindow)
 		if dl, ok := ctx.Deadline(); ok {
 			window = min(window, time.Until(dl))
@@ -563,85 +558,99 @@ func (d *Driver) Claim(ctx context.Context, queue string, max int, lease time.Du
 		if window < 10*time.Millisecond {
 			return nil, nil
 		}
-		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), window)
-		// Fetch does not return on cancellation until its own expiry, so wait
-		// on the result ourselves.
-		type result struct {
-			batch jetstream.MessageBatch
-			err   error
-		}
-		done := make(chan result, 1)
-		go func() {
-			batch, err := consumer.Fetch(max, jetstream.FetchContext(fetchCtx))
-			done <- result{batch, err}
-		}()
-		var res result
-		select {
-		case res = <-done:
-		case <-ctx.Done():
-			cancel()
-			res = <-done
-			if res.err == nil {
-				// Give back what the fetch already took, so it does not wait
-				// for AckWait.
-				for msg := range res.batch.Messages() {
-					_ = msg.Nak()
-				}
+		batch, err := d.fetchBatch(ctx, consumer, max, window)
+		if errors.Is(err, jetstream.ErrConsumerDeleted) || errors.Is(err, jetstream.ErrConsumerNotFound) {
+			d.forgetConsumer(queue)
+			if consumer, err = d.consumer(ctx, queue, lease); err != nil {
+				return nil, err
 			}
-			return nil, ctx.Err()
+			continue
 		}
-		// Messages is drained below while fetchCtx is still live.
-		stopFetch := cancel
-		if res.err != nil {
+		if err != nil {
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
-			if errors.Is(res.err, context.Canceled) || errors.Is(res.err, context.DeadlineExceeded) {
-				// The fetch window closed; the batch may still hold deliveries.
-				res.err = nil
-			}
-		}
-		if res.err != nil {
-			stopFetch()
-			if errors.Is(res.err, jetstream.ErrConsumerDeleted) || errors.Is(res.err, jetstream.ErrConsumerNotFound) {
-				d.forgetConsumer(queue)
-				if consumer, err = d.consumer(ctx, queue, lease); err != nil {
-					return nil, err
-				}
-				continue
-			}
-			return nil, fmt.Errorf("natsq: fetch %s: %w", queue, res.err)
-		}
-		var leases []jobq.Lease
-		for msg := range res.batch.Messages() {
-			l, err := d.claimMessage(ctx, msg, lease)
-			if err != nil {
-				stopFetch()
-				_ = msg.Nak()
-				for rest := range res.batch.Messages() {
-					_ = rest.Nak()
-				}
-				for _, claimed := range leases {
-					_ = claimed.Release(context.WithoutCancel(ctx), jobq.Release{})
-				}
-				return nil, err
-			}
-			if l != nil {
-				leases = append(leases, l)
-			}
-		}
-		stopFetch()
-		if err := res.batch.Error(); err != nil && ctx.Err() == nil &&
-			!errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
 			return nil, fmt.Errorf("natsq: fetch %s: %w", queue, err)
 		}
-		if len(leases) > 0 {
-			return leases, nil
-		}
-		if time.Now().After(deadline) {
-			return nil, nil
+		leases, err := d.claimBatch(ctx, batch, lease)
+		if err != nil || len(leases) > 0 {
+			return leases, err
 		}
 	}
+	return nil, ctx.Err()
+}
+
+// fetched is a batch whose pull is stopped once it has been read.
+type fetched struct {
+	jetstream.MessageBatch
+	cancel context.CancelFunc
+}
+
+// fetchBatch pulls up to max deliveries within window. A closed window is not
+// an error: it yields what arrived. When ctx ends first, everything fetched is
+// handed back at once and ctx.Err() is returned.
+func (d *Driver) fetchBatch(ctx context.Context, consumer jetstream.Consumer, max int, window time.Duration) (*fetched, error) {
+	// The pull takes its expiry from this context and does not return on the
+	// caller's cancellation, so the caller's ctx is waited on separately.
+	fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), window)
+	type result struct {
+		batch jetstream.MessageBatch
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		batch, err := consumer.Fetch(max, jetstream.FetchContext(fetchCtx))
+		done <- result{batch, err}
+	}()
+	var res result
+	select {
+	case res = <-done:
+	case <-ctx.Done():
+		cancel()
+		if res = <-done; res.err == nil {
+			for msg := range res.batch.Messages() {
+				_ = msg.Nak()
+			}
+		}
+		return nil, ctx.Err()
+	}
+	if errors.Is(res.err, context.Canceled) || errors.Is(res.err, context.DeadlineExceeded) {
+		res.err = nil // the window closed
+	}
+	if res.err != nil {
+		cancel()
+		return nil, res.err
+	}
+	return &fetched{MessageBatch: res.batch, cancel: cancel}, nil
+}
+
+// claimBatch turns each delivery of batch into a lease. On a claim error the
+// delivery being handled, the rest of the batch and the leases already taken
+// are given back.
+func (d *Driver) claimBatch(ctx context.Context, batch *fetched, lease time.Duration) ([]jobq.Lease, error) {
+	defer batch.cancel()
+	var leases []jobq.Lease
+	for msg := range batch.Messages() {
+		l, err := d.claimMessage(ctx, msg, lease)
+		if err != nil {
+			_ = msg.Nak()
+			for rest := range batch.Messages() {
+				_ = rest.Nak()
+			}
+			for _, claimed := range leases {
+				_ = claimed.Release(context.WithoutCancel(ctx), jobq.Release{})
+			}
+			return nil, err
+		}
+		if l != nil {
+			leases = append(leases, l)
+		}
+	}
+	if err := batch.Error(); err != nil && ctx.Err() == nil &&
+		!errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		return leases, fmt.Errorf("natsq: fetch: %w", err)
+	}
+	return leases, nil
 }
 
 // claimMessage turns one delivery into a lease, or settles it when it is
@@ -856,19 +865,26 @@ func (l *jobLease) own(ctx context.Context) (*jobState, uint64, error) {
 	return s, rev, nil
 }
 
-// Extend implements [jobq.Lease].
-func (l *jobLease) Extend(ctx context.Context) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+// hold returns the record while this lease still holds the job, marking the
+// lease done once the job is known to be lost. The caller holds l.mu.
+func (l *jobLease) hold(ctx context.Context) (*jobState, uint64, error) {
 	if l.done {
-		return jobq.ErrLeaseLost
+		return nil, 0, jobq.ErrLeaseLost
 	}
-	// Confirm the lease first: InProgress resets the delivery's AckWait, which
-	// a lease that is already lost has no right to do.
 	s, rev, err := l.own(ctx)
 	if errors.Is(err, jobq.ErrLeaseLost) {
 		l.done = true
 	}
+	return s, rev, err
+}
+
+// Extend implements [jobq.Lease].
+func (l *jobLease) Extend(ctx context.Context) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	// Confirm the lease first: InProgress resets the delivery's AckWait, which
+	// a lease that is already lost has no right to do.
+	s, rev, err := l.hold(ctx)
 	if err != nil {
 		return err
 	}
@@ -922,7 +938,7 @@ func (l *jobLease) Fail(ctx context.Context, reason string) error {
 func (l *jobLease) Retry(ctx context.Context, at time.Time, reason string) error {
 	env := newEnvelope(l.msg)
 	env.Schedule = l.schedule
-	return l.requeue(ctx, env, at, l.attempt, reason, jobq.Release{})
+	return l.requeue(ctx, env, at, l.attempt, reason)
 }
 
 // Release implements [jobq.Lease].
@@ -934,21 +950,15 @@ func (l *jobLease) Release(ctx context.Context, r jobq.Release) error {
 	}
 	// Release replaces UnknownSince, so a release without one clears it.
 	env.UnknownSince = r.UnknownSince
-	return l.requeue(ctx, env, r.At, l.attempt-1, "", r)
+	return l.requeue(ctx, env, r.At, l.attempt-1, "")
 }
 
 // requeue stores a new message for the job, updates the record, then acks the
 // old delivery.
-func (l *jobLease) requeue(ctx context.Context, env *envelope, at time.Time, attempt int, reason string, _ jobq.Release) error {
+func (l *jobLease) requeue(ctx context.Context, env *envelope, at time.Time, attempt int, reason string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.done {
-		return jobq.ErrLeaseLost
-	}
-	s, rev, err := l.own(ctx)
-	if errors.Is(err, jobq.ErrLeaseLost) {
-		l.done = true
-	}
+	s, rev, err := l.hold(ctx)
 	if err != nil {
 		return err
 	}
@@ -983,20 +993,23 @@ func (l *jobLease) requeue(ctx context.Context, env *envelope, at time.Time, att
 	done.Gen, done.Next, done.Seq = env.Gen, "", seq
 	_, err = l.d.putState(ctx, l.msg.ID, pendRev, &done)
 	l.done = true
-	if err != nil {
-		// The switch failed. The record may have been claimed by another
-		// worker meanwhile, and a JetStream ack is not tied to a delivery:
-		// acking now could settle that worker's delivery. Look at the record
-		// and ack only when it confirms the handoff.
-		cur, _, getErr := l.d.getState(ctx, l.msg.ID)
-		if getErr != nil || cur.Gen != env.Gen {
-			l.d.cfg.logger.WarnContext(ctx, "natsq: requeue not confirmed, leaving the old delivery to expire", "id", l.msg.ID, "error", err)
-			return nil
-		}
+	if err != nil && !l.d.handedOver(ctx, l.msg.ID, env.Gen) {
+		// A JetStream ack is not tied to a delivery: with the handoff
+		// unconfirmed, another worker may hold the job, and acking could
+		// settle its delivery. Leave the old delivery to expire.
+		l.d.cfg.logger.WarnContext(ctx, "natsq: requeue not confirmed, leaving the old delivery to expire", "id", l.msg.ID, "error", err)
+		return nil
 	}
 	// A lost ack is harmless: the old copy is stale once the record switched.
 	_ = l.nmsg.Ack()
 	return nil
+}
+
+// handedOver reports whether the record of job id already names gen as its
+// current copy.
+func (d *Driver) handedOver(ctx context.Context, id, gen string) bool {
+	cur, _, err := d.getState(ctx, id)
+	return err == nil && cur.Gen == gen
 }
 
 // settle applies change to the record and acks the delivery. change returns
@@ -1004,13 +1017,7 @@ func (l *jobLease) requeue(ctx context.Context, env *envelope, at time.Time, att
 func (l *jobLease) settle(ctx context.Context, change func(*jobState) (*jobState, error)) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.done {
-		return jobq.ErrLeaseLost
-	}
-	s, rev, err := l.own(ctx)
-	if errors.Is(err, jobq.ErrLeaseLost) {
-		l.done = true
-	}
+	s, rev, err := l.hold(ctx)
 	if err != nil {
 		return err
 	}
