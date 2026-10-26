@@ -119,11 +119,12 @@ Timeouts, abandoning handlers that ignore cancellation (10s), shutdown
 
 ### Schema
 
-The schema lives in a configurable schema (default `jobq`) and is created by
-versioned migrations recorded in `jobq.migrations`. Migrations run under
-`pg_advisory_xact_lock`.
+The tables live in a configurable schema (default `jobq`) and are created by
+versioned migrations recorded in `<schema>.migrations`. Migrations run under
+`pg_advisory_xact_lock`, keyed by the schema name.
 
 ```sql
+CREATE SEQUENCE jobq.claim_token_seq;
 CREATE TABLE jobq.jobs (
   id            text PRIMARY KEY,
   queue         text NOT NULL,
@@ -133,7 +134,7 @@ CREATE TABLE jobq.jobs (
   state         text NOT NULL,         -- pending | running | succeeded | failed | canceled
   attempt       int  NOT NULL DEFAULT 0,
   max_attempts  int  NOT NULL DEFAULT 0,
-  timeout_ms    bigint NOT NULL DEFAULT 0,
+  timeout_ns    bigint NOT NULL DEFAULT 0,
   snoozes       int  NOT NULL DEFAULT 0,
   unknown_since timestamptz,
   run_at        timestamptz NOT NULL,
@@ -141,71 +142,54 @@ CREATE TABLE jobq.jobs (
   claim_token   bigint NOT NULL DEFAULT 0,
   last_error    text,
   unique_key    text,
-  unique_until  timestamptz,          -- null: until done
-  enqueued_at   timestamptz NOT NULL,
+  unique_for_ns bigint NOT NULL DEFAULT 0,
+  enqueued_at   timestamptz,
   finished_at   timestamptz
 );
-CREATE INDEX ON jobq.jobs (queue, run_at, id) WHERE state = 'pending';
-CREATE INDEX ON jobq.jobs (locked_until) WHERE state = 'running';
-CREATE INDEX ON jobq.jobs (queue, finished_at DESC) WHERE state = 'failed';
-CREATE INDEX ON jobq.jobs (finished_at) WHERE state IN ('succeeded', 'canceled');
+-- partial indexes: pending (queue, run_at, id), running (queue, locked_until),
+-- failed (finished_at DESC, id), finished (finished_at)
 
--- Unique keys live in their own table, so the until-done and windowed
--- rules are one primary key check.
-CREATE TABLE jobq.unique_keys (
-  key    text PRIMARY KEY,
-  job_id text NOT NULL,
-  until  timestamptz            -- null: until the job finishes
-);
-
-CREATE TABLE jobq.schedules (
-  key         text PRIMARY KEY,
-  spec        jsonb NOT NULL,     -- cron, timezone, message
-  next_run_at timestamptz NOT NULL
-);
+CREATE TABLE jobq.unique_keys (key text PRIMARY KEY, job_id text NOT NULL, until timestamptz);
+CREATE TABLE jobq.schedules (key text PRIMARY KEY, cron text, timezone text, spec jsonb, next_run_at timestamptz);
 ```
 
-Dead letters stay in `jobs` with `state = 'failed'`. `RetryDead` resets a
-dead letter to `pending` with `attempt = 0`.
+Dead letters stay in `jobs` with `state = 'failed'`. `RetryDead` resets one to
+`pending` with `attempt = 0` and takes a new claim token.
 
 ### Operations
 
-- **Enqueue.** One transaction claims the unique key with
-  `INSERT ... ON CONFLICT (key) DO UPDATE ... WHERE expired` and inserts the
-  job. If the id belongs to a finished job, the insert reuses that row;
-  if it belongs to an unfinished job, it fails with `ErrJobIDInUse`.
-  `pgq.EnqueueTx(ctx, tx, ...)` runs the same statements inside the caller's
-  `pgx.Tx`, so a job commits or rolls back with the business data.
-- **Claim.** One statement claims due jobs and expired leases in batches:
-
-  ```sql
-  UPDATE jobq.jobs SET state = 'running', attempt = attempt + 1,
-         claim_token = claim_token + 1, locked_until = now() + $lease
-  WHERE id IN (SELECT id FROM jobq.jobs
-               WHERE queue = $1 AND ((state = 'pending' AND run_at <= now())
-                                  OR (state = 'running' AND locked_until < now()))
-               ORDER BY run_at, id LIMIT $max FOR UPDATE SKIP LOCKED)
-  RETURNING ...
-  ```
-
+- **Enqueue.** One transaction deletes a finished row with the same id, takes
+  the unique key with `INSERT ... ON CONFLICT DO UPDATE ... WHERE expired`, and
+  inserts the job. A primary key conflict means `ErrJobIDInUse`.
+  `Driver.EnqueueTx(ctx, tx, msg)` runs the same statements in the caller's
+  `pgx.Tx` inside a savepoint, so a job commits or rolls back with the business
+  data and a duplicate leaves the transaction usable.
+- **Claim.** One statement claims due jobs and expired leases in a batch with
+  `FOR UPDATE SKIP LOCKED`, increments `attempt` and takes `claim_token` from
+  the schema-wide sequence. Tokens never repeat, so a reused job id cannot
+  accept the lease of an earlier job with that id.
 - **Fencing.** Every lease method carries
   `WHERE id = $1 AND claim_token = $2 AND state = 'running' AND locked_until > now()`.
   Zero affected rows means `ErrLeaseLost`.
 - **Wake-ups.** A trigger runs `pg_notify('jobq', queue)` when a job becomes
-  pending. One listener connection per driver fans notifications out to
-  waiting claims. A timer set to the next `run_at` handles delayed jobs, and
-  a poll (default 5s) covers lost notifications. `WithoutListen()` disables
-  the listener for PgBouncer transaction pooling.
-- **Time.** All times come from the database clock (`now()`).
+  pending. One listener per driver fans notifications out to waiting claims,
+  and a timer set to the next due job plus a poll (default 5s) cover delayed
+  jobs and lost notifications. The listener holds one pool connection for the
+  driver's lifetime, so the pool needs at least two. `WithoutListen()` turns it
+  off, for PgBouncer in transaction mode.
+- **Time.** Run times and unique windows are offsets applied to the database
+  clock (`clock_timestamp()`), so client clock skew and the age of a caller's
+  transaction do not shift them.
 - **Schedules.** Every driver instance ticks once a second and claims due
-  schedule rows with `FOR UPDATE SKIP LOCKED`. In the same transaction it
-  inserts the job `<key>-<unix seconds of the occurrence>` and advances
-  `next_run_at`. The primary key makes an occurrence fire at most once, so no
-  leader election is needed.
-- **Retention.** A janitor deletes succeeded and cancelled jobs after 24h
-  (`WithRetention`), dead letters after 14 days (`WithDeadRetention`) and
-  expired unique keys. It deletes in batches, and only one instance runs it
-  at a time, under an advisory lock.
+  schedule rows with `FOR UPDATE SKIP LOCKED`. Each schedule fires in its own
+  savepoint: it inserts the job `<key>-<unix seconds of the occurrence>` and
+  moves `next_run_at` past now. The primary key makes an occurrence fire at
+  most once, no leader is needed, and a schedule that fails is logged and
+  retried a minute later without blocking the others.
+- **Retention.** A janitor, serialised by a schema-scoped advisory lock, deletes
+  succeeded and cancelled jobs after 24h (`WithRetention`), dead letters after
+  14 days (`WithDeadRetention`) and expired unique keys, in batches of 1000
+  until caught up.
 
 ## NATS driver (natsq)
 

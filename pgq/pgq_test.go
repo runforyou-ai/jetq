@@ -150,3 +150,73 @@ func TestSchedulesFireOnceAcrossDrivers(t *testing.T) {
 		t.Fatalf("schedules = %d", stats.Schedules)
 	}
 }
+
+// A job id that is enqueued again after the first job was cancelled must not
+// accept the first job's stale lease.
+func TestReusedJobIDDoesNotRevivePreviousLease(t *testing.T) {
+	pool := testPool(t)
+	d := newDriver(t, pool)
+	ctx := t.Context()
+
+	first, _ := jobq.NewMessage("x", 1, jobq.OnQueue("q"), jobq.Unique("k"))
+	if err := d.Enqueue(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := d.Claim(ctx, "q", 1, time.Minute)
+	if err != nil || len(stale) != 1 {
+		t.Fatalf("claim = %v, %v", stale, err)
+	}
+	if err := d.Cancel(ctx, first.ID); err != nil {
+		t.Fatal(err)
+	}
+	second, _ := jobq.NewMessage("x", 2, jobq.OnQueue("q"), jobq.JobID(first.ID), jobq.Unique("k"))
+	if err := d.Enqueue(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := d.Claim(ctx, "q", 1, time.Minute)
+	if err != nil || len(fresh) != 1 {
+		t.Fatalf("claim = %v, %v", fresh, err)
+	}
+	if err := stale[0].Complete(ctx); !errors.Is(err, jobq.ErrLeaseLost) {
+		t.Fatalf("stale complete = %v, want ErrLeaseLost", err)
+	}
+	// The new job still holds its unique key.
+	dup, _ := jobq.NewMessage("x", 3, jobq.OnQueue("q"), jobq.Unique("k"))
+	if err := d.Enqueue(ctx, dup); !errors.Is(err, jobq.ErrDuplicate) {
+		t.Fatalf("enqueue after stale complete = %v, want ErrDuplicate", err)
+	}
+	if err := fresh[0].Complete(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The delay of EnqueueTx counts from the statement, not from the start of the
+// caller's transaction.
+func TestEnqueueTxDelayIgnoresTransactionAge(t *testing.T) {
+	pool := testPool(t)
+	d := newDriver(t, pool)
+	ctx := t.Context()
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := tx.Exec(ctx, "SELECT 1"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(2 * time.Second)
+	msg, _ := jobq.NewMessage("x", 1, jobq.OnQueue("q"), jobq.Delay(3*time.Second))
+	if err := d.EnqueueTx(ctx, tx, msg); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	c, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	leases, _ := d.Claim(c, "q", 1, time.Minute)
+	if len(leases) != 0 {
+		t.Fatal("delayed job ran early: its delay was counted from the start of the transaction")
+	}
+}

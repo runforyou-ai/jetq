@@ -1,29 +1,36 @@
-# jetq
+# jobq
 
-[![CI](https://github.com/runforyou-ai/jetq/actions/workflows/ci.yml/badge.svg)](https://github.com/runforyou-ai/jetq/actions/workflows/ci.yml)
-[![Go Reference](https://pkg.go.dev/badge/github.com/runforyou-ai/jetq.svg)](https://pkg.go.dev/github.com/runforyou-ai/jetq)
+[![CI](https://github.com/runforyou-ai/jobq/actions/workflows/ci.yml/badge.svg)](https://github.com/runforyou-ai/jobq/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/runforyou-ai/jobq.svg)](https://pkg.go.dev/github.com/runforyou-ai/jobq)
 
 [中文](README.zh-CN.md)
 
-jetq is a background job queue for Go built on [NATS JetStream](https://docs.nats.io/nats-concepts/jetstream).
+jobq is a background job queue for Go with interchangeable storage drivers: [NATS JetStream](https://docs.nats.io/nats-concepts/jetstream), PostgreSQL and memory.
 Jobs carry explicitly named JSON payloads. Handlers are ordinary Go functions; the queue manages retries, backoff, delays, uniqueness, failure callbacks and recurring schedules.
 
-- **Typed handlers.** Payloads are ordinary structs; `EnqueueNamed` and `HandleNamed` share an explicit job name.
+- **One API, several drivers.** Switch storage by changing the driver you pass to `jobq.New`. Retries, backoff, snoozes, timeouts and shutdown are implemented once in the core, so they behave the same everywhere.
+- **Typed handlers.** Payloads are ordinary structs; `EnqueueNamed` and `HandleNamed` share an explicit job name, or a type can own its name with `JobName()`.
 - **Retries that make sense.** Per-queue attempt limits and backoff, `Permanent` errors, `RetryAfter`, and `Snooze` for "not now" without burning an attempt.
-- **Delayed and recurring jobs on the server.** Delays and cron schedules use JetStream message scheduling, so there is no scheduler process, polling or leader election in your app.
-- **Long jobs.** Running handlers keep their message alive; a crashed worker's job is redelivered after `AckWait`. `Queue.Timeout` and `jetq.Timeout(d)` bound a single attempt.
-- **Dead letters.** Jobs that run out of attempts land in a dead-letter stream with the last error, and your `OnFailure` callbacks run.
-- **Small surface.** One stream, one consumer per queue, plain `nats.go`. Embedded or standalone NATS is your application's choice.
+- **Delayed and recurring jobs.** `Delay`, `At` and cron schedules, without a scheduler process in your app.
+- **Uniqueness.** `Unique(key)` holds a key until the job finishes; `UniqueFor(key, d)` holds it for a time window.
+- **Long jobs.** Running handlers keep their lease alive; a crashed worker's job is claimed again after the lease expires. A lost lease cancels the handler's context.
+- **Dead letters.** Jobs that run out of attempts are kept with their last error; list, retry or delete them through the client.
+- **Conformance suite.** `jobq/drivertest` checks every driver against the same contract.
 
-Requires nats-server **2.14+** (2.15 recommended) and Go 1.27+.
+Requires Go 1.27+.
 
-## Install
+## Modules
+
+| Module | Purpose | Dependencies |
+|---|---|---|
+| `github.com/runforyou-ai/jobq` | Client, worker, driver contract, `memq`, `drivertest` | standard library |
+| `github.com/runforyou-ai/jobq/natsq` | NATS JetStream driver (nats-server 2.14+) | nats.go |
+| `github.com/runforyou-ai/jobq/pgq` | PostgreSQL driver (PostgreSQL 14+) | pgx/v5 |
 
 ```sh
-go get github.com/runforyou-ai/jetq
+go get github.com/runforyou-ai/jobq
+go get github.com/runforyou-ai/jobq/pgq   # and/or natsq
 ```
-
-Version 0.4 removes `Cron` and `Schedule.In`; see [migration instructions](CHANGELOG.md#v040) before upgrading.
 
 ## Usage
 
@@ -32,104 +39,122 @@ type WelcomeEmail struct {
 	UserID int64 `json:"user_id"`
 }
 
-q, err := jetq.New(ctx, js) // js is a jetstream.JetStream; creates the streams if needed
+func (WelcomeEmail) JobName() string { return "welcome-email" }
 
-// Enqueue after your database transaction has committed.
-id, err := q.EnqueueNamed(ctx, "welcome-email", WelcomeEmail{UserID: 42},
-	jetq.OnQueue("mail"),
-	jetq.Delay(10*time.Minute),   // or jetq.At(t)
-	jetq.UniqueUntilDone("welcome-42"), // ErrDuplicate until that job settles; jetq.Unique(key) uses a time window
-	// jetq.JobID(id) sets the id yourself, e.g. to store it before enqueueing
+// Pick a driver.
+driver, err := pgq.New(ctx, pool)       // pool is a *pgxpool.Pool
+// driver, err := natsq.New(ctx, js)    // js is a jetstream.JetStream
+// driver := memq.New()                 // tests and examples
+defer driver.Close()
+
+q := jobq.New(driver)
+
+id, err := q.Enqueue(ctx, WelcomeEmail{UserID: 42},
+	jobq.OnQueue("mail"),
+	jobq.Delay(10*time.Minute),      // or jobq.At(t)
+	jobq.Unique("welcome-42"),       // ErrDuplicate until that job finishes
+	jobq.MaxAttempts(5),
+	jobq.Timeout(time.Minute),
 )
-// errors.Is(err, jetq.ErrUncertain): the job may or may not be enqueued (timeout, lost
-// connection); id is returned. A UniqueUntilDone job is published once more to settle
-// this, even after ctx is cancelled, and otherwise keeps its key until it settles or expires.
-_ = q.Cancel(ctx, id)            // cancel a pending delayed job
+// errors.Is(err, jobq.ErrUncertain): the job may or may not be stored; id is returned.
+// Enqueue again with jobq.JobID(id): you get ErrJobIDInUse if the first copy was stored.
+_ = q.Cancel(ctx, id)
 
 // Recurring jobs: every instance passes the same full set at startup.
 err = q.SyncSchedules(ctx,
-	jetq.Schedule{Key: "daily-report", Cron: "0 2 * * *", Name: "daily-report", Payload: DailyReport{}, Timezone: "Asia/Shanghai"},
-	jetq.Schedule{Key: "sweep", Cron: "@every 30s", Name: "sweep", Payload: Sweep{}, Queue: "maintenance"},
+	jobq.Schedule{Key: "daily-report", Cron: "0 2 * * *", Timezone: "Asia/Shanghai", Job: DailyReport{}},
+	jobq.Schedule{Key: "sweep", Cron: "@every 30s", Job: Sweep{}, Options: []jobq.EnqueueOption{jobq.OnQueue("maintenance")}},
 )
 
 // Workers.
 w := q.NewWorker(
-	jetq.Queue{Name: "default"},
-	jetq.Queue{Name: "mail", Concurrency: 8, MaxAttempts: 5, Backoff: jetq.Exponential(10*time.Second, time.Hour), Timeout: 5 * time.Minute},
+	jobq.Queue{Name: "default"},
+	jobq.Queue{Name: "mail", Concurrency: 8, MaxAttempts: 5, Backoff: jobq.Exponential(10*time.Second, time.Hour), Timeout: 5 * time.Minute},
 )
-jetq.HandleNamed(w, "welcome-email", func(ctx context.Context, job WelcomeEmail) error {
-	info, _ := jetq.JobInfo(ctx) // id, attempt, queue, headers...
+jobq.Handle(w, func(ctx context.Context, job WelcomeEmail) error {
+	info, _ := jobq.JobInfo(ctx) // id, attempt, queue, headers...
 	return send(ctx, job.UserID)
-}, jetq.OnFailure(func(ctx context.Context, job WelcomeEmail, err error) {
+}, jobq.OnFailure(func(ctx context.Context, job WelcomeEmail, err error) {
 	// Record the terminal failure.
 }))
 w.Use(loggingMiddleware)
 err = w.Run(ctx) // blocks; on cancel, waits for running jobs
 ```
 
-### Provisioned resources and durable outboxes
-
-`jetq.ResourceConfigs(options...)` returns the work stream, dead-letter stream and state bucket definitions without writing to NATS. Provision these separately, then use `jetq.Attach(ctx, js, options...)` in application processes. Attach validates subjects, queue semantics and minimum retention while preserving replicas, storage, placement and capacity. `New` remains the convenience constructor that creates or updates resources.
-
-For an outbox retry, keep the same payload, absolute scheduled time, `jetq.JobID(id)` and `jetq.MsgID(publicationID)` on every attempt. `MsgID` uses JetStream deduplication and can resume a `UniqueUntilDone` lock owned by the same job. It requires an explicit JobID and cannot be combined with `Unique` or relative `Delay`; use `At` for a fixed schedule. For UniqueUntilDone, the state TTL must cover the duplicate window; completion is recorded before releasing the lock. A retry acknowledges the same publication even if it has since completed or been cancelled. A recorded cancellation is respected for the state bucket TTL, including retries after the duplicate window. Keep the outbox row after `ErrUncertain`; remove it only after publication is confirmed. Deduplication lasts for the configured duplicate window, so handlers must remain idempotent for later retries.
-
-
-### Runtime job names
-
-When job names are only known at runtime (for example when bridging an existing task system),
-use `EnqueueNamed(ctx, name, payload)` and `HandleNamed(w, name, fn, OnFailure(...))`. Ordinary structs need no methods. For byte-for-byte JSON handlers, pass `json.RawMessage` and register `w.HandleRaw(name, fn, jetq.OnRawFailure(...))`.
-The payload must be valid JSON and is delivered byte for byte.
-
-### Type-owned names
-
-`Enqueue` and `Handle` also accept types implementing `JobName() string`. Use this convenience when a type owns its stable protocol name. Explicit names need no methods.
-
-`json.RawMessage` is validated and preserved byte for byte; an empty raw message or nil payload is encoded as `null`. Other values follow `encoding/json`, including base64 JSON strings for `[]byte`. Decoding `null` into a struct yields its zero value; handlers validate required business fields.
+For job names known only at runtime, use `EnqueueNamed(ctx, name, payload)` with `HandleNamed`, or `jobq.RawJob` with `w.HandleRaw` to receive the JSON payload byte for byte.
 
 ### Inspecting queues
 
-`q.Stats(ctx)` reports per queue the jobs not yet delivered (`Ready`), the delivered but unsettled
-jobs (`InFlight`, mostly running ones), and the dead-lettered jobs, plus the number of pending
-delayed jobs (including jobs waiting for a retry or snoozed) and installed schedules. `q.DeadLetters(ctx, jetq.DeadLetterQuery{...})` pages
-through dead-lettered jobs, newest first, with their last error.
-
-### Log context
-
-`w.SetLogContext(func(ctx, info) context.Context)` derives the context of jetq's own job log records
-and of failure callbacks, so your logging handler can attach a trace id or tenant.
+`q.Stats(ctx)` reports per queue the jobs that are ready, scheduled (delayed, retrying or snoozed), running and dead-lettered. `q.DeadLetters(ctx, jobq.DeadLetterQuery{...})` pages through dead letters, newest first. `q.RetryDead(ctx, id)` and `q.DeleteDead(ctx, id)` act on one. Drivers that cannot do this return `jobq.ErrUnsupported`.
 
 ### Handler results
 
 | Return | Effect |
 |---|---|
-| `nil` | Job done, removed from the queue. |
+| `nil` | Job done. |
 | any error | Retried after the queue's backoff; dead-lettered when attempts run out. |
-| `jetq.RetryAfter(d, err)` | Retried after `d` instead of the backoff. |
-| `jetq.Permanent(err)` | Dead-lettered immediately. |
-| `jetq.Snooze(d)` | Runs again after `d`; the attempt is not counted (`Info.Snoozes` counts snoozes). |
+| `jobq.RetryAfter(d, err)` | Retried after `d` instead of the backoff. |
+| `jobq.Permanent(err)` | Dead-lettered immediately. |
+| `jobq.Snooze(d)` | Runs again after `d`; the attempt is not counted (`Info.Snoozes` counts snoozes). |
 | panic | Treated as an error. |
-| timeout | The context is cancelled with cause `jetq.ErrTimeout`; the attempt fails. |
+| timeout | The context is cancelled with cause `jobq.ErrTimeout`; the attempt fails. |
 
-Jobs waiting for a retry or a snooze are stored as delayed jobs, so they never hold up a queue and
-can be cancelled with `Cancel`. A job this worker has no handler for (for example during a rolling
-deploy) is put back for other workers without using up an attempt and dead-lettered after
-`w.SetUnknownJobTimeout` (default 1h). Jobs interrupted by the shutdown timeout are put back without
-using up an attempt; handlers that ignore cancellation are abandoned 10 seconds later. Retry delays
-under a second are served by redelivery, and delayed jobs fire no sooner than about 250ms.
+A job this worker has no handler for is put back for other workers without using up an attempt, and dead-lettered after `w.SetUnknownJobTimeout` (default 1h). Jobs interrupted by the shutdown timeout are put back without using up an attempt; handlers that ignore cancellation are abandoned 10 seconds later.
 
 Delivery is **at least once**: make handlers idempotent.
 
-## Deployment
+## Drivers
 
-jetq only needs a `jetstream.JetStream`. Run NATS however suits you:
+| | memq | natsq | pgq |
+|---|---|---|---|
+| Storage | process memory | JetStream stream and KV bucket | one PostgreSQL schema |
+| Delayed jobs | yes | server-side message schedules | `run_at` on the database clock |
+| Recurring schedules | yes | server-side message schedules | rows claimed with `SKIP LOCKED` |
+| Inspection and dead letters | yes | yes | yes |
+| Transactional enqueue | no | no | `pgq.Driver.EnqueueTx` |
 
-- **Single server:** embed `nats-server` in your process (see [docs/design.md](docs/design.md#embedding-nats)).
-- **Several servers:** use a standalone NATS server or cluster. Use `jetq.WithReplicas(3)` on a three-node cluster.
+### pgq
+
+`pgq.New` creates or migrates the schema (default `jobq`). `EnqueueTx` stores a job inside your own transaction, so it commits or rolls back with your data:
+
+```go
+tx, _ := pool.Begin(ctx)
+// ... write your rows ...
+msg, _ := jobq.NewMessage("welcome-email", WelcomeEmail{UserID: 42}, jobq.OnQueue("mail"))
+err := driver.EnqueueTx(ctx, tx, msg)
+err = tx.Commit(ctx)
+```
+
+Notes:
+
+- Waiting workers are woken by `LISTEN/NOTIFY`. The listener **holds one connection from your pool** for the driver's lifetime, so size the pool accordingly (at least 2 connections, more with many workers). With PgBouncer in transaction mode use `pgq.WithoutListen()`; workers then poll (`pgq.WithPollInterval`).
+- All times are applied against the database clock, so clock skew between application hosts does not shift delays.
+- Succeeded and cancelled jobs are kept for 24 hours (`WithRetention`), dead letters for 14 days (`WithDeadRetention`).
+
+### natsq
+
+`natsq.New` creates the work stream, the state bucket and the dead-letter stream. Applications sharing a NATS account need distinct prefixes (`natsq.WithPrefix`). Lease expiry is judged by process clocks, so keep clocks synchronised to within a few seconds. See [docs/design.md](docs/design.md#nats-driver-natsq) for how the state record fences stale workers.
+
+### Writing a driver
+
+Implement `jobq.Driver` (and optionally `jobq.Scheduler` and `jobq.Inspector`), then run the conformance suite:
+
+```go
+func TestConformance(t *testing.T) {
+	drivertest.Run(t, func(t *testing.T) jobq.Driver { return newMyDriver(t) }, drivertest.Options{})
+}
+```
+
+## Development
+
+```sh
+make test   # all modules; pgq tests need DATABASE_URL and are skipped without it
+make lint
+```
 
 ## Design
 
-See [docs/design.md](docs/design.md) for streams, subjects, delivery semantics and the roadmap
-(transactional outbox for PostgreSQL and MySQL, job chains and batches, a dashboard).
+See [docs/design.md](docs/design.md) for the driver contract, worker semantics and each driver's storage layout.
 
 ## License
 

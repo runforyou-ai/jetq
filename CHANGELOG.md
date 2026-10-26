@@ -7,8 +7,9 @@ Breaking: jetq is now **jobq**, a multi-driver job queue
 
 - The core package depends only on the standard library and defines the
   `Driver`/`Lease` contract plus the optional `Scheduler` and `Inspector`
-  capabilities. Drivers: `memq` (in memory), `natsq` and `pgq` (separate
-  modules, in progress).
+  capabilities. Drivers: `memq` (in memory, part of the core module), `natsq`
+  (NATS JetStream) and `pgq` (PostgreSQL, with `EnqueueTx` for transactional
+  enqueueing), the last two as separate Go modules.
 - `drivertest` is a conformance suite every driver runs.
 - `Unique(key)` now holds the key until the job finishes (it was
   `UniqueUntilDone`). `UniqueFor(key, d)` replaces the duplicate-window
