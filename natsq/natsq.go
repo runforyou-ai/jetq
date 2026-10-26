@@ -676,10 +676,10 @@ func (d *Driver) claimMessage(ctx context.Context, msg jetstream.Msg, leaseDur t
 		// An older copy of the job.
 		_ = msg.Term()
 		return nil, nil
-	case s.Running && s.LeaseUntil.After(now) && msgTime(msg).Add(s.LeaseUntil.Sub(s.LeaseStart)).After(now):
-		// Another worker holds the job and its lease has not run out since the
-		// message was published: NATS redelivered early. The message time
-		// stands in for the worker's clock, which may be ahead of this one.
+	case s.Running && s.LeaseUntil.After(now):
+		// Another worker holds the job and the lease in its record, which Extend
+		// keeps renewing, is still valid: NATS redelivered early because its
+		// AckWait is the shortest lease asked for on the queue.
 		_ = msg.NakWithDelay(min(s.LeaseUntil.Sub(now), time.Minute))
 		return nil, nil
 	}
@@ -713,7 +713,7 @@ func (d *Driver) claimMessage(ctx context.Context, msg jetstream.Msg, leaseDur t
 		}
 		return nil, err
 	}
-	return &jobLease{d: d, msg: env.message(), attempt: attempt, nmsg: msg, stateRev: newRev, lease: leaseDur, scheduled: env.Schedule != ""}, nil
+	return &jobLease{d: d, msg: env.message(), attempt: attempt, nmsg: msg, stateRev: newRev, lease: leaseDur, scheduled: env.Schedule != "", schedule: env.Schedule}, nil
 }
 
 // consumer returns the durable consumer of queue, creating it with AckWait
@@ -755,14 +755,6 @@ func (d *Driver) forgetConsumer(queue string) {
 	d.mu.Lock()
 	delete(d.consumers, queue)
 	d.mu.Unlock()
-}
-
-// msgTime returns when the delivery was stored, for the server clock.
-func msgTime(msg jetstream.Msg) time.Time {
-	if meta, err := msg.Metadata(); err == nil {
-		return meta.Timestamp
-	}
-	return time.Now()
 }
 
 // === cancel ===
@@ -815,8 +807,10 @@ type jobLease struct {
 	nmsg     jetstream.Msg
 	stateRev uint64
 	lease    time.Duration
-	// scheduled marks a job fired by a recurring schedule.
+	// scheduled marks a job fired by a recurring schedule, and schedule is its
+	// key; both survive Retry and Release.
 	scheduled bool
+	schedule  string
 
 	mu   sync.Mutex
 	done bool
@@ -887,12 +881,14 @@ func (l *jobLease) Fail(ctx context.Context, reason string) error {
 // Retry implements [jobq.Lease].
 func (l *jobLease) Retry(ctx context.Context, at time.Time, reason string) error {
 	env := newEnvelope(l.msg)
+	env.Schedule = l.schedule
 	return l.requeue(ctx, env, at, l.attempt, reason, jobq.Release{})
 }
 
 // Release implements [jobq.Lease].
 func (l *jobLease) Release(ctx context.Context, r jobq.Release) error {
 	env := newEnvelope(l.msg)
+	env.Schedule = l.schedule
 	if r.Snooze {
 		env.Snoozes++
 	}
