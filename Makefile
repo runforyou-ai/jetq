@@ -1,11 +1,12 @@
+MODULES := . natsq pgq
+
 .PHONY: test lint tidy
 
 test:
-	go test -race -count=1 ./...
+	@for m in $(MODULES); do (cd $$m && go test -race -count=1 ./...) || exit 1; done
 
 lint:
-	go vet ./...
-	golangci-lint run ./...
+	@for m in $(MODULES); do (cd $$m && go vet ./... && golangci-lint run ./...) || exit 1; done
 
 tidy:
-	go mod tidy
+	@for m in $(MODULES); do (cd $$m && go mod tidy) || exit 1; done

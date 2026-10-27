@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.5.0 (unreleased)
+
+Breaking: jetq is now **jobq**, a multi-driver job queue
+(`github.com/runforyou-ai/jobq`).
+
+- The core package depends only on the standard library and defines the
+  `Driver`/`Lease` contract plus the optional `Scheduler` and `Inspector`
+  capabilities. Drivers: `memq` (in memory, part of the core module), `natsq`
+  (NATS JetStream) and `pgq` (PostgreSQL, with `EnqueueTx` for transactional
+  enqueueing), the last two as separate Go modules.
+- `drivertest` is a conformance suite every driver runs.
+- `Unique(key)` now holds the key until the job finishes (it was
+  `UniqueUntilDone`). `UniqueFor(key, d)` replaces the duplicate-window
+  `Unique`.
+- `Schedule` takes a `Job` and `EnqueueOption`s. Cron is parsed in the core
+  (`ParseCron`).
+- `Info.Header` is a `map[string]string`. `Queue.AckWait` is now
+  `Queue.Lease`.
+- Dead letters are paged with an opaque cursor. Added `RetryDead` and
+  `DeleteDead`.
+- A lost lease cancels the handler's context with cause `ErrLeaseLost`.
+- Removed: `New(ctx, js)`, `Attach`, `ResourceConfigs`, `MsgID` and the
+  stream options (they move to natsq). The `jetqtest` package is gone; use
+  `memq`.
+
 ## v0.4.1
 
 - Add read-only binding to pre-provisioned JetStream resources (`Attach` / resource configs) so hosts can validate streams without recreating them.

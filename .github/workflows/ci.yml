@@ -11,25 +11,58 @@ permissions:
 
 jobs:
   test:
-    name: Test
+    name: Test ${{ matrix.module }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [".", "natsq", "pgq"]
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version-file: ${{ matrix.module }}/go.mod
+      # The sub-modules are built against the core module in this checkout,
+      # so CI does not depend on which core version is tagged.
+      - name: Use workspace
+        run: |
+          go work init . ./natsq ./pgq
+          go work edit -replace github.com/runforyou-ai/jobq@v0.5.0=.
       - name: Test
+        working-directory: ${{ matrix.module }}
         run: go test -race -count=1 ./...
 
   lint:
-    name: Lint
+    name: Lint ${{ matrix.module }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [".", "natsq", "pgq"]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version-file: ${{ matrix.module }}/go.mod
+      # The sub-modules are built against the core module in this checkout,
+      # so CI does not depend on which core version is tagged.
+      - name: Use workspace
+        run: |
+          go work init . ./natsq ./pgq
+          go work edit -replace github.com/runforyou-ai/jobq@v0.5.0=.
       - run: go vet ./...
+        working-directory: ${{ matrix.module }}
       - uses: golangci/golangci-lint-action@v9
         with:
           version: v2.14.0
+          working-directory: ${{ matrix.module }}

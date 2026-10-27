@@ -1,70 +1,49 @@
-package jetq_test
+package jobq_test
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"log"
 	"time"
 
-	"github.com/nats-io/nats.go"
-	"github.com/nats-io/nats.go/jetstream"
-
-	"github.com/runforyou-ai/jetq"
+	"github.com/runforyou-ai/jobq"
+	"github.com/runforyou-ai/jobq/memq"
 )
 
 type WelcomeEmail struct {
 	UserID int64 `json:"user_id"`
 }
 
-type DailyReport struct{}
+func (WelcomeEmail) JobName() string { return "welcome-email" }
 
 func Example() {
-	nc, err := nats.Connect(nats.DefaultURL)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer nc.Close()
-	js, _ := jetstream.New(nc)
-	ctx := context.Background()
+	driver := memq.New() // or natsq.New(ctx, js), pgq.New(ctx, pool)
+	defer driver.Close()
+	q := jobq.New(driver)
 
-	q, err := jetq.New(ctx, js)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// Producer side: enqueue after the database transaction has committed.
-	_, err = q.EnqueueNamed(ctx, "welcome-email", WelcomeEmail{UserID: 42},
-		jetq.OnQueue("mail"),
-		jetq.Delay(10*time.Minute),
-		jetq.Unique("welcome-42"),
-	)
-	if err != nil && !errors.Is(err, jetq.ErrDuplicate) {
-		log.Fatal(err)
-	}
-
-	// Recurring jobs are fired by the NATS server; every instance syncs the same set.
-	if err := q.SyncSchedules(ctx,
-		jetq.Schedule{Key: "daily-report", Cron: "0 2 * * *", Name: "daily-report", Payload: DailyReport{}, Timezone: "Asia/Shanghai"},
-	); err != nil {
-		log.Fatal(err)
-	}
-
-	// Worker side.
-	w := q.NewWorker(
-		jetq.Queue{Name: "default"},
-		jetq.Queue{Name: "mail", Concurrency: 8, MaxAttempts: 5},
-	)
-	jetq.HandleNamed(w, "welcome-email", func(ctx context.Context, job WelcomeEmail) error {
-		info, _ := jetq.JobInfo(ctx)
-		fmt.Println("sending welcome email", job.UserID, "attempt", info.Attempt)
+	w := q.NewWorker(jobq.Queue{Name: "mail", Concurrency: 8, MaxAttempts: 5, Timeout: time.Minute})
+	done := make(chan struct{})
+	jobq.Handle(w, func(ctx context.Context, job WelcomeEmail) error {
+		info, _ := jobq.JobInfo(ctx)
+		fmt.Println("welcome", job.UserID, "attempt", info.Attempt)
+		close(done)
 		return nil
-	}, jetq.OnFailure(func(ctx context.Context, job WelcomeEmail, err error) {
-		log.Printf("welcome email for %d failed: %v", job.UserID, err)
-	}))
-	jetq.HandleNamed(w, "daily-report", func(ctx context.Context, job DailyReport) error { return nil })
+	})
+	ctx, stop := context.WithCancel(context.Background())
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		_ = w.Run(ctx)
+	}()
 
-	if err := w.Run(ctx); err != nil { // blocks until ctx is cancelled
-		log.Fatal(err)
+	_, err := q.Enqueue(context.Background(), WelcomeEmail{UserID: 42},
+		jobq.OnQueue("mail"),
+		jobq.Unique("welcome-42"),
+	)
+	if err != nil {
+		panic(err)
 	}
+	<-done
+	stop()
+	<-stopped
+	// Output: welcome 42 attempt 1
 }

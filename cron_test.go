@@ -1,0 +1,118 @@
+package jobq_test
+
+import (
+	"testing"
+	"time"
+
+	"github.com/runforyou-ai/jobq"
+)
+
+func TestCronNext(t *testing.T) {
+	t.Parallel()
+	shanghai, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := time.Date(2026, 1, 31, 23, 59, 30, 0, time.UTC)
+	tests := []struct {
+		spec string
+		loc  *time.Location
+		from time.Time
+		want time.Time
+	}{
+		{"* * * * *", nil, base, time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)},
+		{"*/15 * * * * *", nil, base, time.Date(2026, 1, 31, 23, 59, 45, 0, time.UTC)},
+		{"0 2 * * *", nil, base, time.Date(2026, 2, 1, 2, 0, 0, 0, time.UTC)},
+		{"0 2 * * *", shanghai, base, time.Date(2026, 2, 2, 2, 0, 0, 0, shanghai)}, // already 07:59 on Feb 1 there
+		{"0 0 29 2 *", nil, base, time.Date(2028, 2, 29, 0, 0, 0, 0, time.UTC)},
+		{"0 9 * * 1-5", nil, time.Date(2026, 10, 24, 10, 0, 0, 0, time.UTC), time.Date(2026, 10, 26, 9, 0, 0, 0, time.UTC)}, // Saturday -> Monday
+		{"0 0 1 * 0", nil, time.Date(2026, 10, 2, 0, 0, 0, 0, time.UTC), time.Date(2026, 10, 4, 0, 0, 0, 0, time.UTC)},      // first Sunday wins over the 1st
+		{"0 0 * * 7", nil, time.Date(2026, 10, 2, 0, 0, 0, 0, time.UTC), time.Date(2026, 10, 4, 0, 0, 0, 0, time.UTC)},      // 7 is Sunday
+		{"@hourly", nil, base, time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)},
+		{"@every 1m", nil, base, time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)},
+		{"5,10-12 * * * * *", nil, time.Date(2026, 1, 1, 0, 0, 10, 0, time.UTC), time.Date(2026, 1, 1, 0, 0, 11, 0, time.UTC)},
+	}
+	for _, tt := range tests {
+		c, err := jobq.ParseCron(tt.spec)
+		if err != nil {
+			t.Fatalf("%s: %v", tt.spec, err)
+		}
+		if got := c.Next(tt.from, tt.loc); !got.Equal(tt.want) {
+			t.Errorf("%s from %s = %s, want %s", tt.spec, tt.from, got, tt.want)
+		}
+	}
+}
+
+func TestCronNextAcrossDST(t *testing.T) {
+	t.Parallel()
+	ny, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := jobq.ParseCron("0 2 * * *")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan time.Time, 1)
+	from := time.Date(2026, 3, 7, 12, 0, 0, 0, ny)
+	go func() { done <- c.Next(from, ny) }()
+	select {
+	case got := <-done:
+		if !got.After(from) {
+			t.Fatalf("Next = %s, not after %s", got, from)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Next did not return across the spring-forward gap")
+	}
+	t0 := from
+	for range 10 {
+		n := c.Next(t0, ny)
+		if !n.After(t0) {
+			t.Fatalf("Next(%s) = %s does not advance", t0, n)
+		}
+		t0 = n
+	}
+}
+
+func TestParseCronErrors(t *testing.T) {
+	t.Parallel()
+	for _, spec := range []string{"", "* * * *", "60 * * * *", "* * * * * * *", "@every 10ms", "@sometimes", "*/0 * * * *", "5-1 * * * *", "MON * * * *"} {
+		if _, err := jobq.ParseCron(spec); err == nil {
+			t.Errorf("%q accepted", spec)
+		}
+	}
+	c, err := jobq.ParseCron("0  2 * * *")
+	if err != nil || c.String() != "0 0 2 * * *" {
+		t.Fatalf("normalized = %q, %v", c.String(), err)
+	}
+}
+
+func TestCronNextFallBackFiresOnce(t *testing.T) {
+	t.Parallel()
+	ny, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := jobq.ParseCron("0 30 1 * * *")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 2026-11-01: 01:30 happens at EDT and again at EST.
+	first := c.Next(time.Date(2026, 11, 1, 0, 0, 0, 0, ny), ny)
+	if got := first.Format("15:04 MST"); got != "01:30 EDT" {
+		t.Fatalf("first = %s", got)
+	}
+	next := c.Next(first, ny)
+	if sameWallClock(first, next) {
+		t.Fatalf("fired twice at %s and %s", first.Format(time.RFC3339), next.Format(time.RFC3339))
+	}
+	if next.Day() != 2 || next.Hour() != 1 || next.Minute() != 30 {
+		t.Fatalf("next = %s, want the next day at 01:30", next)
+	}
+}
+
+func sameWallClock(a, b time.Time) bool {
+	a, b = a.In(a.Location()), b.In(b.Location())
+	return a.Year() == b.Year() && a.YearDay() == b.YearDay() &&
+		a.Hour() == b.Hour() && a.Minute() == b.Minute() && a.Second() == b.Second()
+}
