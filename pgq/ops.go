@@ -342,13 +342,55 @@ type pgLease struct {
 func (l *pgLease) Message() *jobq.Message { return l.msg }
 func (l *pgLease) Attempt() int           { return l.attempt }
 
-// fence is the condition every lease operation carries.
-const fence = " WHERE id = $1 AND claim_token = $2 AND state = 'running' AND locked_until > now()"
+// Every lease statement is fenced on the claim token: it matches only while
+// this claim still holds the job. The settle statements read the old row in
+// their SET lists, so cancel_requested turns the transition into a
+// cancellation. %s is the quoted schema.
+const (
+	extendSQL = `UPDATE %s.jobs SET
+  locked_until = now() + $3::bigint * interval '1 microsecond'
+WHERE id = $1 AND claim_token = $2 AND state = 'running' AND locked_until > now()`
+
+	completeSQL = `UPDATE %s.jobs SET
+  locked_until = NULL,
+  state = CASE WHEN cancel_requested THEN 'canceled' ELSE 'succeeded' END,
+  finished_at = now()
+WHERE id = $1 AND claim_token = $2 AND state = 'running' AND locked_until > now()
+RETURNING unique_key, unique_for_ns, state = 'canceled'`
+
+	retrySQL = `UPDATE %s.jobs SET
+  run_at = now() + $3::bigint * interval '1 microsecond',
+  last_error = $4,
+  locked_until = NULL,
+  state = CASE WHEN cancel_requested THEN 'canceled' ELSE 'pending' END,
+  finished_at = CASE WHEN cancel_requested THEN now() END
+WHERE id = $1 AND claim_token = $2 AND state = 'running' AND locked_until > now()
+RETURNING unique_key, unique_for_ns, state = 'canceled'`
+
+	// Release replaces UnknownSince, so a release without one clears it.
+	releaseSQL = `UPDATE %s.jobs SET
+  attempt = attempt - 1,
+  run_at = now() + $3::bigint * interval '1 microsecond',
+  snoozes = snoozes + $4,
+  unknown_since = $5,
+  locked_until = NULL,
+  state = CASE WHEN cancel_requested THEN 'canceled' ELSE 'pending' END,
+  finished_at = CASE WHEN cancel_requested THEN now() END
+WHERE id = $1 AND claim_token = $2 AND state = 'running' AND locked_until > now()
+RETURNING unique_key, unique_for_ns, state = 'canceled'`
+
+	failSQL = `UPDATE %s.jobs SET
+  last_error = $3,
+  locked_until = NULL,
+  state = CASE WHEN cancel_requested THEN 'canceled' ELSE 'failed' END,
+  finished_at = now()
+WHERE id = $1 AND claim_token = $2 AND state = 'running' AND locked_until > now()
+RETURNING unique_key, unique_for_ns, state = 'canceled'`
+)
 
 // Extend implements [jobq.Lease].
 func (l *pgLease) Extend(ctx context.Context) error {
-	tag, err := l.d.pool.Exec(ctx, "UPDATE "+l.d.s+".jobs SET locked_until = now() + $3::bigint * interval '1 microsecond'"+fence,
-		l.msg.ID, l.token, l.leaseFor.Microseconds())
+	tag, err := l.d.pool.Exec(ctx, fmt.Sprintf(extendSQL, l.d.s), l.msg.ID, l.token, l.leaseFor.Microseconds())
 	if err != nil {
 		return fmt.Errorf("pgq: extend: %w", err)
 	}
@@ -358,10 +400,10 @@ func (l *pgLease) Extend(ctx context.Context) error {
 	return nil
 }
 
-// settle runs one fenced UPDATE that applies set, or cancels the job when a
-// cancellation was requested while it ran, and frees the job's until-done key
-// when the job ends (release, or a cancellation).
-func (l *pgLease) settle(ctx context.Context, set string, release bool, state string, args ...any) error {
+// settle runs one of the settle statements with the job's id and claim token
+// as $1 and $2 and args after them. It frees the job's until-done key when
+// ends is set or the statement turned into a cancellation.
+func (l *pgLease) settle(ctx context.Context, sql string, ends bool, args ...any) error {
 	tx, err := l.d.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("pgq: begin: %w", err)
@@ -370,23 +412,15 @@ func (l *pgLease) settle(ctx context.Context, set string, release bool, state st
 	var key *string
 	var uniqueNs int64
 	var canceled bool
-	// The SET list reads the old row, so cancel_requested decides between the
-	// requested transition and a cancellation.
-	if set != "" {
-		set += ", "
-	}
-	err = tx.QueryRow(ctx, "UPDATE "+l.d.s+".jobs SET "+set+`locked_until = NULL,
-  state = CASE WHEN cancel_requested THEN 'canceled' ELSE $3::text END,
-  finished_at = CASE WHEN cancel_requested OR $3::text <> 'pending' THEN now() END`+fence+
-		" RETURNING unique_key, unique_for_ns, state = 'canceled'",
-		append([]any{l.msg.ID, l.token, state}, args...)...).Scan(&key, &uniqueNs, &canceled)
+	err = tx.QueryRow(ctx, fmt.Sprintf(sql, l.d.s), append([]any{l.msg.ID, l.token}, args...)...).
+		Scan(&key, &uniqueNs, &canceled)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return jobq.ErrLeaseLost
 	}
 	if err != nil {
 		return fmt.Errorf("pgq: settle: %w", err)
 	}
-	if release || canceled {
+	if ends || canceled {
 		if err := l.d.releaseUnique(ctx, tx, l.msg.ID, key, uniqueNs); err != nil {
 			return err
 		}
@@ -399,12 +433,12 @@ func (l *pgLease) settle(ctx context.Context, set string, release bool, state st
 
 // Complete implements [jobq.Lease].
 func (l *pgLease) Complete(ctx context.Context) error {
-	return l.settle(ctx, "", true, "succeeded")
+	return l.settle(ctx, completeSQL, true)
 }
 
 // Retry implements [jobq.Lease].
 func (l *pgLease) Retry(ctx context.Context, at time.Time, reason string) error {
-	return l.settle(ctx, "run_at = now() + $4::bigint * interval '1 microsecond', last_error = $5", false, "pending", untilMicros(at), reason)
+	return l.settle(ctx, retrySQL, false, untilMicros(at), reason)
 }
 
 // Release implements [jobq.Lease].
@@ -413,13 +447,10 @@ func (l *pgLease) Release(ctx context.Context, r jobq.Release) error {
 	if r.Snooze {
 		snoozes = 1
 	}
-	// Release replaces UnknownSince, so a release without one clears it.
-	return l.settle(ctx, `attempt = attempt - 1, run_at = now() + $4::bigint * interval '1 microsecond',
-snoozes = snoozes + $5, unknown_since = $6`, false, "pending",
-		untilMicros(r.At), snoozes, nilIfZero(r.UnknownSince))
+	return l.settle(ctx, releaseSQL, false, untilMicros(r.At), snoozes, nilIfZero(r.UnknownSince))
 }
 
 // Fail implements [jobq.Lease].
 func (l *pgLease) Fail(ctx context.Context, reason string) error {
-	return l.settle(ctx, "last_error = $4", true, "failed", reason)
+	return l.settle(ctx, failSQL, true, reason)
 }

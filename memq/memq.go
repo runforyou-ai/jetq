@@ -161,21 +161,30 @@ func (d *Driver) Claim(ctx context.Context, queue string, limit int, lease time.
 		if len(leases) > 0 {
 			return leases, nil
 		}
-		var due <-chan time.Time
-		if !next.IsZero() {
-			t := time.NewTimer(max(next.Sub(d.now()), time.Millisecond))
-			defer t.Stop()
-			due = t.C
-		}
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-deadline.C:
-			return nil, nil
-		case <-wake:
-		case <-due:
+		if done, err := d.wait(ctx, deadline.C, wake, next); done {
+			return nil, err
 		}
 	}
+}
+
+// wait blocks until a claim is worth retrying, and reports done when Claim
+// should instead return empty with err.
+func (d *Driver) wait(ctx context.Context, deadline <-chan time.Time, wake <-chan struct{}, next time.Time) (bool, error) {
+	var due <-chan time.Time
+	if !next.IsZero() {
+		t := time.NewTimer(max(next.Sub(d.now()), time.Millisecond))
+		defer t.Stop()
+		due = t.C
+	}
+	select {
+	case <-ctx.Done():
+		return true, ctx.Err()
+	case <-deadline:
+		return true, nil
+	case <-wake:
+	case <-due:
+	}
+	return false, nil
 }
 
 // claim leases due jobs and returns when the next one becomes due; the

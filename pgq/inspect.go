@@ -24,11 +24,17 @@ type scheduleMsg struct {
 	Timeout     time.Duration     `json:"timeout,omitempty"`
 }
 
-func scheduleLocation(name string) (*time.Location, error) {
-	if name == "" {
-		return time.UTC, nil
+// parseSchedule parses a schedule's cron and timezone (empty: UTC).
+func parseSchedule(cronSpec, timezone string) (jobq.Cron, *time.Location, error) {
+	cron, err := jobq.ParseCron(cronSpec)
+	if err != nil {
+		return jobq.Cron{}, nil, err
 	}
-	return time.LoadLocation(name)
+	if timezone == "" {
+		return cron, time.UTC, nil
+	}
+	loc, err := time.LoadLocation(timezone)
+	return cron, loc, err
 }
 
 // SyncSchedules implements [jobq.Scheduler]. Unchanged schedules keep their
@@ -48,11 +54,7 @@ func (d *Driver) SyncSchedules(ctx context.Context, specs []jobq.ScheduleSpec) e
 	}
 	keys := make([]string, 0, len(specs))
 	for _, s := range specs {
-		cron, err := jobq.ParseCron(s.Cron)
-		if err != nil {
-			return err
-		}
-		loc, err := scheduleLocation(s.Timezone)
+		cron, loc, err := parseSchedule(s.Cron, s.Timezone)
 		if err != nil {
 			return fmt.Errorf("pgq: schedule %q: %w", s.Key, err)
 		}
@@ -171,11 +173,7 @@ WHERE next_run_at <= now() ORDER BY next_run_at LIMIT 20 FOR UPDATE SKIP LOCKED`
 
 // fireOne enqueues one occurrence of s and moves its next run time past now.
 func (d *Driver) fireOne(ctx context.Context, tx pgx.Tx, s dueSchedule, now time.Time) error {
-	cron, err := jobq.ParseCron(s.cron)
-	if err != nil {
-		return err
-	}
-	loc, err := scheduleLocation(s.timezone)
+	cron, loc, err := parseSchedule(s.cron, s.timezone)
 	if err != nil {
 		return err
 	}
@@ -205,16 +203,10 @@ func (d *Driver) fireOne(ctx context.Context, tx pgx.Tx, s dueSchedule, now time
 // occurrence, so it never fires off its cron, or in an hour when the schedule
 // itself cannot be read.
 func retryAt(s dueSchedule, now time.Time) time.Time {
-	cron, err := jobq.ParseCron(s.cron)
-	if err != nil {
-		return now.Add(time.Hour)
-	}
-	loc, err := scheduleLocation(s.timezone)
-	if err != nil {
-		return now.Add(time.Hour)
-	}
-	if next := cron.Next(now, loc); !next.IsZero() {
-		return next
+	if cron, loc, err := parseSchedule(s.cron, s.timezone); err == nil {
+		if next := cron.Next(now, loc); !next.IsZero() {
+			return next
+		}
 	}
 	return now.Add(time.Hour)
 }
@@ -259,16 +251,11 @@ func (d *Driver) DeadLetters(ctx context.Context, q jobq.DeadLetterQuery) (jobq.
 		q.Limit = 50
 	}
 	var page jobq.DeadLetterPage
-	var curAt *time.Time
-	curID := ""
-	if q.Cursor != "" {
-		ts, id, ok := strings.Cut(q.Cursor, "|")
-		t, err := time.Parse(time.RFC3339Nano, ts)
-		if !ok || err != nil {
-			return page, fmt.Errorf("pgq: invalid cursor %q", q.Cursor)
-		}
-		curAt, curID = &t, id
+	curAt, curID, err := parseDeadCursor(q.Cursor)
+	if err != nil {
+		return page, err
 	}
+	// One extra row tells whether another page follows.
 	rows, err := d.pool.Query(ctx, `SELECT id, name, queue, payload, header, attempt, max_attempts, timeout_ns,
   snoozes, unknown_since, unique_key, unique_for_ns, enqueued_at, coalesce(last_error, ''), finished_at
 FROM `+d.s+`.jobs
@@ -279,7 +266,6 @@ ORDER BY finished_at DESC, id DESC LIMIT $4`, q.Queue, curAt, curID, q.Limit+1)
 		return page, fmt.Errorf("pgq: dead letters: %w", err)
 	}
 	defer rows.Close()
-	var last jobq.DeadLetter
 	for rows.Next() {
 		var (
 			m              jobq.Message
@@ -309,18 +295,35 @@ ORDER BY finished_at DESC, id DESC LIMIT $4`, q.Queue, curAt, curID, q.Limit+1)
 			m.EnqueuedAt = *enq
 		}
 		dl.Message = &m
-		if len(page.DeadLetters) == q.Limit {
-			// One more than asked for: there is a next page.
-			page.Next = last.FailedAt.UTC().Format(time.RFC3339Nano) + "|" + last.Message.ID
-			break
-		}
 		page.DeadLetters = append(page.DeadLetters, dl)
-		last = dl
 	}
 	if err := rows.Err(); err != nil {
 		return page, fmt.Errorf("pgq: dead letters: %w", err)
 	}
+	if len(page.DeadLetters) > q.Limit {
+		page.DeadLetters = page.DeadLetters[:q.Limit]
+		page.Next = deadCursor(page.DeadLetters[q.Limit-1])
+	}
 	return page, nil
+}
+
+// deadCursor is the cursor of the page after dl: its finish time and id.
+func deadCursor(dl jobq.DeadLetter) string {
+	return dl.FailedAt.UTC().Format(time.RFC3339Nano) + "|" + dl.Message.ID
+}
+
+// parseDeadCursor reverses deadCursor; an empty cursor is the first page,
+// returned as a nil time.
+func parseDeadCursor(cursor string) (*time.Time, string, error) {
+	if cursor == "" {
+		return nil, "", nil
+	}
+	ts, id, ok := strings.Cut(cursor, "|")
+	t, err := time.Parse(time.RFC3339Nano, ts)
+	if !ok || err != nil {
+		return nil, "", fmt.Errorf("pgq: invalid cursor %q", cursor)
+	}
+	return &t, id, nil
 }
 
 // RetryDead implements [jobq.Inspector]. The unique key of the dead job is

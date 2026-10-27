@@ -1094,9 +1094,6 @@ func (d *Driver) storeDead(ctx context.Context, msg *jobq.Message, attempts int,
 	return nil
 }
 
-// scanWindow bounds a dead-letter scan that asks for no limit.
-const scanWindow = 1000
-
 // deadEntry is one dead letter with its stream sequence.
 type deadEntry struct {
 	seq uint64
@@ -1104,9 +1101,8 @@ type deadEntry struct {
 }
 
 // scanDead walks the dead-letter stream backwards from before (zero: the
-// newest) and returns entries matching queue, newest first. limit zero means
-// no limit, but stopAt ends the scan at the first entry with that job id.
-func (d *Driver) scanDead(ctx context.Context, queue string, before uint64, limit int, stopAt string) ([]deadEntry, error) {
+// newest) and returns up to limit entries that match, newest first.
+func (d *Driver) scanDead(ctx context.Context, before uint64, limit int, match func(*deadLetter) bool) ([]deadEntry, error) {
 	info, err := d.dead.Info(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("natsq: dead letter stream: %w", err)
@@ -1117,9 +1113,6 @@ func (d *Driver) scanDead(ctx context.Context, queue string, before uint64, limi
 	seq := info.State.LastSeq
 	if before > 0 {
 		seq = before - 1
-	}
-	if limit <= 0 {
-		limit = scanWindow
 	}
 	var out []deadEntry
 	for seq >= first && first > 0 && len(out) < limit {
@@ -1132,12 +1125,9 @@ func (d *Driver) scanDead(ctx context.Context, queue string, before uint64, limi
 			return nil, fmt.Errorf("natsq: read dead letter %d: %w", seq, err)
 		}
 		var dl deadLetter
-		if json.Unmarshal(raw.Data, &dl) == nil && (queue == "" || dl.Envelope.Queue == queue) {
+		if json.Unmarshal(raw.Data, &dl) == nil && match(&dl) {
 			dl.Envelope.Payload = dl.Payload
 			out = append(out, deadEntry{seq: seq, dl: dl})
-			if stopAt != "" && dl.Envelope.ID == stopAt {
-				return out, nil
-			}
 		}
 		seq--
 	}
@@ -1215,7 +1205,10 @@ func (d *Driver) DeadLetters(ctx context.Context, q jobq.DeadLetterQuery) (jobq.
 		}
 		before = n
 	}
-	entries, err := d.scanDead(ctx, q.Queue, before, q.Limit+1, "")
+	// One extra entry tells whether another page follows.
+	entries, err := d.scanDead(ctx, before, q.Limit+1, func(dl *deadLetter) bool {
+		return q.Queue == "" || dl.Envelope.Queue == q.Queue
+	})
 	if err != nil {
 		return jobq.DeadLetterPage{}, err
 	}
@@ -1237,23 +1230,11 @@ func (d *Driver) DeadLetters(ctx context.Context, q jobq.DeadLetterQuery) (jobq.
 
 // findDead returns the newest dead letter of job id.
 func (d *Driver) findDead(ctx context.Context, id string) (deadEntry, bool, error) {
-	// Each scan reads a bounded batch; page back until the job turns up or
-	// the stream is exhausted.
-	before := uint64(0)
-	for {
-		entries, err := d.scanDead(ctx, "", before, scanWindow, id)
-		if err != nil {
-			return deadEntry{}, false, err
-		}
-		n := len(entries)
-		if n > 0 && entries[n-1].dl.Envelope.ID == id {
-			return entries[n-1], true, nil
-		}
-		if n < scanWindow {
-			return deadEntry{}, false, nil
-		}
-		before = entries[n-1].seq
+	entries, err := d.scanDead(ctx, 0, 1, func(dl *deadLetter) bool { return dl.Envelope.ID == id })
+	if err != nil || len(entries) == 0 {
+		return deadEntry{}, false, err
 	}
+	return entries[0], true, nil
 }
 
 // RetryDead implements [jobq.Inspector].
