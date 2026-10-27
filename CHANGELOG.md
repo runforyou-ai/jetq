@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.5.0 (unreleased)
+## v0.5.0
 
 Breaking: jetq is now **jobq**, a multi-driver job queue
 (`github.com/runforyou-ai/jobq`).
