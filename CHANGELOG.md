@@ -1,5 +1,10 @@
 # Changelog
 
+## pgq/v0.5.1
+
+- Add `pgq.WithoutScheduler()`: the driver keeps syncing schedules but does
+  not fire them, so only chosen processes enqueue recurring jobs.
+
 ## v0.5.0
 
 Breaking: jetq is now **jobq**, a multi-driver job queue

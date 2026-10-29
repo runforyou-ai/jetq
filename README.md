@@ -128,6 +128,7 @@ err = tx.Commit(ctx)
 Notes:
 
 - Waiting workers are woken by `LISTEN/NOTIFY` on a channel of the driver's own, separate from the pool, so a small pool is fine. With PgBouncer in transaction mode use `pgq.WithoutListen()`; workers then poll (`pgq.WithPollInterval`).
+- Every driver fires due schedules by default; each occurrence still fires once. To fire them only in dedicated processes, create the other drivers with `pgq.WithoutScheduler()`.
 - All times are applied against the database clock, so clock skew between application hosts does not shift delays.
 - Succeeded and cancelled jobs are kept for 24 hours (`WithRetention`), dead letters for 14 days (`WithDeadRetention`).
 

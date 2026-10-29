@@ -124,6 +124,7 @@ err = tx.Commit(ctx)
 注意：
 
 - 等待中的 worker 由 `LISTEN/NOTIFY` 唤醒。监听器在 driver 存活期间**一直占用连接池里的一个连接**，所以连接池至少要 2 个连接，worker 多时要更多。PgBouncer 事务模式下请用 `pgq.WithoutListen()`，此时 worker 改为轮询（`pgq.WithPollInterval`）。
+- 默认每个 driver 都会触发到期的定时任务，每个时刻仍只触发一次。若只想让专门的进程触发，其他 driver 用 `pgq.WithoutScheduler()` 创建。
 - 所有时间都按数据库时钟计算，应用主机之间的时钟偏差不会让延迟偏移。
 - 成功和取消的任务保留 24 小时（`WithRetention`），死信保留 14 天（`WithDeadRetention`）。
 
