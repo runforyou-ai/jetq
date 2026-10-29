@@ -154,6 +154,29 @@ func TestSchedulesFireOnceAcrossDrivers(t *testing.T) {
 	}
 }
 
+// A driver created with WithoutScheduler syncs schedules but never fires them.
+func TestWithoutSchedulerDoesNotFire(t *testing.T) {
+	pool := testPool(t)
+	d := newDriver(t, pool, pgq.WithoutScheduler())
+	c := jobq.New(d)
+	if err := c.SyncSchedules(t.Context(), jobq.Schedule{Key: "tick", Cron: "@every 1s", Job: jobq.RawJob{Name: "tick"}}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(3 * time.Second)
+	stats, err := c.Stats(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Schedules != 1 {
+		t.Fatalf("schedules = %d", stats.Schedules)
+	}
+	for _, q := range stats.Queues {
+		if q.Ready+q.Scheduled+q.Running != 0 {
+			t.Fatalf("queue %s has jobs: %+v", q.Queue, q)
+		}
+	}
+}
+
 // A job id that is enqueued again after the first job was cancelled must not
 // accept the first job's stale lease.
 func TestReusedJobIDDoesNotRevivePreviousLease(t *testing.T) {

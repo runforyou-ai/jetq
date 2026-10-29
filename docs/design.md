@@ -192,7 +192,8 @@ Dead letters stay in `jobs` with `state = 'failed'`. `RetryDead` resets one to
   savepoint: it inserts the job `<key>-<unix seconds of the occurrence>` and
   moves `next_run_at` past now. The primary key makes an occurrence fire at
   most once, no leader is needed, and a schedule that fails is logged and
-  retried a minute later without blocking the others.
+  retried a minute later without blocking the others. `WithoutScheduler()`
+  turns the ticker off for a driver, so only chosen processes fire schedules.
 - **Retention.** A janitor, serialised by a schema-scoped advisory lock, deletes
   succeeded and cancelled jobs after 24h (`WithRetention`), dead letters after
   14 days (`WithDeadRetention`) and expired unique keys, in batches of 1000

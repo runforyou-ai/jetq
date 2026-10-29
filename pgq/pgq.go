@@ -31,6 +31,7 @@ type config struct {
 	deadRetention time.Duration
 	poll          time.Duration
 	noListen      bool
+	noScheduler   bool
 	logger        *slog.Logger
 }
 
@@ -48,6 +49,11 @@ func WithPollInterval(d time.Duration) Option { return func(c *config) { c.poll 
 
 // WithoutListen disables LISTEN/NOTIFY, for PgBouncer in transaction mode.
 func WithoutListen() Option { return func(c *config) { c.noListen = true } }
+
+// WithoutScheduler stops this driver from firing recurring schedules.
+// SyncSchedules and the rest of the driver still work; keep at least one
+// driver per schema without this option, or schedules never fire.
+func WithoutScheduler() Option { return func(c *config) { c.noScheduler = true } }
 
 // WithLogger sets the logger (default slog.Default()).
 func WithLogger(l *slog.Logger) Option { return func(c *config) { c.logger = l } }
@@ -100,8 +106,10 @@ func New(ctx context.Context, pool *pgxpool.Pool, opts ...Option) (*Driver, erro
 	}
 	d.wg.Add(1)
 	go d.janitor()
-	d.wg.Add(1)
-	go d.scheduler()
+	if !cfg.noScheduler {
+		d.wg.Add(1)
+		go d.scheduler()
+	}
 	return d, nil
 }
 

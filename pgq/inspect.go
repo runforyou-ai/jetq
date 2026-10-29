@@ -92,7 +92,8 @@ WHERE `+d.s+`.schedules.cron IS DISTINCT FROM EXCLUDED.cron
 	return nil
 }
 
-// scheduler fires due schedules. Every driver instance runs it; the row
+// scheduler fires due schedules. Every driver instance runs it unless
+// created with [WithoutScheduler]; the row
 // lock and the job id (key plus occurrence time) make each occurrence fire
 // once, so no leader is needed.
 func (d *Driver) scheduler() {
